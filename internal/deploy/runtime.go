@@ -126,7 +126,7 @@ func removeCandidate(ctx context.Context, candidate CandidateResult, runner comm
 		return fmt.Errorf("%w: container name %q does not match derived %q", ErrInvalidCandidate, candidate.ContainerName, expectedContainer)
 	}
 
-	out, err := runner.Run(context.Background(), "docker", "rm", "--force", expectedContainer)
+	out, err := runner.Run(ctx, "docker", "rm", "--force", expectedContainer)
 	if err != nil && !strings.Contains(out, "No such container") {
 		return fmt.Errorf("docker rm --force %s: %w", expectedContainer, err)
 	}
@@ -265,6 +265,11 @@ func startWithPortRetry(ctx context.Context, cfg RuntimeConfig, runner commandRu
 		startErr := startContainer(ctx, runner, containerName, image, port, containerPort)
 		if startErr != nil {
 			if isPortInUse(startErr) {
+				// A port-binding failure can leave a stopped container with
+				// the derived name behind. Remove it (best-effort) before
+				// retrying so the next docker run does not hit a name
+				// conflict.
+				_ = removeContainer(ctx, runner, containerName)
 				next, err := nextAvailablePort(cfg.PortRangeStart, cfg.PortRangeEnd, port)
 				if err != nil {
 					return nil, err
@@ -277,8 +282,11 @@ func startWithPortRetry(ctx context.Context, cfg RuntimeConfig, runner commandRu
 
 		healthURL := fmt.Sprintf("http://127.0.0.1:%d%s", port, healthPath)
 		if hErr := pollHealth(ctx, healthURL, cfg.HealthTimeout); hErr != nil {
-			_ = removeContainer(ctx, runner, containerName)
+			// Retrieve logs BEFORE removing the container, otherwise the
+			// logs are lost. Container removal still happens even if log
+			// retrieval fails.
 			logs, _ := containerLogs(ctx, runner, containerName, 100)
+			_ = removeContainer(ctx, runner, containerName)
 			return nil, fmt.Errorf("%w: %v (logs: %s)", ErrHealthCheckFailed, hErr, truncateForError(logs))
 		}
 

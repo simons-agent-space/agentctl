@@ -583,3 +583,109 @@ func TestRemoveCandidate_IdempotentWhenAbsent(t *testing.T) {
 		t.Errorf("expected idempotent nil, got %v", err)
 	}
 }
+
+func TestRemoveCandidate_RespectsContextCancellation(t *testing.T) {
+	commit := strings.Repeat("a", 40)
+	candidate := CandidateResult{
+		App:           "myapp",
+		Commit:        commit,
+		Image:         deriveImage("myapp", commit),
+		ContainerName: deriveContainerName("myapp", commit),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before the call
+
+	runner := newFakeRunner(
+		fakeResponseEntry{
+			match: func(name string, args []string) bool {
+				return name == "docker" && len(args) >= 1 && args[0] == "rm"
+			},
+			resp: fakeResponse{
+				out: "context canceled",
+				err: context.Canceled,
+			},
+		},
+	)
+	err := removeCandidate(ctx, candidate, runner)
+	if err == nil {
+		t.Fatal("expected error from cancelled context, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled in error chain, got %v", err)
+	}
+}
+
+func TestStartCandidate_PortBindingFailureCleansContainerName(t *testing.T) {
+	checkout, cfg := setupValidCheckout(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer srv.Close()
+	var srvPort int
+	fmt.Sscanf(srv.URL[len("http://127.0.0.1:"):], "%d", &srvPort)
+	cfg.PortRangeStart = srvPort
+	cfg.PortRangeEnd = srvPort + 2
+
+	calls := 0
+	old := allocatePortFunc
+	allocatePortFunc = func(start, end int) (int, error) {
+		calls++
+		return srvPort + calls - 1, nil
+	}
+	t.Cleanup(func() { allocatePortFunc = old })
+
+	commit := strings.Repeat("a", 40)
+	containerName := deriveContainerName("myapp", commit)
+
+	runAttempts := 0
+	rmSeen := false
+	runner := newFakeRunner(
+		fakeResponseEntry{
+			match: func(name string, args []string) bool {
+				if name == "docker" && len(args) >= 1 && args[0] == "run" {
+					runAttempts++
+					return runAttempts == 1
+				}
+				if name == "docker" && len(args) >= 3 && args[0] == "rm" && args[1] == "--force" && args[2] == containerName {
+					rmSeen = true
+					return true
+				}
+				return false
+			},
+			resp: fakeResponse{out: "bind: address already in use", err: errors.New("exit 125")},
+		},
+		fakeResponseEntry{match: matchAny("docker"), resp: fakeResponse{out: ""}},
+	)
+
+	_, err := startCandidate(context.Background(), cfg, runtimeManifest(), runtimeSource(checkout), runner)
+	if err != nil && !errors.Is(err, ErrHealthCheckFailed) {
+		t.Fatalf("unexpected startCandidate error: %v", err)
+	}
+	if !rmSeen {
+		t.Errorf("expected docker rm --force %s before retrying with the next port", containerName)
+	}
+	callsLog := runner.Calls()
+	firstRun, firstRm, secondRun := -1, -1, -1
+	for i, c := range callsLog {
+		if len(c) < 2 || c[0] != "docker" {
+			continue
+		}
+		switch {
+		case c[1] == "run":
+			if firstRun == -1 {
+				firstRun = i
+			} else if firstRm != -1 && secondRun == -1 {
+				secondRun = i
+			}
+		case c[1] == "rm" && len(c) >= 3 && c[2] == "--force":
+			if firstRm == -1 {
+				firstRm = i
+			}
+		}
+	}
+	if firstRun == -1 || firstRm == -1 || secondRun == -1 {
+		t.Fatalf("expected docker run, then docker rm --force, then docker run; got %v", callsLog)
+	}
+	if !(firstRun < firstRm && firstRm < secondRun) {
+		t.Errorf("expected order: docker run (%d) < docker rm --force (%d) < docker run (%d); got %v", firstRun, firstRm, secondRun, callsLog)
+	}
+}
