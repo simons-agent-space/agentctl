@@ -92,15 +92,18 @@ rejected with `PROFILE_NOT_ALLOWED`.
 **T7. DoS against the broker host.** *Mitigation:* the broker is a
 single binary with a small attack surface. The systemd unit restricts
 the process via `ProtectSystem=strict`, `PrivateTmp=yes`,
-`RestrictNamespaces=yes`, `RestrictAddressFamilies=AF_UNIX AF_INET
-AF_INET6`, and friends — see
+`RestrictNamespaces=yes`, `MemoryDenyWriteExecute=yes`, and friends.
+The `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` directive
+allows the UDS socket and HTTPS to `api.github.com`; it does not
+OS-enforce `api.github.com` as the only outbound destination — the
+broker's code is what scopes outbound traffic to GitHub. See
 `systemd/gitbridge.service.example`.
 
 **T8. Local privilege escalation via the socket.** *Mitigation:* the
-socket is created with mode `0660` (the default, and the only mode the
-broker will apply) and owned by a dedicated `gitbridge` group. The
-agent sandbox runs as a user that is a member of that group; no other
-user can connect.
+socket is created with mode `0660` and owned by a dedicated
+`gitbridge` group. Whether the agent sandbox can connect depends on
+the deployment joining the sandbox user to that group; see the
+unresolved integration tasks below.
 
 ### Threats out of scope
 

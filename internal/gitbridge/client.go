@@ -12,7 +12,7 @@ import (
 
 const (
 	apiBase = "https://api.github.com"
-	apiVer  = "2022-11-28"
+	apiVer  = "2026-03-10"
 	ua      = "gitbridge/0.1 (+https://github.com/simons-agent-space/agentctl)"
 )
 

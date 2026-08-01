@@ -91,7 +91,6 @@ environment variable.
   "allowed_org": "simons-agent-space",
   "allowed_repositories": ["agentctl", "another-repo"],
   "socket_path": "/run/gitbridge/socket",
-  "socket_mode": "0660"
 }
 ```
 
@@ -104,8 +103,7 @@ environment variable.
 | `private_key_path` | path | yes | Path to the PEM-encoded RSA private key. Read once at startup. |
 | `allowed_org` | string | yes | The single GitHub organisation that repositories must belong to. |
 | `allowed_repositories` | array of string | yes | Explicit allowlist of repository names (without org prefix). |
-| `socket_path` | path | yes | Where the Unix domain socket is created. |
-| `socket_mode` | octal string | no | Override the socket file mode. Defaults to `0660`. |
+| `socket_path` | path | yes | Where the Unix domain socket is created. The socket is always created with mode `0660`. |
 
 ### Validation
 

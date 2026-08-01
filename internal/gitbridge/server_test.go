@@ -241,6 +241,30 @@ func TestServer_GitHubErrorReturnsGenericInternal(t *testing.T) {
 // (these guard the broker against silent contract regressions)
 // ----------------------------------------------------------------------
 
+func TestGitHubRequest_ApiVersionHeader(t *testing.T) {
+	var capturedVersion string
+	ghHandler := func(w http.ResponseWriter, r *http.Request) {
+		capturedVersion = r.Header.Get("X-GitHub-Api-Version")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"token":      "***",
+			"expires_at": time.Now().Add(time.Hour).UTC().Format("2006-01-02T15:04:05Z"),
+		})
+	}
+	srv, _ := makeTestServer(t, ghHandler)
+	body := strings.NewReader(`{"repo":"simons-agent-space/agentctl","profile":"builder"}`)
+	rec := httptest.NewRecorder()
+	srv.handleToken(rec, httptest.NewRequest(http.MethodPost, "/token", body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	const wantVersion = "2026-03-10"
+	if capturedVersion != wantVersion {
+		t.Errorf("X-GitHub-Api-Version = %q, want %q", capturedVersion, wantVersion)
+	}
+}
+
 func TestGitHubRequest_EndpointPath(t *testing.T) {
 	var capturedPath string
 	var capturedMethod string
@@ -400,47 +424,6 @@ func TestGitHubRequest_OnlyBuilderPermissionsRequested(t *testing.T) {
 func TestDefaultSocketModeConstant(t *testing.T) {
 	if DefaultSocketMode != 0660 {
 		t.Errorf("DefaultSocketMode = %o, want 0660", DefaultSocketMode)
-	}
-}
-
-func TestApplySocketMode_DefaultWhenUnset(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "file")
-	if err := os.WriteFile(path, nil, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg := &Config{} // SocketMode empty
-	if err := applySocketMode(cfg, path); err != nil {
-		t.Fatal(err)
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0660 {
-		t.Errorf("mode = %v, want 0660", info.Mode().Perm())
-	}
-}
-
-func TestApplySocketMode_OverrideWhenSet(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "file")
-	if err := os.WriteFile(path, nil, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg := &Config{SocketMode: "0600"}
-	if err := applySocketMode(cfg, path); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0600 {
-		t.Errorf("mode = %v, want 0600", info.Mode().Perm())
 	}
 }
 
@@ -729,6 +712,3 @@ func TestEndToEnd_MintsValidToken(t *testing.T) {
 		t.Errorf("audit log should record the repo_name sent to GitHub: %s", logBuf.String())
 	}
 }
-
-// Just enough to make `go vet` happy with the imported ctx; we don't
-// actually run ListenAndServe in unit tests.

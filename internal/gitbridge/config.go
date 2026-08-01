@@ -2,7 +2,9 @@ package gitbridge
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -29,9 +31,6 @@ type Config struct {
 	AllowedRepos []string `json:"allowed_repositories"`
 	// SocketPath is where the UDS listener is created.
 	SocketPath string `json:"socket_path"`
-	// SocketMode is an optional override for the socket file mode.
-	// When empty, DefaultSocketMode (0660) is applied.
-	SocketMode string `json:"socket_mode,omitempty"`
 }
 
 // LoadConfig reads and validates the JSON file at path.
@@ -45,6 +44,11 @@ func LoadConfig(path string) (*Config, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	// A second Decode must return io.EOF; anything else means the
+	// config file contained trailing data after the JSON object.
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("trailing data after config object")
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err

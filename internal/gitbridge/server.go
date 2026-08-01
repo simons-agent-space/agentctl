@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"time"
 
 	"github.com/simons-agent-space/agentctl/internal/audit"
@@ -42,8 +41,7 @@ func NewServer(cfg *Config, ghc *Client, log *audit.Logger) (*Server, error) {
 }
 
 // ListenAndServe creates the Unix domain socket and serves until ctx is
-// cancelled. The socket is always created with mode 0660 by default;
-// the operator can override via SocketMode in the config.
+// cancelled. The socket is always created with mode 0660.
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	if err := os.Remove(s.cfg.SocketPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove stale socket: %w", err)
@@ -55,8 +53,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	defer listener.Close()
 	defer os.Remove(s.cfg.SocketPath)
 
-	if err := applySocketMode(s.cfg, s.cfg.SocketPath); err != nil {
-		return fmt.Errorf("apply socket mode: %w", err)
+	if err := os.Chmod(s.cfg.SocketPath, DefaultSocketMode); err != nil {
+		return fmt.Errorf("chmod socket: %w", err)
 	}
 
 	mux := http.NewServeMux()
@@ -89,21 +87,6 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	}
-}
-
-// applySocketMode chmods path to either DefaultSocketMode or the
-// override in cfg.SocketMode. It is split out so it can be tested
-// without spinning up a full listener.
-func applySocketMode(cfg *Config, path string) error {
-	mode := DefaultSocketMode
-	if cfg.SocketMode != "" {
-		m, err := strconv.ParseUint(cfg.SocketMode, 8, 32)
-		if err != nil {
-			return fmt.Errorf("parse socket_mode: %w", err)
-		}
-		mode = os.FileMode(m)
-	}
-	return os.Chmod(path, mode)
 }
 
 // handleHealthz returns 200 OK for liveness checks. GET only.
