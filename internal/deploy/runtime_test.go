@@ -22,11 +22,14 @@ type fakeResponse struct {
 }
 
 // fakeRunner records every command invocation and returns canned
-// responses that match a command/argument shape.
+// responses that match a command/argument shape. It also captures the
+// context for each call so tests can assert on context state (e.g.
+// that a cleanup command received a non-cancelled context).
 type fakeRunner struct {
-	mu        sync.Mutex
-	calls     [][]string
-	responses []fakeResponseEntry
+	mu              sync.Mutex
+	calls           [][]string
+	cancelledAtCall []bool
+	responses       []fakeResponseEntry
 }
 
 type fakeResponseEntry struct {
@@ -43,6 +46,11 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) (stri
 	defer f.mu.Unlock()
 	full := append([]string{name}, args...)
 	f.calls = append(f.calls, append([]string(nil), full...))
+	// Record the context's cancellation state at call time. This is
+	// critical for asserting on cleanup paths where the caller
+	// context is cancelled and the cleanup function uses a separate
+	// derived context that is later cancelled by a defer.
+	f.cancelledAtCall = append(f.cancelledAtCall, ctx.Err() != nil)
 	for _, e := range f.responses {
 		if e.match(name, args) {
 			return e.resp.out, e.resp.err
@@ -59,6 +67,18 @@ func (f *fakeRunner) Calls() [][]string {
 		out[i] = append([]string(nil), c...)
 	}
 	return out
+}
+
+// ContextCancelledAt reports whether the context captured for the
+// call at callIndex was already cancelled at the moment Run was
+// invoked.
+func (f *fakeRunner) ContextCancelledAt(callIndex int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if callIndex < 0 || callIndex >= len(f.cancelledAtCall) {
+		return false
+	}
+	return f.cancelledAtCall[callIndex]
 }
 
 func match(name string, args ...string) func(string, []string) bool {
@@ -687,5 +707,68 @@ func TestStartCandidate_PortBindingFailureCleansContainerName(t *testing.T) {
 	}
 	if !(firstRun < firstRm && firstRm < secondRun) {
 		t.Errorf("expected order: docker run (%d) < docker rm --force (%d) < docker run (%d); got %v", firstRun, firstRm, secondRun, callsLog)
+	}
+}
+
+func TestStartCandidate_HealthCancellationStillCleansUp(t *testing.T) {
+	checkout, cfg := setupValidCheckout(t)
+	cfg.HealthTimeout = 5 * time.Second
+
+	// HTTP server that blocks until either the test unblocks it or the
+	// request context is cancelled.
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-block:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	var srvPort int
+	fmt.Sscanf(srv.URL[len("http://127.0.0.1:"):], "%d", &srvPort)
+	cfg.PortRangeStart = srvPort
+	cfg.PortRangeEnd = srvPort
+	withFixedPort(t, srvPort)
+
+	runner := newFakeRunner(fakeResponseEntry{match: matchAny("docker"), resp: fakeResponse{out: ""}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err := startCandidate(ctx, cfg, runtimeManifest(), runtimeSource(checkout), runner)
+	if !errors.Is(err, ErrHealthCheckFailed) {
+		t.Errorf("expected ErrHealthCheckFailed, got %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled in error chain, got %v", err)
+	}
+
+	calls := runner.Calls()
+	rmIndex, logsIndex := -1, -1
+	for i, c := range calls {
+		if len(c) >= 2 && c[0] == "docker" {
+			switch {
+			case c[1] == "rm" && len(c) >= 3 && c[2] == "--force":
+				rmIndex = i
+			case c[1] == "logs":
+				logsIndex = i
+			}
+		}
+	}
+	if rmIndex == -1 {
+		t.Fatal("expected docker rm --force to be called after health cancellation")
+	}
+	if logsIndex == -1 {
+		t.Fatal("expected docker logs to be called after health cancellation")
+	}
+	if runner.ContextCancelledAt(rmIndex) {
+		t.Errorf("docker rm --force received an already-cancelled context (call index %d)", rmIndex)
+	}
+	if runner.ContextCancelledAt(logsIndex) {
+		t.Errorf("docker logs received an already-cancelled context (call index %d)", logsIndex)
 	}
 }

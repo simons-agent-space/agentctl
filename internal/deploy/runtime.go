@@ -282,12 +282,19 @@ func startWithPortRetry(ctx context.Context, cfg RuntimeConfig, runner commandRu
 
 		healthURL := fmt.Sprintf("http://127.0.0.1:%d%s", port, healthPath)
 		if hErr := pollHealth(ctx, healthURL, cfg.HealthTimeout); hErr != nil {
-			// Retrieve logs BEFORE removing the container, otherwise the
-			// logs are lost. Container removal still happens even if log
-			// retrieval fails.
-			logs, _ := containerLogs(ctx, runner, containerName, 100)
-			_ = removeContainer(ctx, runner, containerName)
-			return nil, fmt.Errorf("%w: %v (logs: %s)", ErrHealthCheckFailed, hErr, truncateForError(logs))
+			// Health polling failed. Build, inspect, startup, and polling
+			// used the caller context; now switch to a bounded cleanup
+			// context derived from context.Background() so cleanup runs
+			// even when the caller context is already cancelled.
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			logs, _ := containerLogs(cleanupCtx, runner, containerName, 100)
+			_ = removeContainer(cleanupCtx, runner, containerName)
+			return nil, &healthCheckFailure{
+				sentinel: ErrHealthCheckFailed,
+				cause:    hErr,
+				logs:     truncateForError(logs),
+			}
 		}
 
 		return &CandidateResult{
@@ -396,6 +403,36 @@ func pollHealth(ctx context.Context, url string, timeout time.Duration) error {
 		case <-time.After(delay):
 		}
 	}
+}
+
+// healthCheckFailure wraps both ErrHealthCheckFailed (as the
+// operation sentinel) and the underlying poll error (commonly
+// context.Canceled or context.DeadlineExceeded) so that
+// errors.Is(err, ErrHealthCheckFailed) and errors.Is(err, X) for any
+// X reachable from the poll error both succeed.
+//
+// This is implemented as a struct (not fmt.Errorf with multiple %w)
+// because the module targets Go 1.19, which supports only a single
+// unwrap target per error.
+type healthCheckFailure struct {
+	sentinel error
+	cause    error
+	logs     string
+}
+
+func (e *healthCheckFailure) Error() string {
+	return fmt.Sprintf("%s: %s (logs: %s)", e.sentinel, e.cause, e.logs)
+}
+
+// Unwrap exposes the underlying poll error so errors.Is finds
+// context.Canceled (or any other cancellation cause) in the chain.
+func (e *healthCheckFailure) Unwrap() error {
+	return e.cause
+}
+
+// Is returns true when comparing against the sentinel error.
+func (e *healthCheckFailure) Is(target error) bool {
+	return target == e.sentinel
 }
 
 func truncateForError(s string) string {
