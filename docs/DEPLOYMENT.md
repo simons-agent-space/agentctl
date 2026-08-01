@@ -68,18 +68,29 @@ Deployment sources are resolved by `agentctld` as follows:
   rejected. The check is equivalent to
   `git merge-base --is-ancestor <commit> refs/remotes/origin/main`.
 - The source is fetched into a **host-side bare mirror** at
-  `<repository-root>/<repository>.git`. If the mirror does not exist,
-  it is initialised with `git clone --bare https://github.com/<organisation>/<repository>.git`.
+  `<repository-root>/<repository>.git`. The trusted host configuration
+  supplies the origin URL. If the mirror does not exist, it is created
+  with `git clone --bare <origin-url>` and then immediately populated
+  with the explicit fetch refspec
+  `+refs/heads/main:refs/remotes/origin/main` (bare clones do not create
+  remote-tracking branches on their own).
+- On every deployment, the mirror is re-validated: `git rev-parse --is-bare-repository`
+  must return `true`, and `remote.origin.url` must equal the trusted
+  origin URL. A non-bare directory at the mirror path is rejected.
+- After re-validation, the same explicit fetch refspec is run. A failed
+  fetch is fatal — there is no fallback that accepts a stale
+  `refs/remotes/origin/main` in lieu of a successful fetch.
 - Each deployment uses a **detached temporary checkout** of the exact
   commit, created via `git worktree add --detach`. The checkout does
   not track a branch and the bare mirror's branch state is untouched.
 - The caller **cannot choose arbitrary Git URLs or host paths**. The
   organisation is checked against a trusted configuration; the
-  repository root is supplied by trusted host configuration, not by the
-  caller. The expected origin URL is computed from
-  `https://github.com/<organisation>/<repository>.git` and must match
-  the mirror's configured `remote.origin.url` — anything else is
-  rejected.
-- The checkout directory is removed by an explicit `CleanupCheckout`
-  function, which refuses to operate on paths outside the trusted
-  repository root.
+  repository root and the origin URL are supplied by trusted host
+  configuration, not by the caller.
+- The checkout directory is removed by `CleanupCheckout`, which derives
+  the trusted mirror path from the trusted repository root and the
+  repository name on the result (the caller never supplies it).
+  `CleanupCheckout` runs `git worktree remove --force <path>` and then
+  `git worktree prune` from the mirror to clear stale worktree metadata,
+  then removes the checkout directory. It refuses to operate on paths
+  outside the trusted repository root.

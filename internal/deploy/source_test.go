@@ -10,128 +10,78 @@ import (
 	"testing"
 )
 
-// setupBareMirrorWithRefs creates a local source repo with main and feature
-// branches, clones it as a bare mirror, populates refs/remotes/origin/*,
-// then renames the mirror to the path expected by CheckoutSource. Returns
-// the mirror path, the main commit SHA, and the feature commit SHA.
-func setupBareMirrorWithRefs(t *testing.T) (mirrorPath, mainSHA, featureSHA string) {
+// setupRemote creates a local non-bare Git repository to act as the
+// trusted remote. It contains a `main` branch with one commit and a
+// `feature` branch with one additional commit. Returns the remote path
+// (suitable for cfg.OriginURL), the main SHA, and the feature SHA.
+func setupRemote(t *testing.T) (remotePath, mainSHA, featureSHA string) {
 	t.Helper()
 	dir := t.TempDir()
-	src := filepath.Join(dir, "src")
-	if err := os.MkdirAll(src, 0o755); err != nil {
-		t.Fatalf("mkdir src: %v", err)
+	remotePath = filepath.Join(dir, "remote")
+	if err := os.MkdirAll(remotePath, 0o755); err != nil {
+		t.Fatalf("mkdir remote: %v", err)
 	}
 
-	runCmd := func(dir string, args ...string) string {
+	runCmd := func(args ...string) string {
 		t.Helper()
 		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
+		cmd.Dir = remotePath
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), dir, err, out)
+			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), remotePath, err, out)
 		}
 		return strings.TrimSpace(string(out))
 	}
 
-	runCmd(src, "init", "-q", "-b", "main", src)
-	runCmd(src, "config", "user.email", "test@example.com")
-	runCmd(src, "config", "user.name", "Test User")
-	runCmd(src, "commit", "--allow-empty", "-q", "-m", "first commit on main")
-	mainSHA = runCmd(src, "rev-parse", "HEAD")
+	runCmd("init", "-q", "-b", "main", remotePath)
+	runCmd("config", "user.email", "test@example.com")
+	runCmd("config", "user.name", "Test User")
+	runCmd("commit", "--allow-empty", "-q", "-m", "first commit on main")
+	mainSHA = runCmd("rev-parse", "HEAD")
 
-	runCmd(src, "checkout", "-q", "-b", "feature")
-	runCmd(src, "commit", "--allow-empty", "-q", "-m", "feature commit")
-	featureSHA = runCmd(src, "rev-parse", "HEAD")
-	runCmd(src, "checkout", "-q", "main")
+	runCmd("checkout", "-q", "-b", "feature")
+	runCmd("commit", "--allow-empty", "-q", "-m", "feature commit")
+	featureSHA = runCmd("rev-parse", "HEAD")
+	runCmd("checkout", "-q", "main")
 
-	mirrorPath = filepath.Join(dir, "myrepo.git")
-	cmd := exec.Command("git", "clone", "--bare", "-q", src, mirrorPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("clone bare: %v: %s", err, out)
-	}
-	// Populate refs/remotes/origin/* from the local source so merge-base works
-	// even when the configured origin URL is unreachable (e.g. tests).
-	runCmd(mirrorPath, "fetch", src, "+refs/heads/*:refs/remotes/origin/*")
-
-	// Set origin to the expected GitHub URL (string only; no network access).
-	runCmd(mirrorPath, "remote", "set-url", "origin", "https://github.com/myorg/myrepo.git")
-
-	return mirrorPath, mainSHA, featureSHA
+	return remotePath, mainSHA, featureSHA
 }
 
-// setupBareMirrorWrongOrigin creates a mirror whose origin points at a
-// different local source than expected.
-func setupBareMirrorWrongOrigin(t *testing.T) string {
+func newConfig(t *testing.T, originURL string) SourceConfig {
 	t.Helper()
-	dir := t.TempDir()
-	src1 := filepath.Join(dir, "src1")
-	src2 := filepath.Join(dir, "src2")
-
-	runCmd := func(dir string, args ...string) {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), dir, err, out)
-		}
-	}
-
-	for _, d := range []string{src1, src2} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatalf("mkdir %s: %v", d, err)
-		}
-		runCmd(d, "init", "-q", "-b", "main", d)
-		runCmd(d, "config", "user.email", "test@example.com")
-		runCmd(d, "config", "user.name", "Test")
-		runCmd(d, "commit", "--allow-empty", "-q", "-m", "c")
-	}
-
-	mirror := filepath.Join(dir, "myrepo.git")
-	cmd := exec.Command("git", "clone", "--bare", "-q", src1, mirror)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("clone bare: %v: %s", err, out)
-	}
-	// Repoint origin at the wrong source.
-	runCmd(mirror, "remote", "set-url", "origin", src2)
-	return mirror
-}
-
-func newConfig(t *testing.T) (SourceConfig, string) {
-	t.Helper()
-	root := t.TempDir()
 	return SourceConfig{
 		AllowedOrg:     "myorg",
-		RepositoryRoot: root,
-		SkipFetch:      true, // tests run offline; refs are already populated
-	}, root
+		RepositoryRoot: t.TempDir(),
+		OriginURL:      originURL,
+	}
+}
+
+// mirrorPath returns the trusted mirror path for the given config and repo.
+func mirrorPath(cfg SourceConfig, repo string) string {
+	return filepath.Join(cfg.RepositoryRoot, repo+".git")
 }
 
 func TestCheckoutSource_ValidSHA(t *testing.T) {
-	mirror, mainSHA, _ := setupBareMirrorWithRefs(t)
-	cfg, root := newConfig(t)
-	expectedMirror := filepath.Join(root, "myrepo.git")
-	if err := os.Rename(mirror, expectedMirror); err != nil {
-		t.Fatalf("relocate: %v", err)
-	}
+	remote, mainSHA, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
 
 	result, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
 	if err != nil {
 		t.Fatalf("CheckoutSource: %v", err)
 	}
-	defer CleanupCheckout(cfg, result.CheckoutPath)
+	defer CleanupCheckout(context.Background(), cfg, *result)
 
 	if result.Organisation != "myorg" || result.Repository != "myrepo" || result.Commit != mainSHA {
 		t.Errorf("unexpected result: %+v", result)
 	}
+	if result.MirrorPath != mirrorPath(cfg, "myrepo") {
+		t.Errorf("MirrorPath = %q, want %q", result.MirrorPath, mirrorPath(cfg, "myrepo"))
+	}
 }
 
 func TestCheckoutSource_ShortSHARejected(t *testing.T) {
-	mirror, mainSHA, _ := setupBareMirrorWithRefs(t)
-	cfg, root := newConfig(t)
-	if err := os.Rename(mirror, filepath.Join(root, "myrepo.git")); err != nil {
-		t.Fatalf("relocate: %v", err)
-	}
+	remote, mainSHA, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
 
 	shortSHA := mainSHA[:39]
 	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", shortSHA); !errors.Is(err, ErrInvalidInput) {
@@ -140,11 +90,8 @@ func TestCheckoutSource_ShortSHARejected(t *testing.T) {
 }
 
 func TestCheckoutSource_UppercaseSHARejected(t *testing.T) {
-	mirror, mainSHA, _ := setupBareMirrorWithRefs(t)
-	cfg, root := newConfig(t)
-	if err := os.Rename(mirror, filepath.Join(root, "myrepo.git")); err != nil {
-		t.Fatalf("relocate: %v", err)
-	}
+	remote, mainSHA, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
 
 	upperSHA := strings.ToUpper(mainSHA)
 	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", upperSHA); !errors.Is(err, ErrInvalidInput) {
@@ -153,11 +100,8 @@ func TestCheckoutSource_UppercaseSHARejected(t *testing.T) {
 }
 
 func TestCheckoutSource_NonHexSHARejected(t *testing.T) {
-	mirror, _, _ := setupBareMirrorWithRefs(t)
-	cfg, root := newConfig(t)
-	if err := os.Rename(mirror, filepath.Join(root, "myrepo.git")); err != nil {
-		t.Fatalf("relocate: %v", err)
-	}
+	remote, _, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
 
 	nonHex := strings.Repeat("z", 40)
 	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", nonHex); !errors.Is(err, ErrInvalidInput) {
@@ -166,11 +110,8 @@ func TestCheckoutSource_NonHexSHARejected(t *testing.T) {
 }
 
 func TestCheckoutSource_InvalidRepoNameRejected(t *testing.T) {
-	mirror, mainSHA, _ := setupBareMirrorWithRefs(t)
-	cfg, root := newConfig(t)
-	if err := os.Rename(mirror, filepath.Join(root, "myrepo.git")); err != nil {
-		t.Fatalf("relocate: %v", err)
-	}
+	remote, mainSHA, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
 
 	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "MyRepo", mainSHA); !errors.Is(err, ErrInvalidInput) {
 		t.Errorf("expected ErrInvalidInput for invalid repo name, got %v", err)
@@ -178,23 +119,49 @@ func TestCheckoutSource_InvalidRepoNameRejected(t *testing.T) {
 }
 
 func TestCheckoutSource_RepoOriginMismatchRejected(t *testing.T) {
-	mirror := setupBareMirrorWrongOrigin(t)
-	cfg, root := newConfig(t)
-	if err := os.Rename(mirror, filepath.Join(root, "myrepo.git")); err != nil {
-		t.Fatalf("relocate: %v", err)
+	remote1, mainSHA, _ := setupRemote(t)
+	remote2, _, _ := setupRemote(t)
+	cfg := newConfig(t, remote1)
+
+	// First checkout creates the mirror pointing at remote1.
+	first, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
+	if err != nil {
+		t.Fatalf("first checkout: %v", err)
+	}
+	defer CleanupCheckout(context.Background(), cfg, *first)
+
+	// Repoint the existing mirror's origin at a different remote.
+	cmd := exec.Command("git", "-C", first.MirrorPath, "remote", "set-url", "origin", remote2)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("set-url: %v: %s", err, out)
 	}
 
-	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", strings.Repeat("a", 40)); !errors.Is(err, ErrRepoMismatch) {
+	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA); !errors.Is(err, ErrRepoMismatch) {
 		t.Errorf("expected ErrRepoMismatch, got %v", err)
 	}
 }
 
-func TestCheckoutSource_MissingCommitRejected(t *testing.T) {
-	mirror, _, _ := setupBareMirrorWithRefs(t)
-	cfg, root := newConfig(t)
-	if err := os.Rename(mirror, filepath.Join(root, "myrepo.git")); err != nil {
-		t.Fatalf("relocate: %v", err)
+func TestCheckoutSource_NonBareMirrorRejected(t *testing.T) {
+	cfg := newConfig(t, "file:///nonexistent")
+
+	// Pre-create a non-bare repository at the expected mirror path.
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(mirror, 0o755); err != nil {
+		t.Fatalf("mkdir mirror: %v", err)
 	}
+	cmd := exec.Command("git", "init", "-q", mirror)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+
+	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", strings.Repeat("a", 40)); !errors.Is(err, ErrNotBare) {
+		t.Errorf("expected ErrNotBare, got %v", err)
+	}
+}
+
+func TestCheckoutSource_MissingCommitRejected(t *testing.T) {
+	remote, _, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
 
 	bogusSHA := strings.Repeat("0", 40)
 	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", bogusSHA); !errors.Is(err, ErrCommitNotFound) {
@@ -203,15 +170,18 @@ func TestCheckoutSource_MissingCommitRejected(t *testing.T) {
 }
 
 func TestCheckoutSource_NonCommitObjectRejected(t *testing.T) {
-	mirror, _, _ := setupBareMirrorWithRefs(t)
-	cfg, root := newConfig(t)
-	mirrorPath := filepath.Join(root, "myrepo.git")
-	if err := os.Rename(mirror, mirrorPath); err != nil {
-		t.Fatalf("relocate: %v", err)
-	}
+	remote, _, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
 
-	// Get a tree SHA (a tree object, not a commit).
-	cmd := exec.Command("git", "-C", mirrorPath, "rev-parse", "HEAD^{tree}")
+	// Run a first checkout so the bare mirror is created; the tree SHA
+	// is then resolvable in the mirror.
+	first, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mustCommit(t, remote))
+	if err != nil {
+		t.Fatalf("setup checkout: %v", err)
+	}
+	defer CleanupCheckout(context.Background(), cfg, *first)
+
+	cmd := exec.Command("git", "-C", first.MirrorPath, "rev-parse", "HEAD^{tree}")
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("get tree: %v", err)
@@ -224,25 +194,19 @@ func TestCheckoutSource_NonCommitObjectRejected(t *testing.T) {
 }
 
 func TestCheckoutSource_CommitOnMainAccepted(t *testing.T) {
-	mirror, mainSHA, _ := setupBareMirrorWithRefs(t)
-	cfg, root := newConfig(t)
-	if err := os.Rename(mirror, filepath.Join(root, "myrepo.git")); err != nil {
-		t.Fatalf("relocate: %v", err)
-	}
+	remote, mainSHA, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
 
 	result, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
 	if err != nil {
 		t.Fatalf("CheckoutSource: %v", err)
 	}
-	defer CleanupCheckout(cfg, result.CheckoutPath)
+	defer CleanupCheckout(context.Background(), cfg, *result)
 }
 
 func TestCheckoutSource_CommitNotReachableFromMainRejected(t *testing.T) {
-	mirror, _, featureSHA := setupBareMirrorWithRefs(t)
-	cfg, root := newConfig(t)
-	if err := os.Rename(mirror, filepath.Join(root, "myrepo.git")); err != nil {
-		t.Fatalf("relocate: %v", err)
-	}
+	remote, _, featureSHA := setupRemote(t)
+	cfg := newConfig(t, remote)
 
 	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", featureSHA); !errors.Is(err, ErrUnreachableCommit) {
 		t.Errorf("expected ErrUnreachableCommit, got %v", err)
@@ -250,17 +214,14 @@ func TestCheckoutSource_CommitNotReachableFromMainRejected(t *testing.T) {
 }
 
 func TestCheckoutSource_DetachedCheckoutPointsAtCommit(t *testing.T) {
-	mirror, mainSHA, _ := setupBareMirrorWithRefs(t)
-	cfg, root := newConfig(t)
-	if err := os.Rename(mirror, filepath.Join(root, "myrepo.git")); err != nil {
-		t.Fatalf("relocate: %v", err)
-	}
+	remote, mainSHA, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
 
 	result, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
 	if err != nil {
 		t.Fatalf("CheckoutSource: %v", err)
 	}
-	defer CleanupCheckout(cfg, result.CheckoutPath)
+	defer CleanupCheckout(context.Background(), cfg, *result)
 
 	cmd := exec.Command("git", "-C", result.CheckoutPath, "rev-parse", "HEAD")
 	out, err := cmd.Output()
@@ -272,30 +233,70 @@ func TestCheckoutSource_DetachedCheckoutPointsAtCommit(t *testing.T) {
 	}
 }
 
-func TestCleanupCheckout_RemovesCheckout(t *testing.T) {
-	mirror, mainSHA, _ := setupBareMirrorWithRefs(t)
-	cfg, root := newConfig(t)
-	if err := os.Rename(mirror, filepath.Join(root, "myrepo.git")); err != nil {
-		t.Fatalf("relocate: %v", err)
+func TestCheckoutSource_OriginURLRequired(t *testing.T) {
+	cfg := SourceConfig{
+		AllowedOrg:     "myorg",
+		RepositoryRoot: t.TempDir(),
+		// OriginURL intentionally omitted.
 	}
+	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", strings.Repeat("a", 40)); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for missing OriginURL, got %v", err)
+	}
+}
 
-	result, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
+func TestCleanupCheckout_AllowsReuseAfterCleanup(t *testing.T) {
+	remote, mainSHA, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
+
+	first, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
 	if err != nil {
-		t.Fatalf("CheckoutSource: %v", err)
+		t.Fatalf("first checkout: %v", err)
+	}
+	if err := CleanupCheckout(context.Background(), cfg, *first); err != nil {
+		t.Fatalf("first cleanup: %v", err)
+	}
+	if _, err := os.Stat(first.CheckoutPath); err == nil {
+		t.Fatalf("checkout still exists after cleanup")
 	}
 
-	if err := CleanupCheckout(cfg, result.CheckoutPath); err != nil {
-		t.Fatalf("CleanupCheckout: %v", err)
+	second, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
+	if err != nil {
+		t.Fatalf("second checkout after cleanup: %v", err)
 	}
-	if _, err := os.Stat(result.CheckoutPath); err == nil {
-		t.Errorf("checkout still exists after cleanup")
+	defer CleanupCheckout(context.Background(), cfg, *second)
+	if second.CheckoutPath != first.CheckoutPath {
+		t.Errorf("second checkout path = %q, want %q", second.CheckoutPath, first.CheckoutPath)
 	}
 }
 
 func TestCleanupCheckout_RefusesPathsOutsideRoot(t *testing.T) {
-	cfg, _ := newConfig(t)
-	outside := "/this-path-does-not-exist-and-is-outside-the-temp-root"
-	if err := CleanupCheckout(cfg, outside); err == nil {
+	cfg := newConfig(t, "file:///nonexistent")
+	outside := SourceResult{
+		Repository:   "myrepo",
+		CheckoutPath: "/this-path-does-not-exist-and-is-outside-the-temp-root",
+	}
+	if err := CleanupCheckout(context.Background(), cfg, outside); err == nil {
 		t.Errorf("expected error for path outside root")
 	}
+}
+
+func TestCleanupCheckout_RefusesEmptyRepository(t *testing.T) {
+	cfg := newConfig(t, "file:///nonexistent")
+	bad := SourceResult{
+		Repository:   "",
+		CheckoutPath: filepath.Join(cfg.RepositoryRoot, "whatever"),
+	}
+	if err := CleanupCheckout(context.Background(), cfg, bad); err == nil {
+		t.Errorf("expected error for empty repository")
+	}
+}
+
+func mustCommit(t *testing.T, remote string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-C", remote, "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	return strings.TrimSpace(string(out))
 }
