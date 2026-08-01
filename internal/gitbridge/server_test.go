@@ -418,7 +418,7 @@ func TestGitHubRequest_OnlyBuilderPermissionsRequested(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------
-// Socket mode (default + override)
+// Socket mode
 // ----------------------------------------------------------------------
 
 func TestDefaultSocketModeConstant(t *testing.T) {

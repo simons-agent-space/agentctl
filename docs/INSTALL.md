@@ -90,7 +90,7 @@ environment variable.
   "private_key_path": "/etc/gitbridge/key.pem",
   "allowed_org": "simons-agent-space",
   "allowed_repositories": ["agentctl", "another-repo"],
-  "socket_path": "/run/gitbridge/socket",
+  "socket_path": "/run/gitbridge/socket"
 }
 ```
 

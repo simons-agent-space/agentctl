@@ -19,7 +19,7 @@ short-lived, repository-scoped tokens over a Unix domain socket.
 
 ### Broker
 
-The broker is a single Go binary (`cmd/gitbridge`) with three internal
+The broker is a single Go binary (`cmd/gitbridge`) with two internal
 packages:
 
 - `internal/gitbridge` — config, RS256 JWT minting, validation, UDS server, GitHub REST client
@@ -52,8 +52,9 @@ substring (`token`, `jwt`, `key`, `private_key`, `pem`, `secret`,
 
 The only path across the trust boundary is the UDS socket from the
 sandbox to the broker. There is no network listener on the broker; it
-opens HTTPS to `api.github.com` and nothing else, and the systemd unit
-restricts the broker to `AF_UNIX AF_INET AF_INET6`.
+opens HTTPS to `api.github.com`. The broker's code scopes outbound
+traffic to GitHub as the only intended outbound destination; the systemd
+unit restricts the broker to `AF_UNIX AF_INET AF_INET6`.
 
 ## Threat model
 
@@ -78,7 +79,8 @@ or returned anywhere except the UDS response.
 private key is read into memory once at startup and never returned from
 the package that loads it. The audit logger redacts any attribute whose
 name contains a sensitive substring. Error messages returned over UDS
-are always generic; full detail is logged on the broker side.
+are always generic; only `error_class` and an optional `http_status`
+are recorded on the broker side.
 
 **T5. Replay of an old installation token.** *Mitigation:* the broker
 mints a fresh token for every request. Clients receive the expiry in the
@@ -118,9 +120,9 @@ unresolved integration tasks below.
 |---|---|
 | Config file missing or invalid | Broker exits non-zero with a clear error. |
 | Private key missing or unreadable | Broker exits non-zero. |
-| GitHub API 4xx | Generic `INTERNAL` to the caller; full detail logged on the broker side. |
+| GitHub API 4xx | Generic `INTERNAL` to the caller; only `error_class` and (when applicable) `http_status` are recorded on the broker side. |
 | GitHub API 5xx | Same as 4xx. |
-| Audit log write failure | `slog`-equivalent logger returns the error to the broker; the broker exits non-zero. (No silent log loss.) |
+| Audit log write failure | Logging is currently best-effort: write failures are not propagated and the broker does not exit. |
 
 ## Design choices
 

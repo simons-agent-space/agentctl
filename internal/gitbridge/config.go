@@ -9,9 +9,10 @@ import (
 	"strings"
 )
 
-// DefaultSocketMode is the file mode applied to the UDS socket when the
-// config does not specify one. 0660 keeps the socket accessible to the
-// broker's group but unreadable to other users.
+// DefaultSocketMode is the file mode that the broker applies to the UDS
+// socket. It is fixed at 0660: owner + group can read/write, others
+// cannot. The broker always applies this mode; the config has no
+// override.
 const DefaultSocketMode os.FileMode = 0660
 
 // Config is the JSON file shape consumed by the broker. It is loaded once

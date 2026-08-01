@@ -88,6 +88,20 @@ func TestLoadConfig_RejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_RejectsTrailingJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := `{"app_id":1,"installation_id":2,"private_key_path":"/k","allowed_org":"o","allowed_repositories":["r"],"socket_path":"/s"}{"trailing":"object"}`
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Errorf("expected error for trailing JSON object")
+	} else if !strings.Contains(err.Error(), "trailing") {
+		t.Errorf("expected 'trailing' in error, got: %v", err)
+	}
+}
+
 func TestLoadConfig_HappyPath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")

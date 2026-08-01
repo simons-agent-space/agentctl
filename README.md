@@ -39,7 +39,8 @@ App is installed on, with whatever permissions the App is granted.
 
 The only path across the trust boundary is the local UDS socket. The
 broker never opens a non-TLS TCP listener; it speaks TLS to
-`api.github.com` and exits otherwise.
+`api.github.com`. The broker's code scopes outbound traffic to GitHub
+as the only intended outbound destination.
 
 ## Build and install
 
