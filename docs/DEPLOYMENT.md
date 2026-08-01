@@ -224,3 +224,108 @@ func RemoveCandidate(
 This layer does not yet implement Caddy, public routing, deployment
 state, rollback orchestration, sockets, HTTP handlers, systemd units,
 or the final deployment orchestrator. Those come in later layers.
+
+## Caddy promotion
+
+Once a candidate is health-checked and healthy, `agentctld` promotes
+it through Caddy so external traffic can reach it. Promotion is the
+bridge between the localhost-only candidate phase and the public
+hostname.
+
+### Inputs
+
+Promotion receives a validated `CandidateResult` and a trusted
+`CaddyConfig`. No caller input is accepted for hostnames, paths,
+upstreams, or raw Caddy configuration.
+
+```
+type CaddyConfig struct {
+    BaseDomain  string  // e.g., "apps.simonontheweb.de"
+    ConfigDir   string  // trusted directory for managed fragments
+    CaddyBinary string  // defaults to "caddy" when empty
+}
+```
+
+### Derived names
+
+- **Hostname** is derived as `<app>.<BaseDomain>`. The `app` comes from
+  the candidate's identity, the `BaseDomain` from the trusted host
+  configuration. The caller cannot influence either.
+- **Upstream** is always `127.0.0.1:<candidate.HostPort>`. No
+  `0.0.0.0`, no other interfaces, no caller-supplied addresses.
+- **Config path** is `<ConfigDir>/<app>.caddy`.
+
+### Managed config fragment
+
+The runtime writes a Caddyfile fragment of the form:
+
+```
+<hostname> {
+    reverse_proxy 127.0.0.1:<hostPort>
+}
+```
+
+The fragment is written atomically: the runtime writes to
+`<config>.tmp` first, validates it, reloads Caddy with the temp file,
+and only then renames it to the final path. If validation or reload
+fails, the temp file is removed and the previous final config (if
+any) is left untouched.
+
+### Validation and reload
+
+1. `caddy validate --config <temp>` runs against the new fragment.
+   On failure, the temp file is removed and the function returns
+   `ErrCaddyValidateFailed`. The previous config is preserved.
+2. `caddy reload --config <temp>` applies the new fragment to the
+   running Caddy. On failure, the temp file is removed and the
+   function returns `ErrCaddyReloadFailed`. The previous config is
+   preserved because the final file has not yet been renamed.
+3. On success, the temp file is atomically renamed to the final
+   path.
+
+### Identity validation
+
+Before writing or invoking Caddy, the candidate identity is
+re-derived and required to match exactly:
+
+- `app` matches the app-name regex.
+- `commit` matches `^[0-9a-f]{40}$`.
+- `image` equals `agentctl/<app>:<commit>`.
+- `container name` equals `agentctl-<app>-<first-12-chars-of-commit>`.
+- `host port` is a valid port number.
+- `health URL` is non-empty.
+
+Fabricated candidates are rejected with `ErrInvalidCandidate` before
+any disk or Caddy operation runs.
+
+### Result
+
+```
+type PromotionResult struct {
+    App        string
+    Commit     string
+    Hostname   string
+    Upstream   string
+    ConfigPath string
+}
+```
+
+### Removal
+
+```go
+func RemovePromotion(ctx context.Context, cfg CaddyConfig, app string) error
+```
+
+- Validates `app` against the app-name regex.
+- The derived config path `<ConfigDir>/<app>.caddy` must exist;
+  otherwise `ErrPromotionNotFound`.
+- Runs `caddy reload --config <path>` and then removes the file.
+- Only the exact derived app config is touched; other apps' configs
+  are left alone.
+
+### Out of scope
+
+This layer does not yet implement deployment state, rollback
+orchestration, multi-replica routing, rate limiting, authentication
+middleware, or the final deployment orchestrator. Those come in
+later layers.
