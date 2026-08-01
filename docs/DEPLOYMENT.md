@@ -87,10 +87,24 @@ Deployment sources are resolved by `agentctld` as follows:
   organisation is checked against a trusted configuration; the
   repository root and the origin URL are supplied by trusted host
   configuration, not by the caller.
-- The checkout directory is removed by `CleanupCheckout`, which derives
-  the trusted mirror path from the trusted repository root and the
-  repository name on the result (the caller never supplies it).
-  `CleanupCheckout` runs `git worktree remove --force <path>` and then
-  `git worktree prune` from the mirror to clear stale worktree metadata,
-  then removes the checkout directory. It refuses to operate on paths
-  outside the trusted repository root.
+- The checkout directory is removed by `CleanupCheckout`, which
+  validates the identity on the result: `result.Repository` must match
+  the app-name format and `result.Commit` must be exactly 40 lowercase
+  hex characters. The expected checkout path is derived from the
+  trusted repository root and the validated identity:
+
+  ```
+  <RepositoryRoot>/<Repository>-checkouts/<Commit>
+  ```
+
+  Both that derived path and the caller-supplied `result.CheckoutPath`
+  are resolved to absolute paths and required to be **exactly equal**
+  — `CleanupCheckout` does not accept merely any path beneath the
+  trusted root. The trusted mirror path is derived from the validated
+  `result.Repository`, never from caller input. On success
+  `CleanupCheckout` runs `git worktree remove --force <path>` followed
+  by `git worktree prune` from the mirror to clear stale worktree
+  metadata, then removes the checkout directory. The same
+  worktree-remove + prune + remove-all sequence is used as the
+  failure-cleanup path when `CheckoutSource` itself fails after the
+  worktree has been created (e.g. if credential stripping fails).

@@ -77,7 +77,7 @@ func CheckoutSource(ctx context.Context, cfg SourceConfig, organisation, reposit
 	}
 
 	if err := stripCredentials(checkoutPath); err != nil {
-		_ = os.RemoveAll(checkoutPath)
+		_ = removeCheckout(ctx, mirrorPath, checkoutPath)
 		return nil, fmt.Errorf("strip credentials: %w", err)
 	}
 
@@ -240,42 +240,49 @@ func sanitizeConfigFile(path string) error {
 }
 
 // CleanupCheckout removes the temporary checkout directory and clears
-// its worktree registration from the trusted mirror. The trusted mirror
-// path is derived from cfg.RepositoryRoot and result.Repository — the
-// caller never supplies it.
+// its worktree registration from the trusted mirror.
 //
-// Refuses to operate on paths outside the trusted repository root.
+// The identity of the checkout (repository, commit) is validated
+// against the existing app-name and SHA rules. The expected checkout
+// path is derived from the trusted repository root and the validated
+// identity; the caller-supplied CheckoutPath must match it exactly.
+//
+// The trusted mirror path is derived from cfg.RepositoryRoot and the
+// validated result.Repository — the caller never supplies it.
 func CleanupCheckout(ctx context.Context, cfg SourceConfig, result SourceResult) error {
-	if result.Repository == "" {
-		return fmt.Errorf("repository name is required to derive the trusted mirror path")
+	if !appNameRe.MatchString(result.Repository) {
+		return fmt.Errorf("%w: repository %q does not match app-name format", ErrInvalidInput, result.Repository)
+	}
+	if !shaRe.MatchString(result.Commit) {
+		return fmt.Errorf("%w: commit %q is not exactly 40 lowercase hex characters", ErrInvalidInput, result.Commit)
+	}
+
+	expectedPath := filepath.Join(cfg.RepositoryRoot, result.Repository+"-checkouts", result.Commit)
+	absExpected, err := filepath.Abs(expectedPath)
+	if err != nil {
+		return fmt.Errorf("resolve expected checkout path: %w", err)
 	}
 	absCheckout, err := filepath.Abs(result.CheckoutPath)
 	if err != nil {
-		return fmt.Errorf("resolve checkout path: %w", err)
+		return fmt.Errorf("%w: resolve checkout path %s: %v", ErrInvalidInput, result.CheckoutPath, err)
 	}
-	absRoot, err := filepath.Abs(cfg.RepositoryRoot)
-	if err != nil {
-		return fmt.Errorf("resolve root path: %w", err)
+	if absExpected != absCheckout {
+		return fmt.Errorf("%w: checkout path %s does not match expected %s", ErrInvalidInput, absCheckout, absExpected)
 	}
-	rel, err := filepath.Rel(absRoot, absCheckout)
-	if err != nil {
-		return fmt.Errorf("checkout path %s is outside trusted root %s", result.CheckoutPath, cfg.RepositoryRoot)
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return fmt.Errorf("checkout path %s is outside trusted root %s", result.CheckoutPath, cfg.RepositoryRoot)
-	}
-	mirrorPath := filepath.Join(absRoot, result.Repository+".git")
 
-	// Best-effort worktree removal from the mirror. If the mirror is gone
-	// or the worktree was already unregistered, these can fail without
-	// preventing the directory cleanup below.
-	_ = runGit(ctx, mirrorPath, "worktree", "remove", "--force", absCheckout)
+	mirrorPath := filepath.Join(cfg.RepositoryRoot, result.Repository+".git")
+	return removeCheckout(ctx, mirrorPath, absCheckout)
+}
+
+// removeCheckout clears the worktree's Git registration and removes
+// the checkout directory. The worktree-remove and prune steps are
+// best-effort: a missing mirror, an already-unregistered worktree, or
+// any other pre-condition failure must not prevent the directory
+// removal that follows.
+func removeCheckout(ctx context.Context, mirrorPath, checkoutPath string) error {
+	_ = runGit(ctx, mirrorPath, "worktree", "remove", "--force", checkoutPath)
 	_ = runGit(ctx, mirrorPath, "worktree", "prune")
-
-	if err := os.RemoveAll(absCheckout); err != nil {
-		return fmt.Errorf("remove checkout path %s: %w", absCheckout, err)
-	}
-	return nil
+	return os.RemoveAll(checkoutPath)
 }
 
 func runGit(ctx context.Context, dir string, args ...string) error {

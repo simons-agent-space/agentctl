@@ -269,25 +269,124 @@ func TestCleanupCheckout_AllowsReuseAfterCleanup(t *testing.T) {
 	}
 }
 
-func TestCleanupCheckout_RefusesPathsOutsideRoot(t *testing.T) {
+func TestCleanupCheckout_RejectsCheckoutPathEqualToRoot(t *testing.T) {
 	cfg := newConfig(t, "file:///nonexistent")
-	outside := SourceResult{
-		Repository:   "myrepo",
-		CheckoutPath: "/this-path-does-not-exist-and-is-outside-the-temp-root",
+	commit := strings.Repeat("a", 40)
+
+	// Verify the root is a real directory before the call so we can
+	// assert afterwards that it has not been deleted.
+	if _, err := os.Stat(cfg.RepositoryRoot); err != nil {
+		t.Fatalf("repository root missing before test: %v", err)
 	}
-	if err := CleanupCheckout(context.Background(), cfg, outside); err == nil {
-		t.Errorf("expected error for path outside root")
+
+	bad := SourceResult{
+		Repository:   "myrepo",
+		Commit:       commit,
+		CheckoutPath: cfg.RepositoryRoot,
+	}
+	if err := CleanupCheckout(context.Background(), cfg, bad); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for CheckoutPath == RepositoryRoot, got %v", err)
+	}
+	if _, err := os.Stat(cfg.RepositoryRoot); err != nil {
+		t.Errorf("repository root was deleted by CleanupCheckout: %v", err)
 	}
 }
 
-func TestCleanupCheckout_RefusesEmptyRepository(t *testing.T) {
+func TestCleanupCheckout_RejectsDifferentCheckoutPath(t *testing.T) {
 	cfg := newConfig(t, "file:///nonexistent")
-	bad := SourceResult{
-		Repository:   "",
-		CheckoutPath: filepath.Join(cfg.RepositoryRoot, "whatever"),
+	commit := strings.Repeat("a", 40)
+
+	// Pre-create a path inside the root that is not the derived
+	// <root>/<repo>-checkouts/<commit> path.
+	bogusPath := filepath.Join(cfg.RepositoryRoot, "not-the-real-checkout")
+	if err := os.MkdirAll(bogusPath, 0o755); err != nil {
+		t.Fatalf("mkdir bogus: %v", err)
 	}
-	if err := CleanupCheckout(context.Background(), cfg, bad); err == nil {
-		t.Errorf("expected error for empty repository")
+
+	bad := SourceResult{
+		Repository:   "myrepo",
+		Commit:       commit,
+		CheckoutPath: bogusPath,
+	}
+	if err := CleanupCheckout(context.Background(), cfg, bad); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for different checkout path, got %v", err)
+	}
+	if _, err := os.Stat(bogusPath); err != nil {
+		t.Errorf("alleged checkout path was deleted despite rejection: %v", err)
+	}
+}
+
+func TestCleanupCheckout_RejectsPathTraversalRepositoryName(t *testing.T) {
+	cfg := newConfig(t, "file:///nonexistent")
+	commit := strings.Repeat("a", 40)
+
+	cases := []struct {
+		name string
+		repo string
+	}{
+		{"empty", ""},
+		{"uppercase-prefix", "Myrepo"},
+		{"path-traversal-dotdot", "../../../etc"},
+		{"path-traversal-absolute", "/etc/passwd"},
+		{"trailing-dash", "myrepo-"},
+		{"uppercase-infix", "myREPO"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := SourceResult{
+				Repository:   tc.repo,
+				Commit:       commit,
+				CheckoutPath: filepath.Join(cfg.RepositoryRoot, tc.repo, "checkouts", commit),
+			}
+			if err := CleanupCheckout(context.Background(), cfg, bad); !errors.Is(err, ErrInvalidInput) {
+				t.Errorf("expected ErrInvalidInput for repository %q, got %v", tc.repo, err)
+			}
+		})
+	}
+}
+
+func TestCleanupCheckout_RejectsInvalidCommitSHA(t *testing.T) {
+	cfg := newConfig(t, "file:///nonexistent")
+
+	cases := []struct {
+		name   string
+		commit string
+	}{
+		{"empty", ""},
+		{"too-short", "abc123"},
+		{"too-long", strings.Repeat("a", 41)},
+		{"uppercase", strings.Repeat("A", 40)},
+		{"non-hex", strings.Repeat("z", 40)},
+		{"mixed-case", strings.Repeat("a", 20) + strings.Repeat("A", 20)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := SourceResult{
+				Repository:   "myrepo",
+				Commit:       tc.commit,
+				CheckoutPath: filepath.Join(cfg.RepositoryRoot, "myrepo-checkouts", tc.commit),
+			}
+			if err := CleanupCheckout(context.Background(), cfg, bad); !errors.Is(err, ErrInvalidInput) {
+				t.Errorf("expected ErrInvalidInput for commit %q, got %v", tc.commit, err)
+			}
+		})
+	}
+}
+
+func TestCleanupCheckout_RefusesPathsOutsideRoot(t *testing.T) {
+	cfg := newConfig(t, "file:///nonexistent")
+	commit := strings.Repeat("a", 40)
+	outside := "/this-path-does-not-exist-and-is-outside-the-temp-root"
+
+	bad := SourceResult{
+		Repository:   "myrepo",
+		Commit:       commit,
+		CheckoutPath: outside,
+	}
+	if err := CleanupCheckout(context.Background(), cfg, bad); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for path outside root, got %v", err)
 	}
 }
 
