@@ -1,0 +1,58 @@
+[Unit]
+Description=gitbridge - GitHub App installation-token broker
+Documentation=https://github.com/simons-agent-space/agentctl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gitbridge
+Group=gitbridge
+
+ExecStart=/usr/local/bin/gitbridge \
+    --config /etc/gitbridge/config.json \
+    --log /var/log/gitbridge/audit.log
+
+Restart=on-failure
+RestartSec=5s
+
+# Sandbox the broker hard. The broker only opens:
+#   - a Unix domain socket for UDS clients
+#   - a TCP socket (AF_INET/AF_INET6) for TLS to api.github.com
+# Earlier drafts blocked AF_INET here and broke HTTPS, so the explicit
+# list includes AF_INET and AF_INET6 alongside AF_UNIX.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Filesystem layout created by systemd.
+ConfigurationDirectory=gitbridge
+ConfigurationDirectoryMode=0750
+LogsDirectory=gitbridge
+LogsDirectoryMode=0750
+RuntimeDirectory=gitbridge
+RuntimeDirectoryMode=0750
+StateDirectory=gitbridge
+
+[Install]
+WantedBy=multi-user.target
