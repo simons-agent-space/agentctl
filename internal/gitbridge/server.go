@@ -63,7 +63,14 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/token", s.handleToken)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 
-	server := &http.Server{Handler: mux}
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 16,
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -125,6 +132,11 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cap the request body. Larger bodies are rejected by
+	// MaxBytesReader, which surfaces as a read error that
+	// decodeRequest turns into BAD_REQUEST.
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+
 	repo, prof, verr := decodeRequest(r.Body)
 	if verr != nil {
 		s.auditReject(repo, prof, verr)
@@ -147,12 +159,17 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 
 	token, exp, err := s.issuer.mintAndReturn(r.Context(), repoName, resolvedPerms)
 	if err != nil {
-		s.log.Error("audit", map[string]any{
-			"op":      "internal_error",
-			"repo":    repo,
-			"profile": string(prof),
-			"err":     err.Error(),
-		})
+		cls, status := classifyError(err)
+		fields := map[string]any{
+			"op":          "internal_error",
+			"repo":        repo,
+			"profile":     string(prof),
+			"error_class": string(cls),
+		}
+		if status != 0 {
+			fields["http_status"] = status
+		}
+		s.log.Error("audit", fields)
 		writeInternal(w)
 		return
 	}
@@ -336,9 +353,10 @@ func (v *validationError) Error() string {
 }
 
 // decodeRequest reads exactly one JSON object from r and rejects any
-// trailing content. This prevents an attacker from smuggling extra data
-// past the broker under the assumption that the decoder will only
-// consume the first object.
+// trailing content. A second Decode call is used as the trailing-data
+// check; it must return io.EOF for a well-formed single-object body.
+// Decoder.More() is not a reliable general check for trailing top-level
+// JSON, so we rely on io.EOF instead.
 func decodeRequest(r io.Reader) (string, Name, *validationError) {
 	var req request
 	dec := json.NewDecoder(r)
@@ -346,7 +364,7 @@ func decodeRequest(r io.Reader) (string, Name, *validationError) {
 	if err := dec.Decode(&req); err != nil {
 		return "", "", &validationError{Code: "BAD_REQUEST", Reason: "invalid JSON body"}
 	}
-	if dec.More() {
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return "", "", &validationError{Code: "BAD_REQUEST", Reason: "trailing data after request object"}
 	}
 	if req.Repo == "" {
@@ -356,6 +374,32 @@ func decodeRequest(r io.Reader) (string, Name, *validationError) {
 		return "", "", &validationError{Code: "BAD_REQUEST", Reason: "profile is required"}
 	}
 	return req.Repo, Name(req.Profile), nil
+}
+
+// errorClass classifies internal errors for audit logging. Only safe
+// fields are written; free-form error messages are never logged because
+// they can contain upstream secrets.
+type errorClass string
+
+const (
+	classUpstream  errorClass = "upstream"  // GitHub API error; http_status is set
+	classTransport errorClass = "transport" // network/timeout; no http_status
+	classInternal  errorClass = "internal"  // unexpected; no http_status
+)
+
+// classifyError returns a safe classification of err plus the GitHub
+// HTTP status code when applicable (zero otherwise). It never returns
+// the underlying error message.
+func classifyError(err error) (errorClass, int) {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return classUpstream, apiErr.StatusCode
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return classTransport, 0
+	}
+	return classInternal, 0
 }
 
 // authorize checks the request against the configured allowlist and

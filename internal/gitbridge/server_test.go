@@ -2,7 +2,6 @@ package gitbridge
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -196,9 +195,10 @@ func TestServer_LogsRejection(t *testing.T) {
 }
 
 func TestServer_GitHubErrorReturnsGenericInternal(t *testing.T) {
+	const fakeSecret = "internal-stack-secret-ABC123-leaked-from-upstream"
 	ghHandler := func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = io.WriteString(w, `{"message":"internal-stack-secret-ABC123 leaked from upstream"}`)
+		_, _ = io.WriteString(w, `{"message":"`+fakeSecret+`"}`)
 	}
 	srv, logBuf := makeTestServer(t, ghHandler)
 	body := strings.NewReader(`{"repo":"simons-agent-space/agentctl","profile":"builder"}`)
@@ -209,13 +209,21 @@ func TestServer_GitHubErrorReturnsGenericInternal(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("expected 500, got %d", rec.Code)
 	}
+
 	bodyStr := rec.Body.String()
-	if strings.Contains(bodyStr, "internal-stack-secret-ABC123") {
-		t.Errorf("raw upstream error leaked to UDS caller: %s", bodyStr)
+	if strings.Contains(bodyStr, fakeSecret) {
+		t.Errorf("fake upstream secret leaked to UDS caller: %s", bodyStr)
 	}
-	if strings.Contains(bodyStr, "leaked") {
-		t.Errorf("raw upstream error message leaked: %s", bodyStr)
+	if strings.Contains(logBuf.String(), fakeSecret) {
+		t.Errorf("fake upstream secret leaked to audit log: %s", logBuf.String())
 	}
+	if !strings.Contains(logBuf.String(), `"error_class":"upstream"`) {
+		t.Errorf("audit log should classify error as upstream: %s", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), `"http_status":500`) {
+		t.Errorf("audit log should record http_status 500: %s", logBuf.String())
+	}
+
 	var er errorResponse
 	if err := json.NewDecoder(strings.NewReader(bodyStr)).Decode(&er); err != nil {
 		t.Fatal(err)
@@ -225,9 +233,6 @@ func TestServer_GitHubErrorReturnsGenericInternal(t *testing.T) {
 	}
 	if er.Error != "internal error" {
 		t.Errorf("error message should be generic, got %q", er.Error)
-	}
-	if !strings.Contains(logBuf.String(), "internal-stack-secret-ABC123") {
-		t.Errorf("full upstream error must be logged on the broker side: %s", logBuf.String())
 	}
 }
 
@@ -727,4 +732,3 @@ func TestEndToEnd_MintsValidToken(t *testing.T) {
 
 // Just enough to make `go vet` happy with the imported ctx; we don't
 // actually run ListenAndServe in unit tests.
-var _ = context.Background

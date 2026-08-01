@@ -160,4 +160,4 @@ Error response:
 | `PROFILE_NOT_ALLOWED` | 403 | Profile is not `builder` |
 | `REPO_NOT_ALLOWED` | 403 | Repository is not in `allowed_org`/`allowed_repositories` |
 | `METHOD_NOT_ALLOWED` | 405 | Wrong HTTP method |
-| `INTERNAL` | 500 | Unexpected error (see broker audit log for detail) |
+| `INTERNAL` | 500 | Unexpected error. The audit log on the broker side records an `error_class` (e.g. `upstream`, `transport`, `internal`) and, for upstream errors, the GitHub `http_status`. The free-form upstream message is never logged or returned. |

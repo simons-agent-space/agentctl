@@ -101,7 +101,7 @@ func (c *Config) IsAllowed(fullSlug string) bool {
 	return false
 }
 
-// SplitSlug returns the org and name parts of a full repository slug
+// splitSlug returns the org and name parts of a full repository slug
 // like "octo/cat". It returns ok=false for malformed inputs.
 func splitSlug(slug string) (org, name string, ok bool) {
 	parts := strings.Split(slug, "/")

@@ -133,6 +133,18 @@ func (c *Client) MintInstallationToken(
 	if err := json.Unmarshal(respBody, &out); err != nil {
 		return nil, fmt.Errorf("decode token response: %w", err)
 	}
+	if out.Token == "" {
+		return nil, &APIError{StatusCode: resp.StatusCode, Message: "missing or empty token in response"}
+	}
+	if out.ExpiresAt.IsZero() {
+		return nil, &APIError{StatusCode: resp.StatusCode, Message: "missing expires_at in response"}
+	}
+	if !out.ExpiresAt.After(time.Now()) {
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    fmt.Sprintf("expires_at %v is not in the future", out.ExpiresAt),
+		}
+	}
 	return &out, nil
 }
 
