@@ -17,7 +17,6 @@ import (
 	"time"
 )
 
-// redacted is the placeholder substituted for any redacted field value.
 const redacted = "[REDACTED]"
 
 // sensitiveSubstrings are case-insensitive substrings that mark a field
@@ -81,7 +80,6 @@ func (l *Logger) emit(level, event string, fields map[string]any) {
 	_, _ = l.w.Write(b)
 }
 
-// redactField returns redacted if key is sensitive, otherwise val.
 func redactField(key string, val any) any {
 	if isSensitive(key) {
 		return redacted
@@ -108,39 +106,4 @@ func RedactString(sensitive string) string {
 		return ""
 	}
 	return redacted
-}
-
-// Event is a small helper for emitting consistently-named audit events.
-// Use it from request middleware to avoid spelling inconsistencies.
-type Event struct {
-	Op      string // short verb: validated, minted, rejected
-	Repo    string // full repo slug, if known
-	Profile string // permission profile requested, if any
-	Reason  string // rejection reason, if any
-	Err     error  // error to record (never carries the token)
-}
-
-// Emit writes the event to log.
-func (l *Event) Emit(log *Logger) {
-	fields := map[string]any{}
-	if l.Op != "" {
-		fields["op"] = l.Op
-	}
-	if l.Repo != "" {
-		fields["repo"] = l.Repo
-	}
-	if l.Profile != "" {
-		fields["profile"] = l.Profile
-	}
-	if l.Reason != "" {
-		fields["reason"] = l.Reason
-	}
-	if l.Err != nil {
-		fields["err"] = l.Err.Error()
-	}
-	if l.Err != nil || l.Op == "rejected" {
-		log.Warn("audit", fields)
-	} else {
-		log.Info("audit", fields)
-	}
 }

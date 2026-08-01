@@ -22,7 +22,6 @@ import (
 
 	"github.com/simons-agent-space/agentctl/internal/audit"
 	"github.com/simons-agent-space/agentctl/internal/gitbridge"
-	gh "github.com/simons-agent-space/agentctl/internal/github"
 )
 
 func main() {
@@ -47,7 +46,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ghClient := gh.NewClient()
+	ghClient := gitbridge.NewClient()
 
 	srv, err := gitbridge.NewServer(cfg, ghClient, log)
 	if err != nil {

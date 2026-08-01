@@ -1,9 +1,4 @@
-// Package github wraps the small slice of the GitHub REST API that
-// gitbridge needs to mint installation tokens. It deliberately avoids a
-// general-purpose client: every method has a narrow contract and any
-// value that contains a token is consumed locally and never returned to
-// a caller that would log it.
-package github
+package gitbridge
 
 import (
 	"bytes"
@@ -63,9 +58,7 @@ type Client struct {
 	base       string
 }
 
-// NewClient returns a Client with sensible defaults. Callers can wrap
-// the http.Client in a transport of their own choosing if they need to
-// pin certificates, route through a proxy, etc.
+// NewClient returns a Client configured for the production GitHub API.
 func NewClient() *Client {
 	return NewClientWithBase(apiBase)
 }

@@ -18,65 +18,39 @@ func validConfig() *Config {
 	}
 }
 
-func TestConfigValidate_OK(t *testing.T) {
+func cloneConfig(c *Config) *Config {
+	out := *c
+	out.AllowedRepos = append([]string(nil), c.AllowedRepos...)
+	return &out
+}
+
+func TestConfigValidate_Valid(t *testing.T) {
 	if err := validConfig().Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
 }
 
-func TestConfigValidate_AppID(t *testing.T) {
-	c := validConfig()
-	c.AppID = 0
-	if err := c.Validate(); err == nil {
-		t.Errorf("expected error for app_id=0")
+func TestConfigValidate_RejectsInvalid(t *testing.T) {
+	cases := []struct {
+		name string
+		mod  func(*Config)
+	}{
+		{"AppID zero", func(c *Config) { c.AppID = 0 }},
+		{"InstallationID zero", func(c *Config) { c.InstallationID = 0 }},
+		{"missing PrivateKeyPath", func(c *Config) { c.PrivateKeyPath = "" }},
+		{"missing AllowedOrg", func(c *Config) { c.AllowedOrg = "" }},
+		{"empty AllowedRepos", func(c *Config) { c.AllowedRepos = nil }},
+		{"repo with slash", func(c *Config) { c.AllowedRepos = []string{"org/repo"} }},
+		{"missing SocketPath", func(c *Config) { c.SocketPath = "" }},
 	}
-}
-
-func TestConfigValidate_InstallationID(t *testing.T) {
-	c := validConfig()
-	c.InstallationID = 0
-	if err := c.Validate(); err == nil {
-		t.Errorf("expected error for installation_id=0")
-	}
-}
-
-func TestConfigValidate_NoPrivateKeyPath(t *testing.T) {
-	c := validConfig()
-	c.PrivateKeyPath = ""
-	if err := c.Validate(); err == nil {
-		t.Errorf("expected error for missing private_key_path")
-	}
-}
-
-func TestConfigValidate_NoOrg(t *testing.T) {
-	c := validConfig()
-	c.AllowedOrg = ""
-	if err := c.Validate(); err == nil {
-		t.Errorf("expected error for missing allowed_org")
-	}
-}
-
-func TestConfigValidate_EmptyAllowedRepos(t *testing.T) {
-	c := validConfig()
-	c.AllowedRepos = nil
-	if err := c.Validate(); err == nil {
-		t.Errorf("expected error for empty allowed_repositories")
-	}
-}
-
-func TestConfigValidate_RepoWithSlash(t *testing.T) {
-	c := validConfig()
-	c.AllowedRepos = []string{"org/repo"}
-	if err := c.Validate(); err == nil {
-		t.Errorf("expected error for repo name with slash")
-	}
-}
-
-func TestConfigValidate_NoSocketPath(t *testing.T) {
-	c := validConfig()
-	c.SocketPath = ""
-	if err := c.Validate(); err == nil {
-		t.Errorf("expected error for missing socket_path")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := cloneConfig(validConfig())
+			tc.mod(c)
+			if err := c.Validate(); err == nil {
+				t.Errorf("expected error for %s", tc.name)
+			}
+		})
 	}
 }
 

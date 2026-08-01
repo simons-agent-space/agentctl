@@ -1,8 +1,8 @@
-// Package policy defines permission profiles that constrain GitHub App
-// installation tokens. The broker only ever mints tokens with one of the
-// profiles defined here; arbitrary permissions are not accepted from the
-// caller. This keeps the principle of least privilege at the API surface.
-package policy
+// Package gitbridge defines the fixed permission profile that the broker
+// will mint tokens for. The broker only ever mints tokens with this
+// profile; arbitrary permissions are not accepted from the caller.
+// This keeps the principle of least privilege at the API surface.
+package gitbridge
 
 import "fmt"
 
@@ -19,7 +19,7 @@ const (
 
 // Permission is a single (scope, level) pair. The level is one of the
 // strings documented at https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
-type Permission struct {
+type permissionEntry struct {
 	Scope  string `json:"scope"`
 	Access string `json:"access"`
 }
@@ -27,7 +27,7 @@ type Permission struct {
 // Profile is the resolved set of permissions for a request.
 type Profile struct {
 	Name        Name
-	Permissions []Permission
+	Permissions []permissionEntry
 }
 
 // all returns the static set of permissions for a known profile name.
@@ -37,7 +37,7 @@ func all(name Name) (Profile, error) {
 	case ProfileBuilder:
 		return Profile{
 			Name: ProfileBuilder,
-			Permissions: []Permission{
+			Permissions: []permissionEntry{
 				{Scope: "contents", Access: "write"},
 				{Scope: "pull_requests", Access: "write"},
 				{Scope: "issues", Access: "write"},
