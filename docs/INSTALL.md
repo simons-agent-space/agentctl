@@ -11,7 +11,6 @@ The repository uses Go 1.19+ and has no third-party dependencies.
 ```
 git clone https://github.com/simons-agent-space/agentctl.git
 cd agentctl
-git checkout feat/bootstrap-gitbridge
 go build -o bin/gitbridge ./cmd/gitbridge
 ```
 
@@ -92,8 +91,7 @@ environment variable.
   "allowed_org": "simons-agent-space",
   "allowed_repositories": ["agentctl", "another-repo"],
   "socket_path": "/run/gitbridge/socket",
-  "socket_mode": "0660",
-  "socket_group": "gitbridge"
+  "socket_mode": "0660"
 }
 ```
 
@@ -107,8 +105,7 @@ environment variable.
 | `allowed_org` | string | yes | The single GitHub organisation that repositories must belong to. |
 | `allowed_repositories` | array of string | yes | Explicit allowlist of repository names (without org prefix). |
 | `socket_path` | path | yes | Where the Unix domain socket is created. |
-| `socket_mode` | octal string | no | File mode applied to the socket (default: `0660`). |
-| `socket_group` | group name | no | Group applied to the socket (default: broker process group). |
+| `socket_mode` | octal string | no | Override the socket file mode. Defaults to `0660`. |
 
 ### Validation
 
@@ -159,8 +156,8 @@ Error response:
 
 | Code | HTTP | Cause |
 |---|---|---|
-| `BAD_REQUEST` | 400 | Malformed JSON, missing fields, or unknown fields |
+| `BAD_REQUEST` | 400 | Malformed JSON, missing fields, unknown fields, or trailing data |
 | `PROFILE_NOT_ALLOWED` | 403 | Profile is not `builder` |
 | `REPO_NOT_ALLOWED` | 403 | Repository is not in `allowed_org`/`allowed_repositories` |
 | `METHOD_NOT_ALLOWED` | 405 | Wrong HTTP method |
-| `INTERNAL` | 500 | Unexpected error (e.g. GitHub API failure) |
+| `INTERNAL` | 500 | Unexpected error (see broker audit log for detail) |

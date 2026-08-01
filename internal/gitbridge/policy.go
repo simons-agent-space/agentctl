@@ -2,6 +2,10 @@
 // will mint tokens for. The broker only ever mints tokens with this
 // profile; arbitrary permissions are not accepted from the caller.
 // This keeps the principle of least privilege at the API surface.
+//
+// The profile's permissions must align with what the GitHub App is
+// actually granted and what the calling agent needs to do its job.
+// Adding a permission here widens what every minted token can do.
 package gitbridge
 
 import "fmt"
@@ -12,47 +16,27 @@ type Name string
 // Supported profile names.
 const (
 	// ProfileBuilder is the only fixed profile accepted by gitbridge.
-	// It grants the minimum permissions required to push code, open
-	// pull requests, file issues, and report build status.
+	// It grants the minimum permissions required to push code and open
+	// pull requests. Issue filing, checks, statuses, and other
+	// non-essential scopes are deliberately omitted: an agent that
+	// needs more should justify each scope explicitly rather than
+	// inheriting a generous default.
 	ProfileBuilder Name = "builder"
 )
 
-// Permission is a single (scope, level) pair. The level is one of the
-// strings documented at https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
-type permissionEntry struct {
-	Scope  string `json:"scope"`
-	Access string `json:"access"`
-}
-
-// Profile is the resolved set of permissions for a request.
-type Profile struct {
-	Name        Name
-	Permissions []permissionEntry
-}
-
-// all returns the static set of permissions for a known profile name.
-// Unknown names return an error so the broker can reject the request.
-func all(name Name) (Profile, error) {
+// PermissionsFor returns the permissions map for the given profile
+// name, suitable for serialising directly into the GitHub access-tokens
+// request body. Unknown profile names return an error so the broker
+// can reject the request before contacting GitHub.
+func PermissionsFor(name Name) (map[string]string, error) {
 	switch name {
 	case ProfileBuilder:
-		return Profile{
-			Name: ProfileBuilder,
-			Permissions: []permissionEntry{
-				{Scope: "contents", Access: "write"},
-				{Scope: "pull_requests", Access: "write"},
-				{Scope: "issues", Access: "write"},
-				{Scope: "checks", Access: "write"},
-				{Scope: "statuses", Access: "write"},
-				{Scope: "metadata", Access: "read"},
-			},
+		return map[string]string{
+			"contents":      "write",
+			"pull_requests": "write",
+			"metadata":      "read",
 		}, nil
 	default:
-		return Profile{}, fmt.Errorf("unknown profile: %q", name)
+		return nil, fmt.Errorf("unknown profile: %q", name)
 	}
-}
-
-// Resolve returns the canonical Profile for name. It is the single entry
-// point used by the broker when validating a request.
-func Resolve(name Name) (Profile, error) {
-	return all(name)
 }

@@ -42,8 +42,8 @@ func NewServer(cfg *Config, ghc *Client, log *audit.Logger) (*Server, error) {
 }
 
 // ListenAndServe creates the Unix domain socket and serves until ctx is
-// cancelled. The socket is created with mode 0660 by default; the caller
-// can configure the mode and group via the config file.
+// cancelled. The socket is always created with mode 0660 by default;
+// the operator can override via SocketMode in the config.
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	if err := os.Remove(s.cfg.SocketPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove stale socket: %w", err)
@@ -55,14 +55,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	defer listener.Close()
 	defer os.Remove(s.cfg.SocketPath)
 
-	if s.cfg.SocketMode != "" {
-		mode, err := strconv.ParseUint(s.cfg.SocketMode, 8, 32)
-		if err != nil {
-			return fmt.Errorf("parse socket_mode: %w", err)
-		}
-		if err := os.Chmod(s.cfg.SocketPath, os.FileMode(mode)); err != nil {
-			return fmt.Errorf("chmod socket: %w", err)
-		}
+	if err := applySocketMode(s.cfg, s.cfg.SocketPath); err != nil {
+		return fmt.Errorf("apply socket mode: %w", err)
 	}
 
 	mux := http.NewServeMux()
@@ -90,24 +84,44 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 }
 
-// handleHealthz returns 200 OK for liveness checks. It does not require
-// any configuration and does not contact the GitHub API.
-func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
+// applySocketMode chmods path to either DefaultSocketMode or the
+// override in cfg.SocketMode. It is split out so it can be tested
+// without spinning up a full listener.
+func applySocketMode(cfg *Config, path string) error {
+	mode := DefaultSocketMode
+	if cfg.SocketMode != "" {
+		m, err := strconv.ParseUint(cfg.SocketMode, 8, 32)
+		if err != nil {
+			return fmt.Errorf("parse socket_mode: %w", err)
+		}
+		mode = os.FileMode(m)
+	}
+	return os.Chmod(path, mode)
 }
 
-// handleToken processes one mint request. The handler is intentionally
-// simple: every step is logged via the audit logger and the private key,
-// JWT, and installation token never appear in any log line.
-func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+// handleHealthz returns 200 OK for liveness checks. GET only.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		_ = json.NewEncoder(w).Encode(errorResponse{
 			Error: "method not allowed",
 			Code:  "METHOD_NOT_ALLOWED",
 		})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+// handleToken processes one mint request. The handler is intentionally
+// simple: every step is logged via the audit logger and the private key,
+// JWT, and installation token never appear in any log line. Errors from
+// GitHub or the local filesystem are logged with full detail on the
+// broker side; the UDS caller always sees a generic message instead.
+func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w)
 		return
 	}
 
@@ -118,7 +132,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolved, verr := s.cfg.authorize(repo, prof)
+	repoName, resolvedPerms, verr := s.cfg.authorize(repo, prof)
 	if verr != nil {
 		s.auditReject(repo, prof, verr)
 		writeError(w, verr)
@@ -131,17 +145,22 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		"profile": string(prof),
 	})
 
-	token, exp, err := s.issuer.mintAndReturn(r.Context(), repo, resolved)
+	token, exp, err := s.issuer.mintAndReturn(r.Context(), repoName, resolvedPerms)
 	if err != nil {
-		ve := errInternal(err)
-		s.auditReject(repo, prof, ve)
-		writeError(w, ve)
+		s.log.Error("audit", map[string]any{
+			"op":      "internal_error",
+			"repo":    repo,
+			"profile": string(prof),
+			"err":     err.Error(),
+		})
+		writeInternal(w)
 		return
 	}
 
 	s.log.Info("audit", map[string]any{
 		"op":         "minted",
 		"repo":       repo,
+		"repo_name":  repoName,
 		"profile":    string(prof),
 		"expires_at": exp.UTC().Format("2006-01-02T15:04:05Z"),
 	})
@@ -157,7 +176,6 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 // auditReject emits a single WARN audit event for a rejected request.
-// The reason is included but never the underlying secret material.
 func (s *Server) auditReject(repo string, prof Name, verr *validationError) {
 	s.log.Warn("audit", map[string]any{
 		"op":      "rejected",
@@ -194,24 +212,21 @@ func newTokenIssuer(cfg *Config, ghc *Client) (*tokenIssuer, error) {
 	}, nil
 }
 
+// mintAndReturn fetches a fresh installation token for repoName using
+// permissions. The JWT used to authenticate the request and the
+// installation token returned by GitHub are both kept out of the audit
+// log; the caller is responsible for redacting any further material
+// before passing it on.
 func (i *tokenIssuer) mintAndReturn(
 	ctx context.Context,
-	repoSlug string,
-	prof Profile,
+	repoName string,
+	permissions map[string]string,
 ) (string, time.Time, error) {
 	jwt, err := mintJWT(i.privateKey, i.appID)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("mint jwt: %w", err)
 	}
-	perms := make([]Permission, 0, len(prof.Permissions))
-	for _, p := range prof.Permissions {
-		perms = append(perms, Permission{Scope: p.Scope, Access: p.Access})
-	}
-	req := AccessTokenRequest{
-		Repositories: []string{repoSlug},
-		Permissions:  perms,
-	}
-	resp, err := i.githubClient.MintInstallationToken(ctx, jwt, i.installation, req)
+	resp, err := i.githubClient.MintInstallationToken(ctx, jwt, i.installation, repoName, permissions)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("mint installation token: %w", err)
 	}
@@ -320,12 +335,19 @@ func (v *validationError) Error() string {
 	return fmt.Sprintf("%s: %s", v.Code, v.Reason)
 }
 
+// decodeRequest reads exactly one JSON object from r and rejects any
+// trailing content. This prevents an attacker from smuggling extra data
+// past the broker under the assumption that the decoder will only
+// consume the first object.
 func decodeRequest(r io.Reader) (string, Name, *validationError) {
 	var req request
 	dec := json.NewDecoder(r)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		return "", "", &validationError{Code: "BAD_REQUEST", Reason: "invalid JSON body"}
+	}
+	if dec.More() {
+		return "", "", &validationError{Code: "BAD_REQUEST", Reason: "trailing data after request object"}
 	}
 	if req.Repo == "" {
 		return "", "", &validationError{Code: "BAD_REQUEST", Reason: "repo is required"}
@@ -337,32 +359,41 @@ func decodeRequest(r io.Reader) (string, Name, *validationError) {
 }
 
 // authorize checks the request against the configured allowlist and
-// returns the resolved Profile or a validation error.
-func (c *Config) authorize(repoSlug string, prof Name) (Profile, *validationError) {
+// returns the repository name (suitable for the GitHub access-tokens
+// endpoint) and the resolved permission map.
+func (c *Config) authorize(repoSlug string, prof Name) (string, map[string]string, *validationError) {
 	if prof != ProfileBuilder {
-		return Profile{}, &validationError{
+		return "", nil, &validationError{
 			Code:   "PROFILE_NOT_ALLOWED",
 			Reason: fmt.Sprintf("only %q is accepted", ProfileBuilder),
 		}
 	}
 	if !c.IsAllowed(repoSlug) {
-		return Profile{}, &validationError{
+		return "", nil, &validationError{
 			Code:   "REPO_NOT_ALLOWED",
 			Reason: "repository not in allowlist or wrong organisation",
 		}
 	}
-	profile, err := Resolve(prof)
+	_, name, ok := splitSlug(repoSlug)
+	if !ok {
+		return "", nil, &validationError{
+			Code:   "REPO_NOT_ALLOWED",
+			Reason: "repository slug must be org/name",
+		}
+	}
+	perms, err := PermissionsFor(prof)
 	if err != nil {
-		return Profile{}, &validationError{
+		return "", nil, &validationError{
 			Code:   "PROFILE_NOT_ALLOWED",
 			Reason: err.Error(),
 		}
 	}
-	return profile, nil
+	return name, perms, nil
 }
 
-// writeError serialises err as an errorResponse with the appropriate HTTP
-// status. It does not log; the caller is responsible for audit logging.
+// writeError serialises err as an errorResponse with the appropriate
+// HTTP status. It does not log; the caller is responsible for audit
+// logging.
 func writeError(w http.ResponseWriter, err *validationError) {
 	status := http.StatusBadRequest
 	switch err.Code {
@@ -376,10 +407,23 @@ func writeError(w http.ResponseWriter, err *validationError) {
 	_ = json.NewEncoder(w).Encode(errorResponse{Error: err.Reason, Code: err.Code})
 }
 
-func errInternal(err error) *validationError {
-	var ve *validationError
-	if errors.As(err, &ve) {
-		return ve
-	}
-	return &validationError{Code: "INTERNAL", Reason: err.Error()}
+// writeInternal emits the generic INTERNAL response. It is used when
+// the broker hits an unexpected error: full detail is logged on the
+// broker side via the audit logger and never reaches the UDS caller.
+func writeInternal(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusInternalServerError)
+	_ = json.NewEncoder(w).Encode(errorResponse{
+		Error: "internal error",
+		Code:  "INTERNAL",
+	})
+}
+
+func writeMethodNotAllowed(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	_ = json.NewEncoder(w).Encode(errorResponse{
+		Error: "method not allowed",
+		Code:  "METHOD_NOT_ALLOWED",
+	})
 }

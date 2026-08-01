@@ -2,6 +2,7 @@ package gitbridge
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -62,7 +63,7 @@ func makeTestServer(t *testing.T, ghHandler http.HandlerFunc) (*Server, *bytes.B
 }
 
 // ----------------------------------------------------------------------
-// End-to-end server tests (with mocked GitHub API)
+// End-to-end server tests
 // ----------------------------------------------------------------------
 
 func TestServer_Healthz(t *testing.T) {
@@ -74,6 +75,20 @@ func TestServer_Healthz(t *testing.T) {
 	srv.handleHealthz(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", rec.Code)
+	}
+}
+
+func TestServer_HealthzRejectsNonGET(t *testing.T) {
+	srv, _ := makeTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("GitHub API should not be called for healthz")
+	})
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(method, "/healthz", nil)
+		srv.handleHealthz(rec, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s /healthz: expected 405, got %d", method, rec.Code)
+		}
 	}
 }
 
@@ -98,6 +113,29 @@ func TestServer_RejectsBadJSON(t *testing.T) {
 	srv.handleToken(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestServer_RejectsTrailingJSON(t *testing.T) {
+	srv, _ := makeTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("GitHub API must not be called when the request body has trailing data")
+	})
+	body := strings.NewReader(`{"repo":"simons-agent-space/agentctl","profile":"builder"}{"sneaky":"object"}`)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/token", body)
+	srv.handleToken(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+	var er errorResponse
+	if err := json.NewDecoder(rec.Body).Decode(&er); err != nil {
+		t.Fatal(err)
+	}
+	if er.Code != "BAD_REQUEST" {
+		t.Errorf("code = %q, want BAD_REQUEST", er.Code)
+	}
+	if !strings.Contains(strings.ToLower(er.Error), "trailing") {
+		t.Errorf("error should mention trailing data, got %q", er.Error)
 	}
 }
 
@@ -141,70 +179,6 @@ func TestServer_RejectsWrongProfile(t *testing.T) {
 	}
 }
 
-func TestServer_MintsToken(t *testing.T) {
-	expires := time.Now().Add(1 * time.Hour).UTC().Format("2006-01-02T15:04:05Z")
-	ghHandler := func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			t.Errorf("missing Bearer prefix: %q", auth)
-		}
-		var req AccessTokenRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Errorf("decode request: %v", err)
-		}
-		if len(req.Repositories) != 1 || req.Repositories[0] != "simons-agent-space/agentctl" {
-			t.Errorf("repositories = %v", req.Repositories)
-		}
-		if len(req.Permissions) == 0 {
-			t.Errorf("no permissions")
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"token":      "ghs_test_token",
-			"expires_at": expires,
-		})
-	}
-	srv, logBuf := makeTestServer(t, ghHandler)
-	body := strings.NewReader(`{"repo":"simons-agent-space/agentctl","profile":"builder"}`)
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/token", body)
-	srv.handleToken(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-	var out response
-	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if out.Token != "ghs_test_token" {
-		t.Errorf("token = %q", out.Token)
-	}
-	if out.ExpiresAt == "" {
-		t.Errorf("expires_at empty")
-	}
-	if !strings.Contains(logBuf.String(), `"op":"minted"`) {
-		t.Errorf("minted event missing in log: %s", logBuf.String())
-	}
-	if strings.Contains(logBuf.String(), "ghs_test_token") {
-		t.Errorf("token leaked into audit log: %s", logBuf.String())
-	}
-}
-
-func TestServer_GitHubErrorPropagates(t *testing.T) {
-	ghHandler := func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = io.WriteString(w, `{"message":"server is on fire"}`)
-	}
-	srv, _ := makeTestServer(t, ghHandler)
-	body := strings.NewReader(`{"repo":"simons-agent-space/agentctl","profile":"builder"}`)
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/token", body)
-	srv.handleToken(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("expected 500, got %d", rec.Code)
-	}
-}
-
 func TestServer_LogsRejection(t *testing.T) {
 	srv, logBuf := makeTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("GitHub API should not be called")
@@ -218,6 +192,250 @@ func TestServer_LogsRejection(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), `"reason"`) {
 		t.Errorf("reason missing in rejection log: %s", logBuf.String())
+	}
+}
+
+func TestServer_GitHubErrorReturnsGenericInternal(t *testing.T) {
+	ghHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"message":"internal-stack-secret-ABC123 leaked from upstream"}`)
+	}
+	srv, logBuf := makeTestServer(t, ghHandler)
+	body := strings.NewReader(`{"repo":"simons-agent-space/agentctl","profile":"builder"}`)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/token", body)
+	srv.handleToken(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", rec.Code)
+	}
+	bodyStr := rec.Body.String()
+	if strings.Contains(bodyStr, "internal-stack-secret-ABC123") {
+		t.Errorf("raw upstream error leaked to UDS caller: %s", bodyStr)
+	}
+	if strings.Contains(bodyStr, "leaked") {
+		t.Errorf("raw upstream error message leaked: %s", bodyStr)
+	}
+	var er errorResponse
+	if err := json.NewDecoder(strings.NewReader(bodyStr)).Decode(&er); err != nil {
+		t.Fatal(err)
+	}
+	if er.Code != "INTERNAL" {
+		t.Errorf("code = %q, want INTERNAL", er.Code)
+	}
+	if er.Error != "internal error" {
+		t.Errorf("error message should be generic, got %q", er.Error)
+	}
+	if !strings.Contains(logBuf.String(), "internal-stack-secret-ABC123") {
+		t.Errorf("full upstream error must be logged on the broker side: %s", logBuf.String())
+	}
+}
+
+// ----------------------------------------------------------------------
+// Contract tests for the GitHub access-tokens request body
+// (these guard the broker against silent contract regressions)
+// ----------------------------------------------------------------------
+
+func TestGitHubRequest_EndpointPath(t *testing.T) {
+	var capturedPath string
+	var capturedMethod string
+	ghHandler := func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		capturedMethod = r.Method
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"token":      "***",
+			"expires_at": time.Now().Add(time.Hour).UTC().Format("2006-01-02T15:04:05Z"),
+		})
+	}
+	srv, _ := makeTestServer(t, ghHandler)
+	body := strings.NewReader(`{"repo":"simons-agent-space/agentctl","profile":"builder"}`)
+	rec := httptest.NewRecorder()
+	srv.handleToken(rec, httptest.NewRequest(http.MethodPost, "/token", body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if capturedMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", capturedMethod)
+	}
+	const wantPath = "/app/installations/67890/access_tokens"
+	if capturedPath != wantPath {
+		t.Errorf("path = %q, want %q", capturedPath, wantPath)
+	}
+}
+
+func TestGitHubRequest_RepositoriesContainsRepoName(t *testing.T) {
+	var capturedRepos []string
+	ghHandler := func(w http.ResponseWriter, r *http.Request) {
+		var parsed struct {
+			Repositories []string `json:"repositories"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&parsed)
+		capturedRepos = parsed.Repositories
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"token":      "***",
+			"expires_at": time.Now().Add(time.Hour).UTC().Format("2006-01-02T15:04:05Z"),
+		})
+	}
+	srv, _ := makeTestServer(t, ghHandler)
+	body := strings.NewReader(`{"repo":"simons-agent-space/agentctl","profile":"builder"}`)
+	rec := httptest.NewRecorder()
+	srv.handleToken(rec, httptest.NewRequest(http.MethodPost, "/token", body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(capturedRepos) != 1 {
+		t.Fatalf("repositories = %v, want exactly one entry", capturedRepos)
+	}
+	if capturedRepos[0] != "agentctl" {
+		t.Errorf("repositories[0] = %q, want %q (repo name only, no org prefix)", capturedRepos[0], "agentctl")
+	}
+	for _, r := range capturedRepos {
+		if strings.Contains(r, "/") {
+			t.Errorf("repository %q must not contain '/'; the broker should send the short name", r)
+		}
+	}
+}
+
+func TestGitHubRequest_PermissionsIsJSONObject(t *testing.T) {
+	ghHandler := func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var generic map[string]any
+		if err := json.Unmarshal(raw, &generic); err != nil {
+			t.Errorf("decode body as generic object: %v", err)
+			return
+		}
+		perms, present := generic["permissions"]
+		if !present {
+			t.Errorf("body missing 'permissions' key: %s", string(raw))
+			return
+		}
+		if _, isArray := perms.([]any); isArray {
+			t.Errorf("permissions must be a JSON object, not an array; got %s", string(raw))
+		}
+		if _, isObject := perms.(map[string]any); !isObject {
+			t.Errorf("permissions must be a JSON object; got type %T", perms)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"token":      "***",
+			"expires_at": time.Now().Add(time.Hour).UTC().Format("2006-01-02T15:04:05Z"),
+		})
+	}
+	srv, _ := makeTestServer(t, ghHandler)
+	body := strings.NewReader(`{"repo":"simons-agent-space/agentctl","profile":"builder"}`)
+	rec := httptest.NewRecorder()
+	srv.handleToken(rec, httptest.NewRequest(http.MethodPost, "/token", body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGitHubRequest_OnlyBuilderPermissionsRequested(t *testing.T) {
+	var captured map[string]any
+	ghHandler := func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &captured)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"token":      "***",
+			"expires_at": time.Now().Add(time.Hour).UTC().Format("2006-01-02T15:04:05Z"),
+		})
+	}
+	srv, _ := makeTestServer(t, ghHandler)
+	body := strings.NewReader(`{"repo":"simons-agent-space/agentctl","profile":"builder"}`)
+	rec := httptest.NewRecorder()
+	srv.handleToken(rec, httptest.NewRequest(http.MethodPost, "/token", body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	perms, ok := captured["permissions"].(map[string]any)
+	if !ok {
+		t.Fatalf("permissions not a JSON object: %+v", captured["permissions"])
+	}
+
+	wantScopes := map[string]string{
+		"contents":      "write",
+		"pull_requests": "write",
+		"metadata":      "read",
+	}
+	if len(perms) != len(wantScopes) {
+		t.Errorf("got %d permissions, want %d: %v", len(perms), len(wantScopes), perms)
+	}
+	for scope, level := range wantScopes {
+		got, present := perms[scope]
+		if !present {
+			t.Errorf("missing permission %q", scope)
+			continue
+		}
+		if got != level {
+			t.Errorf("permission %q = %v, want %q", scope, got, level)
+		}
+	}
+
+	// Scopes the agent does not need must not be requested.
+	forbidden := []string{"checks", "statuses", "issues", "actions", "deployments", "packages", "members", "administration"}
+	for _, scope := range forbidden {
+		if _, present := perms[scope]; present {
+			t.Errorf("forbidden permission %q must not be requested; got: %v", scope, perms)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------
+// Socket mode (default + override)
+// ----------------------------------------------------------------------
+
+func TestDefaultSocketModeConstant(t *testing.T) {
+	if DefaultSocketMode != 0660 {
+		t.Errorf("DefaultSocketMode = %o, want 0660", DefaultSocketMode)
+	}
+}
+
+func TestApplySocketMode_DefaultWhenUnset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "file")
+	if err := os.WriteFile(path, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{} // SocketMode empty
+	if err := applySocketMode(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0660 {
+		t.Errorf("mode = %v, want 0660", info.Mode().Perm())
+	}
+}
+
+func TestApplySocketMode_OverrideWhenSet(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "file")
+	if err := os.WriteFile(path, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{SocketMode: "0600"}
+	if err := applySocketMode(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("mode = %v, want 0600", info.Mode().Perm())
 	}
 }
 
@@ -384,15 +602,21 @@ func TestDecodeRequest_UnknownField(t *testing.T) {
 
 func TestAuthorize_OK(t *testing.T) {
 	c := validConfig()
-	_, verr := c.authorize("simons-agent-space/agentctl", ProfileBuilder)
+	name, perms, verr := c.authorize("simons-agent-space/agentctl", ProfileBuilder)
 	if verr != nil {
 		t.Errorf("authorize: %v", verr)
+	}
+	if name != "agentctl" {
+		t.Errorf("name = %q, want agentctl", name)
+	}
+	if perms["contents"] != "write" {
+		t.Errorf("perms[contents] = %q", perms["contents"])
 	}
 }
 
 func TestAuthorize_NotBuilder(t *testing.T) {
 	c := validConfig()
-	_, verr := c.authorize("simons-agent-space/agentctl", "admin")
+	_, _, verr := c.authorize("simons-agent-space/agentctl", "admin")
 	if verr == nil || verr.Code != "PROFILE_NOT_ALLOWED" {
 		t.Errorf("expected PROFILE_NOT_ALLOWED, got %v", verr)
 	}
@@ -400,7 +624,7 @@ func TestAuthorize_NotBuilder(t *testing.T) {
 
 func TestAuthorize_RepoNotAllowed(t *testing.T) {
 	c := validConfig()
-	_, verr := c.authorize("simons-agent-space/other", ProfileBuilder)
+	_, _, verr := c.authorize("simons-agent-space/other", ProfileBuilder)
 	if verr == nil || verr.Code != "REPO_NOT_ALLOWED" {
 		t.Errorf("expected REPO_NOT_ALLOWED, got %v", verr)
 	}
@@ -408,7 +632,7 @@ func TestAuthorize_RepoNotAllowed(t *testing.T) {
 
 func TestAuthorize_WrongOrg(t *testing.T) {
 	c := validConfig()
-	_, verr := c.authorize("other-org/agentctl", ProfileBuilder)
+	_, _, verr := c.authorize("other-org/agentctl", ProfileBuilder)
 	if verr == nil || verr.Code != "REPO_NOT_ALLOWED" {
 		t.Errorf("expected REPO_NOT_ALLOWED, got %v", verr)
 	}
@@ -454,3 +678,53 @@ func decodeJWTForTest(t *testing.T, tok string) (map[string]any, map[string]any)
 	}
 	return hdr, pl
 }
+
+// ----------------------------------------------------------------------
+// Cross-feature integration test
+// ----------------------------------------------------------------------
+
+func TestEndToEnd_MintsValidToken(t *testing.T) {
+	const wantToken = "ghs_test_token"
+	expires := time.Now().Add(time.Hour).UTC().Format("2006-01-02T15:04:05Z")
+	ghHandler := func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			t.Errorf("missing Bearer prefix")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"token":      wantToken,
+			"expires_at": expires,
+		})
+	}
+	srv, logBuf := makeTestServer(t, ghHandler)
+	body := strings.NewReader(`{"repo":"simons-agent-space/agentctl","profile":"builder"}`)
+	rec := httptest.NewRecorder()
+	srv.handleToken(rec, httptest.NewRequest(http.MethodPost, "/token", body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var out response
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Token != wantToken {
+		t.Errorf("token = %q, want %q", out.Token, wantToken)
+	}
+	if out.ExpiresAt == "" {
+		t.Errorf("expires_at empty")
+	}
+	if !strings.Contains(logBuf.String(), `"op":"minted"`) {
+		t.Errorf("minted event missing in log: %s", logBuf.String())
+	}
+	if strings.Contains(logBuf.String(), wantToken) {
+		t.Errorf("token leaked into audit log: %s", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), `"repo_name":"agentctl"`) {
+		t.Errorf("audit log should record the repo_name sent to GitHub: %s", logBuf.String())
+	}
+}
+
+// Just enough to make `go vet` happy with the imported ctx; we don't
+// actually run ListenAndServe in unit tests.
+var _ = context.Background

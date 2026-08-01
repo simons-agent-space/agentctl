@@ -17,15 +17,16 @@ const (
 )
 
 // AccessTokenRequest is the body of POST /app/installations/{id}/access_tokens.
+//
+// GitHub's contract for this endpoint:
+//   - "repositories" is an array of *repository names* (e.g. "agentctl"),
+//     NOT full "org/name" slugs.
+//   - "permissions" is a JSON object mapping permission name -> access
+//     level (e.g. {"contents": "write"}). An array of {scope,access}
+//     objects is rejected by the API.
 type AccessTokenRequest struct {
-	Repositories []string     `json:"repositories"`
-	Permissions  []Permission `json:"permissions"`
-}
-
-// Permission is (scope, access) for the access-token endpoint.
-type Permission struct {
-	Scope  string `json:"scope"`
-	Access string `json:"access"`
+	Repositories []string          `json:"repositories"`
+	Permissions  map[string]string `json:"permissions"`
 }
 
 // AccessTokenResponse is what GitHub returns. The Token field is the
@@ -77,14 +78,22 @@ func NewClientWithBase(base string) *Client {
 
 // MintInstallationToken calls POST /app/installations/{installation_id}/access_tokens.
 // jwt is a freshly-minted GitHub App JWT (not an installation token).
-// The returned AccessTokenResponse must be consumed and discarded by the
-// caller: the broker returns only the fields it needs to the UDS client.
+// repoName is the short repository name (e.g. "agentctl"); the caller
+// must have already validated the full "org/name" slug and extracted
+// the name. The returned AccessTokenResponse must be consumed and
+// discarded by the caller: the broker returns only the fields it needs
+// to the UDS client.
 func (c *Client) MintInstallationToken(
 	ctx context.Context,
 	jwt string,
 	installationID int64,
-	req AccessTokenRequest,
+	repoName string,
+	permissions map[string]string,
 ) (*AccessTokenResponse, error) {
+	req := AccessTokenRequest{
+		Repositories: []string{repoName},
+		Permissions:  permissions,
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal token request: %w", err)
@@ -117,7 +126,6 @@ func (c *Client) MintInstallationToken(
 		return nil, &APIError{
 			StatusCode: resp.StatusCode,
 			Message:    er.Message,
-			Body:       string(respBody),
 		}
 	}
 
@@ -129,12 +137,11 @@ func (c *Client) MintInstallationToken(
 }
 
 // APIError is returned when GitHub responds with a non-2xx status. The
-// Body field is intentionally not exposed to the UDS caller; we keep it
-// on the broker side for debugging only.
+// StatusCode and Message are kept for broker-side logging; the broker
+// returns a generic INTERNAL error to the UDS caller.
 type APIError struct {
 	StatusCode int
 	Message    string
-	Body       string
 }
 
 func (e *APIError) Error() string {

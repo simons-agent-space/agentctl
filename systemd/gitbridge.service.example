@@ -16,8 +16,11 @@ ExecStart=/usr/local/bin/gitbridge \
 Restart=on-failure
 RestartSec=5s
 
-# Sandbox the broker hard. The only file descriptors it should hold
-# are the UDS socket and the audit log.
+# Sandbox the broker hard. The broker only opens:
+#   - a Unix domain socket for UDS clients
+#   - a TCP socket (AF_INET/AF_INET6) for TLS to api.github.com
+# Earlier drafts blocked AF_INET here and broke HTTPS, so the explicit
+# list includes AF_INET and AF_INET6 alongside AF_UNIX.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -32,7 +35,7 @@ ProtectHostname=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native

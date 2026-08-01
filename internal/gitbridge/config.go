@@ -1,6 +1,3 @@
-// Package gitbridge implements the broker: it validates a request, mints a
-// GitHub App JWT, calls GitHub to mint an installation token restricted to
-// a single repository, and returns the token + expiry to the UDS caller.
 package gitbridge
 
 import (
@@ -10,6 +7,11 @@ import (
 	"strings"
 )
 
+// DefaultSocketMode is the file mode applied to the UDS socket when the
+// config does not specify one. 0660 keeps the socket accessible to the
+// broker's group but unreadable to other users.
+const DefaultSocketMode os.FileMode = 0660
+
 // Config is the JSON file shape consumed by the broker. It is loaded once
 // at startup. Mutating it at runtime is not supported.
 type Config struct {
@@ -18,7 +20,7 @@ type Config struct {
 	// InstallationID is the numeric installation ID for the org.
 	InstallationID int64 `json:"installation_id"`
 	// PrivateKeyPath is the on-disk path to the PEM-encoded RSA private key.
-	// The key is read once at startup and zeroed when the broker exits.
+	// The key is read once at startup.
 	PrivateKeyPath string `json:"private_key_path"`
 	// AllowedOrg is the single organisation that repositories must live in.
 	AllowedOrg string `json:"allowed_org"`
@@ -27,11 +29,9 @@ type Config struct {
 	AllowedRepos []string `json:"allowed_repositories"`
 	// SocketPath is where the UDS listener is created.
 	SocketPath string `json:"socket_path"`
-	// SocketMode is the file mode applied to the socket (e.g. "0660").
+	// SocketMode is an optional override for the socket file mode.
+	// When empty, DefaultSocketMode (0660) is applied.
 	SocketMode string `json:"socket_mode,omitempty"`
-	// SocketGroup is the optional group name applied to the socket.
-	// If empty, the socket inherits the broker process's group.
-	SocketGroup string `json:"socket_group,omitempty"`
 }
 
 // LoadConfig reads and validates the JSON file at path.
@@ -101,6 +101,8 @@ func (c *Config) IsAllowed(fullSlug string) bool {
 	return false
 }
 
+// SplitSlug returns the org and name parts of a full repository slug
+// like "octo/cat". It returns ok=false for malformed inputs.
 func splitSlug(slug string) (org, name string, ok bool) {
 	parts := strings.Split(slug, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {

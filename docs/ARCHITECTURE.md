@@ -14,21 +14,15 @@ short-lived, repository-scoped tokens over a Unix domain socket.
 │ Agent sandbox      │   UDS   │ gitbridge host     │  HTTPS │ api.github.com     │
 │                    │ ──────► │                    │ ──────► │                    │
 │ curl --unix-socket │         │ gitbridge binary   │        │ access_tokens API  │
-└────────────────────┘         │                    │        └────────────────────┘
-                               │ - config.json      │
-                               │ - key.pem          │
-                               │ - audit.log        │
-                               └────────────────────┘
+└────────────────────┘         └────────────────────┘        └────────────────────┘
 ```
 
 ### Broker
 
-The broker is a single Go binary (`cmd/gitbridge`) with four internal
+The broker is a single Go binary (`cmd/gitbridge`) with three internal
 packages:
 
-- `internal/policy` — the fixed permission profiles the broker will mint
-- `internal/github` — minimal client for the access-tokens endpoint
-- `internal/gitbridge` — config, JWT minting, validation, UDS server
+- `internal/gitbridge` — config, RS256 JWT minting, validation, UDS server, GitHub REST client
 - `internal/audit` — structured JSON logger with secret redaction
 
 ### Audit log
@@ -38,7 +32,7 @@ single JSON line:
 
 ```
 {"time":"2026-08-01T16:30:00Z","level":"INFO","msg":"audit","op":"validated","repo":"simons-agent-space/agentctl","profile":"builder"}
-{"time":"2026-08-01T16:30:00Z","level":"INFO","msg":"audit","op":"minted","repo":"simons-agent-space/agentctl","profile":"builder","expires_at":"2026-08-01T17:30:00Z"}
+{"time":"2026-08-01T16:30:00Z","level":"INFO","msg":"audit","op":"minted","repo":"simons-agent-space/agentctl","repo_name":"agentctl","profile":"builder","expires_at":"2026-08-01T17:30:00Z"}
 {"time":"2026-08-01T16:30:01Z","level":"WARN","msg":"audit","op":"rejected","repo":"other-org/repo","profile":"builder","reason":"REPO_NOT_ALLOWED: ..."}
 ```
 
@@ -46,7 +40,7 @@ The audit logger never receives the JWT, the installation token, or the
 private key. Every attribute key whose name contains a sensitive
 substring (`token`, `jwt`, `key`, `private_key`, `pem`, `secret`,
 `authorization`, `bearer`, `password`, `client_secret`) is replaced with
-`[REDACTED]` by the `slog` `ReplaceAttr` hook.
+`[REDACTED]` by the logger's redaction hook.
 
 ## Trust boundaries
 
@@ -57,9 +51,9 @@ substring (`token`, `jwt`, `key`, `private_key`, `pem`, `secret`,
 | api.github.com | trusted (third party) | installation tokens |
 
 The only path across the trust boundary is the UDS socket from the
-sandbox to the broker. There is no network path; the broker listens on
-`unix://` only, and the systemd unit restricts the broker to `AF_UNIX`
-sockets.
+sandbox to the broker. There is no network listener on the broker; it
+opens HTTPS to `api.github.com` and nothing else, and the systemd unit
+restricts the broker to `AF_UNIX AF_INET AF_INET6`.
 
 ## Threat model
 
@@ -83,8 +77,8 @@ or returned anywhere except the UDS response.
 **T4. Private-key leakage via logs or error paths.** *Mitigation:* the
 private key is read into memory once at startup and never returned from
 the package that loads it. The audit logger redacts any attribute whose
-name contains a sensitive substring. Error messages are produced by
-typed errors and never include the underlying key material.
+name contains a sensitive substring. Error messages returned over UDS
+are always generic; full detail is logged on the broker side.
 
 **T5. Replay of an old installation token.** *Mitigation:* the broker
 mints a fresh token for every request. Clients receive the expiry in the
@@ -98,13 +92,15 @@ rejected with `PROFILE_NOT_ALLOWED`.
 **T7. DoS against the broker host.** *Mitigation:* the broker is a
 single binary with a small attack surface. The systemd unit restricts
 the process via `ProtectSystem=strict`, `PrivateTmp=yes`,
-`RestrictNamespaces=yes`, `RestrictAddressFamilies=AF_UNIX`, and friends
-— see `systemd/gitbridge.service.example`.
+`RestrictNamespaces=yes`, `RestrictAddressFamilies=AF_UNIX AF_INET
+AF_INET6`, and friends — see
+`systemd/gitbridge.service.example`.
 
 **T8. Local privilege escalation via the socket.** *Mitigation:* the
-socket is created with mode `0660` (or stricter) and owned by a
-dedicated `gitbridge` group. The agent sandbox runs as a user that is a
-member of that group; no other user can connect.
+socket is created with mode `0660` (the default, and the only mode the
+broker will apply) and owned by a dedicated `gitbridge` group. The
+agent sandbox runs as a user that is a member of that group; no other
+user can connect.
 
 ### Threats out of scope
 
@@ -119,15 +115,15 @@ member of that group; no other user can connect.
 |---|---|
 | Config file missing or invalid | Broker exits non-zero with a clear error. |
 | Private key missing or unreadable | Broker exits non-zero. |
-| GitHub API 4xx | Broker returns `INTERNAL` and logs the rejection. |
+| GitHub API 4xx | Generic `INTERNAL` to the caller; full detail logged on the broker side. |
 | GitHub API 5xx | Same as 4xx. |
-| Audit log write failure | `slog` returns the error to the broker; the broker exits non-zero. |
+| Audit log write failure | `slog`-equivalent logger returns the error to the broker; the broker exits non-zero. (No silent log loss.) |
 
 ## Design choices
 
 1. **UDS only.** No TCP listener, no localhost port. The broker is
-   invisible from the network. The socket lives in `/run/gitbridge/socket`
-   with mode `0660`.
+   invisible from the network. The socket lives in
+   `/run/gitbridge/socket` with mode `0660`.
 
 2. **Stdlib only.** No third-party dependencies. The JWT is RS256 and is
    signed in-process using `crypto/rsa`, `crypto/sha256`, and
@@ -136,25 +132,42 @@ member of that group; no other user can connect.
 
 3. **One fixed profile.** The broker never accepts arbitrary
    permissions from the caller. It only ever mints tokens with the
-   `builder` profile, which is the minimum permissions required to push
-   code, open PRs, file issues, and report build status.
+   `builder` profile, which is the minimum permissions required to
+   push code and open pull requests.
 
-4. **Single installation per broker process.** The installation ID is
+4. **Repo slug validated locally; repo name sent to GitHub.** The
+   broker validates the full `org/name` slug against the configured
+   organisation and allowlist before doing anything else. When it
+   calls GitHub, it sends only the short repository name — that's
+   what the access-tokens endpoint expects.
+
+5. **Single installation per broker process.** The installation ID is
    read from the config file. Multi-installation scenarios would
    require configuration to map repositories to installations; this is
    left for future work.
 
-5. **Repo and profile are both required.** Either missing returns
+6. **Repo and profile are both required.** Either missing returns
    `BAD_REQUEST`. This is deliberate: a profile with no repo is a
    misuse, and a repo with no profile is a privilege-escalation risk.
 
-6. **Audit log is the only side effect of a request.** The broker never
-   caches tokens and never persists anything else. Each request mints a
-   fresh token from GitHub.
+7. **Trailing JSON rejected.** The request decoder rejects any bytes
+   after the first JSON object, so an attacker cannot smuggle extra
+   data past the broker under the assumption that "the decoder only
+   consumes the first object anyway".
 
-7. **Disallow unknown config fields.** Typos in the config file should
-   fail loudly, not silently. The loader uses
-   `json.Decoder.DisallowUnknownFields()`.
+8. **Errors returned over UDS are generic.** GitHub API failures,
+   filesystem errors, and cryptographic errors are logged in full on
+   the broker side; the caller only ever sees the code `INTERNAL` and
+   a generic message. The raw error is never serialised into a UDS
+   response.
+
+9. **Audit log is the only side effect of a request.** The broker
+   never caches tokens and never persists anything else. Each request
+   mints a fresh token from GitHub.
+
+10. **Disallow unknown config fields.** Typos in the config file
+    should fail loudly, not silently. The loader uses
+    `json.Decoder.DisallowUnknownFields()`.
 
 ## Open questions / unresolved risks
 
@@ -173,8 +186,3 @@ member of that group; no other user can connect.
   track tokens it has already issued. This is consistent with the
   threat model (the sandbox is the only consumer) but worth revisiting
   if the broker ever serves multiple clients.
-
-- **Socket group ownership.** Setting the socket group requires CAP_CHOWN
-  or root at startup. The example systemd unit runs the broker as
-  `gitbridge:gitbridge`; if the operator wants a different group, the
-  unit must be adjusted.
