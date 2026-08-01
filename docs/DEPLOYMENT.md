@@ -56,3 +56,30 @@ require a future version bump:
 - Cron jobs
 - Custom domains
 - Multiple services per manifest
+
+## Source resolution
+
+Deployment sources are resolved by `agentctld` as follows:
+
+- The caller must supply an **exact full commit SHA** (40 lowercase hex
+  characters). Short or non-hex SHAs are rejected at the input boundary.
+- The named commit must **already be reachable from `origin/main`**.
+  Tags, trees, blobs, unmerged branches, and pull-request refs are all
+  rejected. The check is equivalent to
+  `git merge-base --is-ancestor <commit> refs/remotes/origin/main`.
+- The source is fetched into a **host-side bare mirror** at
+  `<repository-root>/<repository>.git`. If the mirror does not exist,
+  it is initialised with `git clone --bare https://github.com/<organisation>/<repository>.git`.
+- Each deployment uses a **detached temporary checkout** of the exact
+  commit, created via `git worktree add --detach`. The checkout does
+  not track a branch and the bare mirror's branch state is untouched.
+- The caller **cannot choose arbitrary Git URLs or host paths**. The
+  organisation is checked against a trusted configuration; the
+  repository root is supplied by trusted host configuration, not by the
+  caller. The expected origin URL is computed from
+  `https://github.com/<organisation>/<repository>.git` and must match
+  the mirror's configured `remote.origin.url` — anything else is
+  rejected.
+- The checkout directory is removed by an explicit `CleanupCheckout`
+  function, which refuses to operate on paths outside the trusted
+  repository root.
