@@ -3,6 +3,7 @@ package deploy
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,8 +11,13 @@ import (
 	"time"
 )
 
+// testBaseDomain is the trusted base domain every test derives
+// hostname and upstream from. Keeping it in one place keeps the
+// derived values consistent across tests.
+const testBaseDomain = "apps.simonontheweb.de"
+
 // validDeployment returns a fully-derived Deployment that satisfies
-// every identity check.
+// every identity check against testBaseDomain.
 func validDeployment(app, commit string, hostPort, containerPort int) Deployment {
 	return Deployment{
 		App:           app,
@@ -20,22 +26,31 @@ func validDeployment(app, commit string, hostPort, containerPort int) Deployment
 		ContainerName: deriveContainerName(app, commit),
 		HostPort:      hostPort,
 		ContainerPort: containerPort,
-		Hostname:      app + ".apps.simonontheweb.de",
-		Upstream:      "127.0.0.1:49152",
+		Hostname:      app + "." + testBaseDomain,
+		Upstream:      fmt.Sprintf("127.0.0.1:%d", hostPort),
 		DeployedAt:    time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC),
 	}
 }
 
-func TestSaveDeployment_FirstDeployment(t *testing.T) {
-	dir := t.TempDir()
-	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
-	dep.Upstream = "127.0.0.1:49152" // matches hostPort
+// validStateConfig returns a StateConfig that points at a fresh
+// temp directory and carries the test base domain.
+func validStateConfig(t *testing.T) StateConfig {
+	t.Helper()
+	return StateConfig{
+		StateDir:   t.TempDir(),
+		BaseDomain: testBaseDomain,
+	}
+}
 
-	if err := SaveDeployment(dir, dep); err != nil {
+func TestSaveDeployment_FirstDeployment(t *testing.T) {
+	cfg := validStateConfig(t)
+	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
+
+	if err := SaveDeployment(cfg, dep); err != nil {
 		t.Fatalf("SaveDeployment: %v", err)
 	}
 
-	state, err := LoadDeploymentState(dir, "myapp")
+	state, err := LoadDeploymentState(cfg, "myapp")
 	if err != nil {
 		t.Fatalf("LoadDeploymentState: %v", err)
 	}
@@ -57,20 +72,20 @@ func TestSaveDeployment_FirstDeployment(t *testing.T) {
 }
 
 func TestSaveDeployment_SecondDeploymentMovesCurrentToPrevious(t *testing.T) {
-	dir := t.TempDir()
+	cfg := validStateConfig(t)
 	first := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
 	first.DeployedAt = time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
-	if err := SaveDeployment(dir, first); err != nil {
+	if err := SaveDeployment(cfg, first); err != nil {
 		t.Fatalf("SaveDeployment(first): %v", err)
 	}
 
 	second := validDeployment("myapp", strings.Repeat("b", 40), 49153, 8080)
 	second.DeployedAt = time.Date(2026, 8, 2, 10, 5, 0, 0, time.UTC)
-	if err := SaveDeployment(dir, second); err != nil {
+	if err := SaveDeployment(cfg, second); err != nil {
 		t.Fatalf("SaveDeployment(second): %v", err)
 	}
 
-	state, err := LoadDeploymentState(dir, "myapp")
+	state, err := LoadDeploymentState(cfg, "myapp")
 	if err != nil {
 		t.Fatalf("LoadDeploymentState: %v", err)
 	}
@@ -86,25 +101,25 @@ func TestSaveDeployment_SecondDeploymentMovesCurrentToPrevious(t *testing.T) {
 }
 
 func TestSaveDeployment_AtomicReplacementNoTempLeft(t *testing.T) {
-	dir := t.TempDir()
+	cfg := validStateConfig(t)
 	first := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
-	if err := SaveDeployment(dir, first); err != nil {
+	if err := SaveDeployment(cfg, first); err != nil {
 		t.Fatalf("SaveDeployment(first): %v", err)
 	}
 
 	second := validDeployment("myapp", strings.Repeat("b", 40), 49153, 8080)
-	if err := SaveDeployment(dir, second); err != nil {
+	if err := SaveDeployment(cfg, second); err != nil {
 		t.Fatalf("SaveDeployment(second): %v", err)
 	}
 
 	// The temp file pattern must leave no temp files behind.
-	entries, err := os.ReadDir(dir)
+	entries, err := os.ReadDir(cfg.StateDir)
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".write") {
+		if strings.HasPrefix(name, "state-") || strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".write") {
 			t.Errorf("unexpected leftover temp file: %s", name)
 		}
 		if name != "myapp.state.json" {
@@ -112,8 +127,7 @@ func TestSaveDeployment_AtomicReplacementNoTempLeft(t *testing.T) {
 		}
 	}
 
-	// The file must contain the new deployment as current.
-	state, err := LoadDeploymentState(dir, "myapp")
+	state, err := LoadDeploymentState(cfg, "myapp")
 	if err != nil {
 		t.Fatalf("LoadDeploymentState: %v", err)
 	}
@@ -123,19 +137,19 @@ func TestSaveDeployment_AtomicReplacementNoTempLeft(t *testing.T) {
 }
 
 func TestLoadDeploymentState_CorruptJSON(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "myapp.state.json")
+	cfg := validStateConfig(t)
+	path := filepath.Join(cfg.StateDir, "myapp.state.json")
 	if err := os.WriteFile(path, []byte("{not valid json"), 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	_, err := LoadDeploymentState(dir, "myapp")
+	_, err := LoadDeploymentState(cfg, "myapp")
 	if !errors.Is(err, ErrCorruptDeploymentState) {
 		t.Errorf("expected ErrCorruptDeploymentState, got %v", err)
 	}
 }
 
 func TestLoadDeploymentState_UnsupportedVersion(t *testing.T) {
-	dir := t.TempDir()
+	cfg := validStateConfig(t)
 	state := DeploymentState{
 		Version: 99,
 		App:     "myapp",
@@ -146,20 +160,23 @@ func TestLoadDeploymentState_UnsupportedVersion(t *testing.T) {
 			ContainerName: deriveContainerName("myapp", strings.Repeat("a", 40)),
 			HostPort:      49152,
 			ContainerPort: 8080,
+			Hostname:      "myapp." + testBaseDomain,
+			Upstream:      "127.0.0.1:49152",
+			DeployedAt:    time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC),
 		},
 	}
 	data, _ := json.MarshalIndent(state, "", "  ")
-	if err := os.WriteFile(filepath.Join(dir, "myapp.state.json"), data, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cfg.StateDir, "myapp.state.json"), data, 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	_, err := LoadDeploymentState(dir, "myapp")
+	_, err := LoadDeploymentState(cfg, "myapp")
 	if !errors.Is(err, ErrUnsupportedStateVersion) {
 		t.Errorf("expected ErrUnsupportedStateVersion, got %v", err)
 	}
 }
 
 func TestLoadDeploymentState_FabricatedIdentity(t *testing.T) {
-	dir := t.TempDir()
+	cfg := validStateConfig(t)
 	commit := strings.Repeat("a", 40)
 	// Tamper: image does not equal the derived value for the
 	// declared app+commit.
@@ -173,140 +190,348 @@ func TestLoadDeploymentState_FabricatedIdentity(t *testing.T) {
 			ContainerName: deriveContainerName("myapp", commit),
 			HostPort:      49152,
 			ContainerPort: 8080,
+			Hostname:      "myapp." + testBaseDomain,
+			Upstream:      "127.0.0.1:49152",
+			DeployedAt:    time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC),
 		},
 	}
 	data, _ := json.MarshalIndent(state, "", "  ")
-	if err := os.WriteFile(filepath.Join(dir, "myapp.state.json"), data, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cfg.StateDir, "myapp.state.json"), data, 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	_, err := LoadDeploymentState(dir, "myapp")
+	_, err := LoadDeploymentState(cfg, "myapp")
 	if !errors.Is(err, ErrInvalidDeploymentState) {
 		t.Errorf("expected ErrInvalidDeploymentState, got %v", err)
 	}
 }
 
+func TestSaveDeployment_FabricatedUpstreamRejected(t *testing.T) {
+	cfg := validStateConfig(t)
+	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
+	dep.Upstream = "0.0.0.0:49152" // does not match 127.0.0.1:HostPort
+	err := SaveDeployment(cfg, dep)
+	if !errors.Is(err, ErrInvalidDeploymentState) {
+		t.Errorf("expected ErrInvalidDeploymentState for fabricated upstream, got %v", err)
+	}
+	// Disk must be untouched.
+	if _, err := os.Stat(filepath.Join(cfg.StateDir, "myapp.state.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("state file must not exist after rejected save, stat err = %v", err)
+	}
+}
+
+func TestSaveDeployment_FabricatedHostnameRejected(t *testing.T) {
+	cfg := validStateConfig(t)
+	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
+	dep.Hostname = "evil." + testBaseDomain // hostname must equal app+"."+baseDomain
+	err := SaveDeployment(cfg, dep)
+	if !errors.Is(err, ErrInvalidDeploymentState) {
+		t.Errorf("expected ErrInvalidDeploymentState for fabricated hostname, got %v", err)
+	}
+}
+
+func TestSaveDeployment_ZeroTimestampRejected(t *testing.T) {
+	cfg := validStateConfig(t)
+	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
+	dep.DeployedAt = time.Time{} // zero value
+	err := SaveDeployment(cfg, dep)
+	if !errors.Is(err, ErrInvalidDeploymentState) {
+		t.Errorf("expected ErrInvalidDeploymentState for zero timestamp, got %v", err)
+	}
+}
+
+func TestLoadDeploymentState_FabricatedUpstreamRejected(t *testing.T) {
+	cfg := validStateConfig(t)
+	commit := strings.Repeat("a", 40)
+	state := DeploymentState{
+		Version: deploymentStateVersion,
+		App:     "myapp",
+		Current: &Deployment{
+			App:           "myapp",
+			Commit:        commit,
+			Image:         deriveImage("myapp", commit),
+			ContainerName: deriveContainerName("myapp", commit),
+			HostPort:      49152,
+			ContainerPort: 8080,
+			Hostname:      "myapp." + testBaseDomain,
+			Upstream:      "0.0.0.0:49152", // fabricated
+			DeployedAt:    time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC),
+		},
+	}
+	data, _ := json.MarshalIndent(state, "", "  ")
+	if err := os.WriteFile(filepath.Join(cfg.StateDir, "myapp.state.json"), data, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_, err := LoadDeploymentState(cfg, "myapp")
+	if !errors.Is(err, ErrInvalidDeploymentState) {
+		t.Errorf("expected ErrInvalidDeploymentState for fabricated upstream, got %v", err)
+	}
+}
+
+func TestLoadDeploymentState_FabricatedHostnameRejected(t *testing.T) {
+	cfg := validStateConfig(t)
+	commit := strings.Repeat("a", 40)
+	state := DeploymentState{
+		Version: deploymentStateVersion,
+		App:     "myapp",
+		Current: &Deployment{
+			App:           "myapp",
+			Commit:        commit,
+			Image:         deriveImage("myapp", commit),
+			ContainerName: deriveContainerName("myapp", commit),
+			HostPort:      49152,
+			ContainerPort: 8080,
+			Hostname:      "evil." + testBaseDomain, // fabricated
+			Upstream:      "127.0.0.1:49152",
+			DeployedAt:    time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC),
+		},
+	}
+	data, _ := json.MarshalIndent(state, "", "  ")
+	if err := os.WriteFile(filepath.Join(cfg.StateDir, "myapp.state.json"), data, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_, err := LoadDeploymentState(cfg, "myapp")
+	if !errors.Is(err, ErrInvalidDeploymentState) {
+		t.Errorf("expected ErrInvalidDeploymentState for fabricated hostname, got %v", err)
+	}
+}
+
+func TestLoadDeploymentState_ZeroTimestampRejected(t *testing.T) {
+	cfg := validStateConfig(t)
+	commit := strings.Repeat("a", 40)
+	state := DeploymentState{
+		Version: deploymentStateVersion,
+		App:     "myapp",
+		Current: &Deployment{
+			App:           "myapp",
+			Commit:        commit,
+			Image:         deriveImage("myapp", commit),
+			ContainerName: deriveContainerName("myapp", commit),
+			HostPort:      49152,
+			ContainerPort: 8080,
+			Hostname:      "myapp." + testBaseDomain,
+			Upstream:      "127.0.0.1:49152",
+			DeployedAt:    time.Time{}, // zero
+		},
+	}
+	data, _ := json.MarshalIndent(state, "", "  ")
+	if err := os.WriteFile(filepath.Join(cfg.StateDir, "myapp.state.json"), data, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_, err := LoadDeploymentState(cfg, "myapp")
+	if !errors.Is(err, ErrInvalidDeploymentState) {
+		t.Errorf("expected ErrInvalidDeploymentState for zero timestamp, got %v", err)
+	}
+}
+
+func TestLoadDeploymentState_PreviousValidatedAgainstBaseDomain(t *testing.T) {
+	cfg := validStateConfig(t)
+	commit1 := strings.Repeat("a", 40)
+	commit2 := strings.Repeat("b", 40)
+	// Previous was persisted with a hostname that does not match
+	// the current trusted base domain. Load must reject.
+	state := DeploymentState{
+		Version: deploymentStateVersion,
+		App:     "myapp",
+		Current: &Deployment{
+			App:           "myapp",
+			Commit:        commit2,
+			Image:         deriveImage("myapp", commit2),
+			ContainerName: deriveContainerName("myapp", commit2),
+			HostPort:      49153,
+			ContainerPort: 8080,
+			Hostname:      "myapp." + testBaseDomain,
+			Upstream:      "127.0.0.1:49153",
+			DeployedAt:    time.Date(2026, 8, 2, 10, 5, 0, 0, time.UTC),
+		},
+		Previous: &Deployment{
+			App:           "myapp",
+			Commit:        commit1,
+			Image:         deriveImage("myapp", commit1),
+			ContainerName: deriveContainerName("myapp", commit1),
+			HostPort:      49152,
+			ContainerPort: 8080,
+			Hostname:      "myapp.evil.example.com", // fabricated
+			Upstream:      "127.0.0.1:49152",
+			DeployedAt:    time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC),
+		},
+	}
+	data, _ := json.MarshalIndent(state, "", "  ")
+	if err := os.WriteFile(filepath.Join(cfg.StateDir, "myapp.state.json"), data, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_, err := LoadDeploymentState(cfg, "myapp")
+	if !errors.Is(err, ErrInvalidDeploymentState) {
+		t.Errorf("expected ErrInvalidDeploymentState for fabricated previous hostname, got %v", err)
+	}
+}
+
 func TestLoadDeploymentState_SymlinkRejected(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "real.json")
+	cfg := validStateConfig(t)
+	target := filepath.Join(cfg.StateDir, "real.json")
 	if err := os.WriteFile(target, []byte("{}"), 0o644); err != nil {
 		t.Fatalf("seed target: %v", err)
 	}
-	link := filepath.Join(dir, "myapp.state.json")
+	link := filepath.Join(cfg.StateDir, "myapp.state.json")
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	_, err := LoadDeploymentState(dir, "myapp")
+	_, err := LoadDeploymentState(cfg, "myapp")
 	if !errors.Is(err, ErrSymlinkedStateFile) {
 		t.Errorf("expected ErrSymlinkedStateFile, got %v", err)
 	}
 }
 
 func TestSaveDeployment_SymlinkRejected(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "real.json")
+	cfg := validStateConfig(t)
+	target := filepath.Join(cfg.StateDir, "real.json")
 	if err := os.WriteFile(target, []byte("{}"), 0o644); err != nil {
 		t.Fatalf("seed target: %v", err)
 	}
-	link := filepath.Join(dir, "myapp.state.json")
+	link := filepath.Join(cfg.StateDir, "myapp.state.json")
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
 	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
-	err := SaveDeployment(dir, dep)
+	err := SaveDeployment(cfg, dep)
 	if !errors.Is(err, ErrSymlinkedStateFile) {
 		t.Errorf("expected ErrSymlinkedStateFile, got %v", err)
 	}
 }
 
 func TestLoadDeploymentState_Missing(t *testing.T) {
-	dir := t.TempDir()
-	_, err := LoadDeploymentState(dir, "myapp")
+	cfg := validStateConfig(t)
+	_, err := LoadDeploymentState(cfg, "myapp")
 	if !errors.Is(err, ErrDeploymentStateNotFound) {
 		t.Errorf("expected ErrDeploymentStateNotFound, got %v", err)
 	}
 }
 
 func TestSaveDeployment_RejectsPathTraversal(t *testing.T) {
-	dir := t.TempDir()
+	cfg := validStateConfig(t)
 	dep := validDeployment("../etc", strings.Repeat("a", 40), 49152, 8080)
-	err := SaveDeployment(dir, dep)
+	err := SaveDeployment(cfg, dep)
 	if !errors.Is(err, ErrInvalidDeploymentState) {
 		t.Errorf("expected ErrInvalidDeploymentState for path traversal app, got %v", err)
 	}
 }
 
 func TestSaveDeployment_RejectsFabricatedInput(t *testing.T) {
-	dir := t.TempDir()
+	cfg := validStateConfig(t)
 	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
 	dep.Image = "agentctl/myapp:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-	err := SaveDeployment(dir, dep)
+	err := SaveDeployment(cfg, dep)
 	if !errors.Is(err, ErrInvalidDeploymentState) {
 		t.Errorf("expected ErrInvalidDeploymentState for fabricated image, got %v", err)
 	}
 }
 
-func TestDeleteDeploymentState_SafeDeletion(t *testing.T) {
-	dir := t.TempDir()
+func TestSaveDeployment_RequiresStateConfig(t *testing.T) {
 	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
-	if err := SaveDeployment(dir, dep); err != nil {
+	if err := SaveDeployment(StateConfig{}, dep); !errors.Is(err, ErrInvalidDeploymentState) {
+		t.Errorf("expected ErrInvalidDeploymentState for empty cfg, got %v", err)
+	}
+	if err := SaveDeployment(StateConfig{StateDir: "/tmp", BaseDomain: "no-tld"}, dep); !errors.Is(err, ErrInvalidDomain) {
+		t.Errorf("expected ErrInvalidDomain for invalid base domain, got %v", err)
+	}
+}
+
+func TestSaveDeployment_PredictableTempSymlinkNotFollowed(t *testing.T) {
+	// The old atomic-write path used <file>.tmp as a predictable
+	// temp file name. An attacker who pre-placed that path as a
+	// symlink could redirect the write. The new path uses
+	// os.CreateTemp (random suffix), so the predictable path must
+	// never be opened.
+	cfg := validStateConfig(t)
+	sentinel := filepath.Join(cfg.StateDir, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("untouched"), 0o644); err != nil {
+		t.Fatalf("seed sentinel: %v", err)
+	}
+	// Pre-create the predictable temp path as a symlink to the
+	// sentinel. If atomicWriteSync opens this path with
+	// O_CREATE|O_TRUNC, the sentinel would be truncated.
+	predictableTmp := filepath.Join(cfg.StateDir, "myapp.state.json.tmp")
+	if err := os.Symlink(sentinel, predictableTmp); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
+	if err := SaveDeployment(cfg, dep); err != nil {
 		t.Fatalf("SaveDeployment: %v", err)
 	}
 
-	// Successful deletion.
-	if err := DeleteDeploymentState(dir, "myapp"); err != nil {
+	// The sentinel must be untouched: the save never wrote through
+	// the predictable symlink.
+	got, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("read sentinel: %v", err)
+	}
+	if string(got) != "untouched" {
+		t.Errorf("sentinel was modified via predictable temp symlink: %q", got)
+	}
+
+	// The state file must exist with the expected content.
+	state, err := LoadDeploymentState(cfg, "myapp")
+	if err != nil {
+		t.Fatalf("LoadDeploymentState: %v", err)
+	}
+	if state.Current == nil || state.Current.Commit != dep.Commit {
+		t.Errorf("state mismatch: %+v", state.Current)
+	}
+}
+
+func TestDeleteDeploymentState_SafeDeletion(t *testing.T) {
+	cfg := validStateConfig(t)
+	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
+	if err := SaveDeployment(cfg, dep); err != nil {
+		t.Fatalf("SaveDeployment: %v", err)
+	}
+
+	if err := DeleteDeploymentState(cfg, "myapp"); err != nil {
 		t.Fatalf("DeleteDeploymentState: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "myapp.state.json")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(cfg.StateDir, "myapp.state.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("file should be gone, stat err = %v", err)
 	}
 
-	// Deleting again returns ErrDeploymentStateNotFound (safe: not
-	// a silent success on a missing file).
-	err := DeleteDeploymentState(dir, "myapp")
+	err := DeleteDeploymentState(cfg, "myapp")
 	if !errors.Is(err, ErrDeploymentStateNotFound) {
 		t.Errorf("expected ErrDeploymentStateNotFound on second delete, got %v", err)
 	}
 
-	// Path traversal app name rejected.
-	if err := DeleteDeploymentState(dir, "../etc"); !errors.Is(err, ErrInvalidDeploymentState) {
+	if err := DeleteDeploymentState(cfg, "../etc"); !errors.Is(err, ErrInvalidDeploymentState) {
 		t.Errorf("expected ErrInvalidDeploymentState for traversal app, got %v", err)
 	}
 }
 
 func TestDeleteDeploymentState_SymlinkNotFollowed(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "real.json")
+	cfg := validStateConfig(t)
+	target := filepath.Join(cfg.StateDir, "real.json")
 	if err := os.WriteFile(target, []byte("{}"), 0o644); err != nil {
 		t.Fatalf("seed target: %v", err)
 	}
-	link := filepath.Join(dir, "myapp.state.json")
+	link := filepath.Join(cfg.StateDir, "myapp.state.json")
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	if err := DeleteDeploymentState(dir, "myapp"); !errors.Is(err, ErrSymlinkedStateFile) {
+	if err := DeleteDeploymentState(cfg, "myapp"); !errors.Is(err, ErrSymlinkedStateFile) {
 		t.Errorf("expected ErrSymlinkedStateFile, got %v", err)
 	}
-	// Target must still exist (we refused to follow the symlink).
 	if _, err := os.Stat(target); err != nil {
 		t.Errorf("target should still exist: %v", err)
 	}
 }
 
 func TestSaveDeployment_OverwritesCorruptStateRefused(t *testing.T) {
-	// If the existing state file is corrupt, SaveDeployment must
-	// refuse to overwrite it — otherwise a buggy save could silently
-	// destroy the only record of the previous deployment.
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "myapp.state.json"), []byte("{not valid json"), 0o644); err != nil {
+	cfg := validStateConfig(t)
+	if err := os.WriteFile(filepath.Join(cfg.StateDir, "myapp.state.json"), []byte("{not valid json"), 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
-	err := SaveDeployment(dir, dep)
+	err := SaveDeployment(cfg, dep)
 	if !errors.Is(err, ErrCorruptDeploymentState) {
 		t.Errorf("expected ErrCorruptDeploymentState, got %v", err)
 	}
-	// The corrupt file must still be there.
-	data, err := os.ReadFile(filepath.Join(dir, "myapp.state.json"))
+	data, err := os.ReadFile(filepath.Join(cfg.StateDir, "myapp.state.json"))
 	if err != nil {
 		t.Fatalf("read corrupt file: %v", err)
 	}

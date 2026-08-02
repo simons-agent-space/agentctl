@@ -417,12 +417,24 @@ build without re-deriving identity from the runtime or Caddy
 layers. State lives in a trusted host-side directory, one JSON
 file per app.
 
-### State directory
+### State directory and base domain
+
+State is configured by a trusted `StateConfig`:
+
+```
+type StateConfig struct {
+    StateDir   string // <StateDir>/<app>.state.json per app
+    BaseDomain string // every persisted Hostname must equal "<app>.<BaseDomain>"
+}
+```
 
 `StateDir` is a trusted host path supplied by configuration. Each
 app's state is written to `<StateDir>/<app>.state.json`. The
 app-name regex (`^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])$`) gates the
 filename, so path traversal is rejected before disk is touched.
+`BaseDomain` is validated by the same rules the Caddy layer uses
+(`isValidDomain`), so a state file validated here is guaranteed
+to be usable by Caddy without further checks.
 
 ### Schema
 
@@ -455,24 +467,36 @@ migrate deliberately rather than silently misinterpret old data.
 
 ### Identity validation
 
-Before any read, write, or delete, every identity field is
-re-derived and required to match exactly: `Image` must equal
-`deriveImage(App, Commit)`, `ContainerName` must equal
-`deriveContainerName(App, Commit)`, the commit must match the
-40-hex regex, the host port must be in `[1, 65535]`, and the
-container port must be in `[1024, 65535]`. Any mismatch returns
-`ErrInvalidDeploymentState`. This catches both fabricated writes
-and tampered reads.
+Before any read, write, or delete, every field of every persisted
+`Deployment` (Current and Previous) is re-derived against
+`cfg.BaseDomain` and required to match exactly:
+
+- `Image` must equal `deriveImage(App, Commit)`.
+- `ContainerName` must equal `deriveContainerName(App, Commit)`.
+- `Commit` must match the 40-lowercase-hex regex.
+- `HostPort` must be in `[1, 65535]`; `ContainerPort` in `[1024, 65535]`.
+- `Hostname` must equal `"<app>.<BaseDomain>"` exactly.
+- `Upstream` must equal `"127.0.0.1:<HostPort>"` exactly.
+- `DeployedAt` must be non-zero.
+
+Any mismatch returns `ErrInvalidDeploymentState`. This catches
+both fabricated writes and tampered reads, including any tampering
+that survives the previous-deployment move.
 
 ### Atomic write
 
-`SaveDeployment` writes the new state to a sibling temp file, calls
-`fsync` on the temp file, renames it into place over the existing
-file, and finally calls `fsync` on the parent directory. A reader
-that opens the state file at any instant sees either the full
-previous state or the full new state — never a partial write. The
-temp file is named `<file>.tmp` and is unlinked on any error so a
-failed save leaves no stale temp behind.
+`SaveDeployment` writes the new state through an unpredictable
+temp file: `os.CreateTemp(dir, "state-*.tmp")` opens the temp file
+with `O_RDWR|O_CREATE|O_EXCL` semantics, so an attacker who
+pre-placed the predictable `<file>.tmp` (or any other) path as a
+symlink cannot redirect the write. The flow is: chmod `0644`,
+write, `fsync`, close, `rename` into place over the existing file,
+then `fsync` the parent directory. A reader that opens the state
+file at any instant sees either the full previous state or the
+full new state — never a partial write. The temp file is unlinked
+on every error path so a failed save leaves no stale temp behind
+(the deferred unlink is a no-op on success because the file has
+been renamed).
 
 ### Symlink and path-traversal rejection
 
@@ -487,30 +511,32 @@ directory).
 ### API
 
 ```go
-func SaveDeployment(dir string, dep Deployment) error
-func LoadDeploymentState(dir string, app string) (*DeploymentState, error)
-func DeleteDeploymentState(dir string, app string) error
+func SaveDeployment(cfg StateConfig, dep Deployment) error
+func LoadDeploymentState(cfg StateConfig, app string) (*DeploymentState, error)
+func DeleteDeploymentState(cfg StateConfig, app string) error
 ```
 
-`SaveDeployment` validates the supplied `Deployment`, refuses to
-write through a symlink, loads any existing state, moves the
-existing `Current` to `Previous`, installs the new `Current`, and
-writes atomically. A corrupt or fabricated existing state causes
-the save to fail rather than be silently overwritten — losing the
-previous deployment record is worse than refusing a save.
+`SaveDeployment` validates `cfg` (both `StateDir` and `BaseDomain`
+are required; `BaseDomain` must be a valid domain), validates the
+supplied `Deployment` against `cfg.BaseDomain`, refuses to write
+through a symlink, loads any existing state, moves the existing
+`Current` to `Previous`, installs the new `Current`, and writes
+atomically. A corrupt or fabricated existing state causes the save
+to fail rather than be silently overwritten — losing the previous
+deployment record is worse than refusing a save.
 
 `LoadDeploymentState` returns `ErrDeploymentStateNotFound` when no
 state file exists, `ErrCorruptDeploymentState` when the JSON is
 malformed, `ErrUnsupportedStateVersion` when the version field
 does not equal 1, `ErrSymlinkedStateFile` when the state file is a
 symlink, and `ErrInvalidDeploymentState` for any identity
-mismatch.
+mismatch (including a fabricated `Previous`).
 
-`DeleteDeploymentState` is "safe" in three ways: the app name is
-validated against the app-name regex (no path traversal), the file
-is rejected if it is a symlink (the symlink target is left alone),
-and deleting an already-absent file returns
-`ErrDeploymentStateNotFound` rather than silently succeeding.
+`DeleteDeploymentState` is "safe" in three ways: `cfg` and the
+app name are validated (no path traversal), the file is rejected
+if it is a symlink (the symlink target is left alone), and
+deleting an already-absent file returns `ErrDeploymentStateNotFound`
+rather than silently succeeding.
 
 ### Out of scope
 
