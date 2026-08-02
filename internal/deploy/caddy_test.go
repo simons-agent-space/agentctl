@@ -85,12 +85,31 @@ func validCandidate(app, commit string, hostPort int) CandidateResult {
 	}
 }
 
+// defaultCaddyConfig returns a CaddyConfig that satisfies every
+// host-side field required for promotion: a valid base domain, a
+// temp config dir, and a root config path inside the temp dir.
 func defaultCaddyConfig(t *testing.T) CaddyConfig {
 	t.Helper()
+	dir := t.TempDir()
+	root := filepath.Join(dir, "Caddyfile")
+	if err := os.WriteFile(root, []byte("import "+filepath.Join(dir, "*.caddy*")+"\n"), 0o644); err != nil {
+		t.Fatalf("seed root config: %v", err)
+	}
 	return CaddyConfig{
-		BaseDomain:  "apps.simonontheweb.de",
-		ConfigDir:   t.TempDir(),
-		CaddyBinary: "caddy",
+		BaseDomain:     "apps.simonontheweb.de",
+		ConfigDir:      dir,
+		RootConfigPath: root,
+		CaddyBinary:    "caddy",
+	}
+}
+
+// validateAndReloadRoot matches the canonical pair of caddy
+// invocations that target the root config: validate then reload,
+// both with --config <root>.
+func validateAndReloadRoot(root string) []fakeCaddyEntry {
+	return []fakeCaddyEntry{
+		{match: matchCaddy("validate", "--config", root), resp: caddyResponse{}},
+		{match: matchCaddy("reload", "--config", root), resp: caddyResponse{}},
 	}
 }
 
@@ -99,10 +118,7 @@ func TestPromote_ValidPromotion(t *testing.T) {
 	commit := strings.Repeat("a", 40)
 	candidate := validCandidate("myapp", commit, 49152)
 
-	runner := newFakeCaddyRunner(
-		fakeCaddyEntry{match: matchCaddy("validate", "--config", filepath.Join(cfg.ConfigDir, "myapp.caddy.tmp")), resp: caddyResponse{}},
-		fakeCaddyEntry{match: matchCaddy("reload", "--config", filepath.Join(cfg.ConfigDir, "myapp.caddy.tmp")), resp: caddyResponse{}},
-	)
+	runner := newFakeCaddyRunner(validateAndReloadRoot(cfg.RootConfigPath)...)
 
 	result, err := promote(context.Background(), cfg, candidate, runner)
 	if err != nil {
@@ -130,6 +146,41 @@ func TestPromote_ValidPromotion(t *testing.T) {
 	if string(body) != want {
 		t.Errorf("config body mismatch:\n--- got ---\n%s\n--- want ---\n%s", body, want)
 	}
+
+	// No leftover temp or backup files.
+	for _, p := range []string{
+		expectedPath + ".partial",
+		expectedPath + ".bak",
+		expectedPath + ".tmp",
+		expectedPath + ".write",
+	} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("unexpected leftover %s: stat err = %v", p, err)
+		}
+	}
+
+	// Validate and reload both targeted the canonical root, never
+	// the per-app fragment.
+	for _, call := range runner.Calls() {
+		if len(call) < 4 {
+			continue
+		}
+		if call[2] == "--config" && (call[3] == expectedPath || strings.HasSuffix(call[3], ".partial") || strings.HasSuffix(call[3], ".tmp")) {
+			t.Errorf("caddy must target root config, not a fragment: %v", call)
+		}
+	}
+}
+
+func TestPromote_RequiresRootConfigPath(t *testing.T) {
+	cfg := defaultCaddyConfig(t)
+	cfg.RootConfigPath = ""
+	commit := strings.Repeat("a", 40)
+	candidate := validCandidate("myapp", commit, 49152)
+	runner := newFakeCaddyRunner()
+	_, err := promote(context.Background(), cfg, candidate, runner)
+	if !errors.Is(err, ErrInvalidCaddyConfig) {
+		t.Errorf("expected ErrInvalidCaddyConfig, got %v", err)
+	}
 }
 
 func TestPromote_FabricatedCandidateRejected(t *testing.T) {
@@ -148,7 +199,6 @@ func TestPromote_FabricatedCandidateRejected(t *testing.T) {
 		{"wrong-image", func(c *CandidateResult) { c.Image = "agentctl/myapp:deadbeef" }, ErrInvalidCandidate},
 		{"wrong-container", func(c *CandidateResult) { c.ContainerName = "evil" }, ErrInvalidCandidate},
 		{"bad-port", func(c *CandidateResult) { c.HostPort = 0 }, ErrInvalidCandidate},
-		{"no-health-url", func(c *CandidateResult) { c.HealthURL = "" }, ErrInvalidCandidate},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -191,14 +241,12 @@ func TestPromote_AtomicWrite(t *testing.T) {
 	commit := strings.Repeat("a", 40)
 	candidate := validCandidate("myapp", commit, 49152)
 
-	tempPath := filepath.Join(cfg.ConfigDir, "myapp.caddy.tmp")
+	tempPath := filepath.Join(cfg.ConfigDir, "myapp.caddy.partial")
 	finalPath := filepath.Join(cfg.ConfigDir, "myapp.caddy")
 
-	// Snapshot existing temp at start; the test asserts it is removed
-	// after a failed validate, and renamed to final after success.
 	runner := newFakeCaddyRunner(
-		fakeCaddyEntry{match: matchCaddy("validate", "--config", tempPath), resp: caddyResponse{err: errors.New("bad config")}},
-		fakeCaddyEntry{match: matchCaddy("reload", "--config", tempPath), resp: caddyResponse{}},
+		fakeCaddyEntry{match: matchCaddy("validate", "--config", cfg.RootConfigPath), resp: caddyResponse{err: errors.New("bad config")}},
+		fakeCaddyEntry{match: matchCaddy("reload", "--config", cfg.RootConfigPath), resp: caddyResponse{}},
 	)
 
 	_, err := promote(context.Background(), cfg, candidate, runner)
@@ -213,6 +261,28 @@ func TestPromote_AtomicWrite(t *testing.T) {
 	}
 }
 
+func TestPromote_ValidateTargetsRootConfig(t *testing.T) {
+	cfg := defaultCaddyConfig(t)
+	commit := strings.Repeat("a", 40)
+	candidate := validCandidate("myapp", commit, 49152)
+
+	runner := newFakeCaddyRunner(validateAndReloadRoot(cfg.RootConfigPath)...)
+
+	if _, err := promote(context.Background(), cfg, candidate, runner); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	calls := runner.Calls()
+	if len(calls) != 2 {
+		t.Fatalf("expected exactly 2 caddy invocations (validate, reload), got %d: %v", len(calls), calls)
+	}
+	if calls[0][1] != "validate" || calls[0][2] != "--config" || calls[0][3] != cfg.RootConfigPath {
+		t.Errorf("validate must target root config: %v", calls[0])
+	}
+	if calls[1][1] != "reload" || calls[1][2] != "--config" || calls[1][3] != cfg.RootConfigPath {
+		t.Errorf("reload must target root config: %v", calls[1])
+	}
+}
+
 func TestPromote_ValidationFailurePreservesPreviousConfig(t *testing.T) {
 	cfg := defaultCaddyConfig(t)
 	commit := strings.Repeat("a", 40)
@@ -224,10 +294,9 @@ func TestPromote_ValidationFailurePreservesPreviousConfig(t *testing.T) {
 		t.Fatalf("seed previous: %v", err)
 	}
 
-	tempPath := filepath.Join(cfg.ConfigDir, "myapp.caddy.tmp")
 	runner := newFakeCaddyRunner(
-		fakeCaddyEntry{match: matchCaddy("validate", "--config", tempPath), resp: caddyResponse{out: "invalid Caddyfile", err: errors.New("exit 1")}},
-		fakeCaddyEntry{match: matchCaddy("reload", "--config", tempPath), resp: caddyResponse{}},
+		fakeCaddyEntry{match: matchCaddy("validate", "--config", cfg.RootConfigPath), resp: caddyResponse{out: "invalid Caddyfile", err: errors.New("exit 1")}},
+		fakeCaddyEntry{match: matchCaddy("reload", "--config", cfg.RootConfigPath), resp: caddyResponse{}},
 	)
 
 	_, err := promote(context.Background(), cfg, candidate, runner)
@@ -241,9 +310,12 @@ func TestPromote_ValidationFailurePreservesPreviousConfig(t *testing.T) {
 	if string(got) != string(previous) {
 		t.Errorf("previous config was overwritten:\n--- got ---\n%s\n--- want ---\n%s", got, previous)
 	}
+	if _, err := os.Stat(finalPath + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("backup must not be created on validate failure, stat err = %v", err)
+	}
 }
 
-func TestPromote_ReloadFailurePreservesPreviousConfig(t *testing.T) {
+func TestPromote_ReloadFailureRestoresPreviousAndReloads(t *testing.T) {
 	cfg := defaultCaddyConfig(t)
 	commit := strings.Repeat("a", 40)
 	candidate := validCandidate("myapp", commit, 49152)
@@ -254,25 +326,80 @@ func TestPromote_ReloadFailurePreservesPreviousConfig(t *testing.T) {
 		t.Fatalf("seed previous: %v", err)
 	}
 
-	tempPath := filepath.Join(cfg.ConfigDir, "myapp.caddy.tmp")
-	runner := newFakeCaddyRunner(
-		fakeCaddyEntry{match: matchCaddy("validate", "--config", tempPath), resp: caddyResponse{}},
-		fakeCaddyEntry{match: matchCaddy("reload", "--config", tempPath), resp: caddyResponse{out: "reload failed", err: errors.New("exit 1")}},
-	)
+	// Validate succeeds; every reload (the promotion reload and the
+	// best-effort restore reload) fails.
+	runner := &fakeCaddyRunner{responses: []fakeCaddyEntry{
+		{match: matchCaddy("validate", "--config", cfg.RootConfigPath), resp: caddyResponse{}},
+		{match: func(a []string) bool {
+			return len(a) >= 3 && a[1] == "reload" && a[2] == "--config" && a[3] == cfg.RootConfigPath
+		}, resp: caddyResponse{out: "reload failed", err: errors.New("exit 1")}},
+	}}
 
 	_, err := promote(context.Background(), cfg, candidate, runner)
 	if !errors.Is(err, ErrCaddyReloadFailed) {
 		t.Fatalf("expected ErrCaddyReloadFailed, got %v", err)
 	}
+
+	// Final file holds the previous contents (restored from backup).
 	got, err := os.ReadFile(finalPath)
 	if err != nil {
 		t.Fatalf("read final: %v", err)
 	}
 	if string(got) != string(previous) {
-		t.Errorf("previous config was overwritten on reload failure:\n--- got ---\n%s\n--- want ---\n%s", got, previous)
+		t.Errorf("previous config not restored on reload failure:\n--- got ---\n%s\n--- want ---\n%s", got, previous)
 	}
-	if _, err := os.Stat(tempPath); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("temp file should have been removed after reload failure, stat err = %v", err)
+
+	// No leftover temp or backup files.
+	for _, p := range []string{
+		finalPath + ".partial",
+		finalPath + ".bak",
+	} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("unexpected leftover %s: stat err = %v", p, err)
+		}
+	}
+
+	// Validate (1) + reload (1, failed) + best-effort restore reload (1)
+	// = 3 caddy invocations, all targeting the root config.
+	calls := runner.Calls()
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 caddy invocations (validate, reload-fail, restore-reload), got %d: %v", len(calls), calls)
+	}
+	for i, call := range calls {
+		if call[2] != "--config" || call[3] != cfg.RootConfigPath {
+			t.Errorf("call %d must target root config: %v", i, call)
+		}
+	}
+}
+
+func TestPromote_ReloadFailureFirstPromotionRemovesNewFragment(t *testing.T) {
+	cfg := defaultCaddyConfig(t)
+	commit := strings.Repeat("a", 40)
+	candidate := validCandidate("myapp", commit, 49152)
+	finalPath := filepath.Join(cfg.ConfigDir, "myapp.caddy")
+
+	runner := &fakeCaddyRunner{responses: []fakeCaddyEntry{
+		{match: matchCaddy("validate", "--config", cfg.RootConfigPath), resp: caddyResponse{}},
+		{match: func(a []string) bool {
+			return len(a) >= 3 && a[1] == "reload" && a[2] == "--config" && a[3] == cfg.RootConfigPath
+		}, resp: caddyResponse{out: "reload failed", err: errors.New("exit 1")}},
+	}}
+
+	_, err := promote(context.Background(), cfg, candidate, runner)
+	if !errors.Is(err, ErrCaddyReloadFailed) {
+		t.Fatalf("expected ErrCaddyReloadFailed, got %v", err)
+	}
+
+	// No previous config existed, so final file must be gone (we
+	// removed it to restore pre-promotion state), and the parked
+	// temp must be gone too.
+	if _, err := os.Stat(finalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("final file should be removed after failed first promotion, stat err = %v", err)
+	}
+	for _, p := range []string{finalPath + ".partial", finalPath + ".bak"} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("unexpected leftover %s: stat err = %v", p, err)
+		}
 	}
 }
 
@@ -281,11 +408,7 @@ func TestPromote_UpstreamIsExactLocalhost(t *testing.T) {
 	commit := strings.Repeat("a", 40)
 	candidate := validCandidate("myapp", commit, 49152)
 
-	tempPath := filepath.Join(cfg.ConfigDir, "myapp.caddy.tmp")
-	runner := newFakeCaddyRunner(
-		fakeCaddyEntry{match: matchCaddy("validate", "--config", tempPath), resp: caddyResponse{}},
-		fakeCaddyEntry{match: matchCaddy("reload", "--config", tempPath), resp: caddyResponse{}},
-	)
+	runner := newFakeCaddyRunner(validateAndReloadRoot(cfg.RootConfigPath)...)
 
 	_, err := promote(context.Background(), cfg, candidate, runner)
 	if err != nil {
@@ -310,15 +433,29 @@ func TestRemovePromotion_SafeRemoval(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	runner := newFakeCaddyRunner(
-		fakeCaddyEntry{match: matchCaddy("reload", "--config", configPath), resp: caddyResponse{}},
-	)
+	runner := newFakeCaddyRunner(validateAndReloadRoot(cfg.RootConfigPath)...)
 
 	if err := removePromotion(context.Background(), cfg, "myapp", runner); err != nil {
 		t.Fatalf("removePromotion: %v", err)
 	}
 	if _, err := os.Stat(configPath); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("config file should have been removed, stat err = %v", err)
+	}
+	for _, p := range []string{configPath + ".bak", configPath + ".partial"} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("unexpected leftover %s: stat err = %v", p, err)
+		}
+	}
+
+	// Validate (1) + reload (1), both targeting root.
+	calls := runner.Calls()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 caddy invocations (validate, reload), got %d: %v", len(calls), calls)
+	}
+	for i, call := range calls {
+		if call[2] != "--config" || call[3] != cfg.RootConfigPath {
+			t.Errorf("call %d must target root config: %v", i, call)
+		}
 	}
 }
 
@@ -345,6 +482,72 @@ func TestRemovePromotion_NotFound(t *testing.T) {
 	}
 }
 
+func TestRemovePromotion_ValidateFailureRestoresFragment(t *testing.T) {
+	cfg := defaultCaddyConfig(t)
+	configPath := filepath.Join(cfg.ConfigDir, "myapp.caddy")
+	previous := []byte("previous contents\n")
+	if err := os.WriteFile(configPath, previous, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	runner := newFakeCaddyRunner(
+		fakeCaddyEntry{match: matchCaddy("validate", "--config", cfg.RootConfigPath), resp: caddyResponse{err: errors.New("bad config")}},
+		fakeCaddyEntry{match: matchCaddy("reload", "--config", cfg.RootConfigPath), resp: caddyResponse{}},
+	)
+
+	err := removePromotion(context.Background(), cfg, "myapp", runner)
+	if !errors.Is(err, ErrCaddyValidateFailed) {
+		t.Fatalf("expected ErrCaddyValidateFailed, got %v", err)
+	}
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if string(got) != string(previous) {
+		t.Errorf("fragment was not restored on validate failure:\n--- got ---\n%s\n--- want ---\n%s", got, previous)
+	}
+	if _, err := os.Stat(configPath + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("backup must not linger on validate failure, stat err = %v", err)
+	}
+}
+
+func TestRemovePromotion_ReloadFailureRestoresFragmentAndReloads(t *testing.T) {
+	cfg := defaultCaddyConfig(t)
+	configPath := filepath.Join(cfg.ConfigDir, "myapp.caddy")
+	previous := []byte("previous contents\n")
+	if err := os.WriteFile(configPath, previous, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	runner := &fakeCaddyRunner{responses: []fakeCaddyEntry{
+		{match: matchCaddy("validate", "--config", cfg.RootConfigPath), resp: caddyResponse{}},
+		{match: func(a []string) bool {
+			return len(a) >= 3 && a[1] == "reload" && a[2] == "--config" && a[3] == cfg.RootConfigPath
+		}, resp: caddyResponse{out: "reload failed", err: errors.New("exit 1")}},
+	}}
+
+	err := removePromotion(context.Background(), cfg, "myapp", runner)
+	if !errors.Is(err, ErrCaddyReloadFailed) {
+		t.Fatalf("expected ErrCaddyReloadFailed, got %v", err)
+	}
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if string(got) != string(previous) {
+		t.Errorf("fragment not restored on reload failure:\n--- got ---\n%s\n--- want ---\n%s", got, previous)
+	}
+	if _, err := os.Stat(configPath + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("backup must not linger on reload failure, stat err = %v", err)
+	}
+
+	// Validate + reload-fail + best-effort restore-reload = 3 calls.
+	calls := runner.Calls()
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 caddy invocations, got %d: %v", len(calls), calls)
+	}
+}
+
 func TestRemovePromotion_DoesNotTouchOtherApps(t *testing.T) {
 	cfg := defaultCaddyConfig(t)
 	target := filepath.Join(cfg.ConfigDir, "myapp.caddy")
@@ -356,9 +559,7 @@ func TestRemovePromotion_DoesNotTouchOtherApps(t *testing.T) {
 		t.Fatalf("seed other: %v", err)
 	}
 
-	runner := newFakeCaddyRunner(
-		fakeCaddyEntry{match: matchCaddy("reload", "--config", target), resp: caddyResponse{}},
-	)
+	runner := newFakeCaddyRunner(validateAndReloadRoot(cfg.RootConfigPath)...)
 
 	if err := removePromotion(context.Background(), cfg, "myapp", runner); err != nil {
 		t.Fatalf("removePromotion: %v", err)

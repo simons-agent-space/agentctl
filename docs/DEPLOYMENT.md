@@ -240,11 +240,26 @@ upstreams, or raw Caddy configuration.
 
 ```
 type CaddyConfig struct {
-    BaseDomain  string  // e.g., "apps.simonontheweb.de"
-    ConfigDir   string  // trusted directory for managed fragments
-    CaddyBinary string  // defaults to "caddy" when empty
+    BaseDomain     string  // e.g., "apps.simonontheweb.de"
+    ConfigDir      string  // trusted directory for managed fragments
+    RootConfigPath string  // canonical Caddyfile Caddy is running
+    CaddyBinary    string  // defaults to "caddy" when empty
 }
 ```
+
+Caddy is expected to run as a single long-lived process whose
+canonical config file is `RootConfigPath`. That root file is
+expected to import the managed fragments from `ConfigDir`, e.g.
+
+```
+import <ConfigDir>/*.caddy*
+```
+
+The import glob must match both final fragments (`<app>.caddy`) and
+the temporary fragments (`<app>.caddy.partial`) that promotion
+writes for validation. Every `caddy validate` and `caddy reload`
+invocation this package makes targets the canonical root file; no
+individual app fragment is ever passed to Caddy directly.
 
 ### Derived names
 
@@ -266,22 +281,42 @@ The runtime writes a Caddyfile fragment of the form:
 ```
 
 The fragment is written atomically: the runtime writes to
-`<config>.tmp` first, validates it, reloads Caddy with the temp file,
-and only then renames it to the final path. If validation or reload
-fails, the temp file is removed and the previous final config (if
-any) is left untouched.
+`<config>.partial` first so the root config's import statement can
+pick it up while the prospective configuration is validated. The
+final `<config>` is renamed into place only after validation
+succeeds; on failure, the partial is removed and the previous final
+config (if any) is left untouched. Every Caddy invocation in this
+flow targets the canonical root config, never the per-app
+fragment.
 
 ### Validation and reload
 
-1. `caddy validate --config <temp>` runs against the new fragment.
-   On failure, the temp file is removed and the function returns
-   `ErrCaddyValidateFailed`. The previous config is preserved.
-2. `caddy reload --config <temp>` applies the new fragment to the
-   running Caddy. On failure, the temp file is removed and the
-   function returns `ErrCaddyReloadFailed`. The previous config is
-   preserved because the final file has not yet been renamed.
-3. On success, the temp file is atomically renamed to the final
-   path.
+1. `caddy validate --config <RootConfigPath>` runs against the
+   complete prospective configuration (root + fragments, including
+   the new partial). On failure, the partial is removed and the
+   function returns `ErrCaddyValidateFailed`. The previous config is
+   preserved and no backup is created — we only back up the final
+   fragment after validation succeeds.
+2. If a previous final fragment exists, it is renamed to
+   `<config>.bak`. On rename failure, the partial is removed and
+   the function returns `ErrAtomicWriteFailed`; the previous
+   fragment is preserved at its original path.
+3. The partial is renamed to the final `<config>` path. On rename
+   failure, the partial is removed and the previous fragment (if
+   any) is restored from the backup; the function returns
+   `ErrAtomicWriteFailed`.
+4. `caddy reload --config <RootConfigPath>` applies the new
+   configuration to the running Caddy. On failure:
+   - The new fragment is parked back at `<config>.partial` so the
+     backup can be moved into its place without overwriting.
+   - The backup (or absence of one, for first-time promotions) is
+     restored at `<config>` and a best-effort reload is issued so
+     the running Caddy state matches disk.
+   - The parked partial is removed so it cannot leak into a later
+     reload.
+   - The function returns `ErrCaddyReloadFailed`.
+5. On success, the backup is removed (best-effort; a leftover `.bak`
+   is harmless because nothing in this package imports `.bak` files).
 
 ### Identity validation
 
@@ -293,10 +328,12 @@ re-derived and required to match exactly:
 - `image` equals `agentctl/<app>:<commit>`.
 - `container name` equals `agentctl-<app>-<first-12-chars-of-commit>`.
 - `host port` is a valid port number.
-- `health URL` is non-empty.
 
-Fabricated candidates are rejected with `ErrInvalidCandidate` before
-any disk or Caddy operation runs.
+`HealthURL` is intentionally not part of the promotion identity:
+promotion derives its upstream exclusively from `HostPort`, and
+`HealthURL` is the runtime layer's concern. Fabricated candidates
+are rejected with `ErrInvalidCandidate` before any disk or Caddy
+operation runs.
 
 ### Result
 
@@ -319,7 +356,18 @@ func RemovePromotion(ctx context.Context, cfg CaddyConfig, app string) error
 - Validates `app` against the app-name regex.
 - The derived config path `<ConfigDir>/<app>.caddy` must exist;
   otherwise `ErrPromotionNotFound`.
-- Runs `caddy reload --config <path>` and then removes the file.
+- Moves the fragment to `<config>.bak`. The root config's import
+  statement no longer sees the fragment after this rename, so the
+  following validate/reload reflects the post-removal state.
+- `caddy validate --config <RootConfigPath>` confirms the canonical
+  config is still valid without the fragment. On failure the
+  fragment is restored from the backup and `ErrCaddyValidateFailed`
+  is returned.
+- `caddy reload --config <RootConfigPath>` applies the change to the
+  running Caddy. On failure the fragment is restored from the
+  backup, a best-effort reload is issued, and
+  `ErrCaddyReloadFailed` is returned.
+- On success, the backup is removed.
 - Only the exact derived app config is touched; other apps' configs
   are left alone.
 
