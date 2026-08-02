@@ -108,10 +108,14 @@ func rollbackDeployment(ctx context.Context, cfg RollbackConfig, deps rollbackDe
 		// original runtime state so the rollback is transparent
 		// to the caller when promotion fails. Uses the bounded
 		// recovery context so a cancelled caller cannot prevent
-		// the restore.
+		// the restore. The restore error is reported alongside
+		// the primary promotion failure.
 		cleanupCtx, cancel := recoveryContext()
-		restorePreviousContainer(cleanupCtx, deps.docker, previous.ContainerName, previousAction)
+		restoreErr := restorePreviousContainer(cleanupCtx, deps.docker, previous.ContainerName, previousAction)
 		cancel()
+		if restoreErr != nil {
+			return fmt.Errorf("%w: promote previous: %v; cleanup also failed: %v", ErrRollbackFailed, err, restoreErr)
+		}
 		return fmt.Errorf("%w: promote previous: %v", ErrRollbackFailed, err)
 	}
 
@@ -125,7 +129,9 @@ func rollbackDeployment(ctx context.Context, cfg RollbackConfig, deps rollbackDe
 		// disk and Caddy agree again. Uses the bounded recovery
 		// context so a cancelled caller cannot prevent revert.
 		// After the revert (whether it succeeded or not), restore
-		// the previous container's original runtime state.
+		// the previous container's original runtime state. Both
+		// the revert error and the restore error are reported
+		// alongside the primary state-save failure.
 		cleanupCtx, cancel := recoveryContext()
 		defer cancel()
 		currentCandidate := deploymentToCandidate(current, cfg.HealthPath)
@@ -135,8 +141,14 @@ func rollbackDeployment(ctx context.Context, cfg RollbackConfig, deps rollbackDe
 			// container so the rollback is transparent.
 		}
 		restoreCtx, cancelRestore := recoveryContext()
-		restorePreviousContainer(restoreCtx, deps.docker, previous.ContainerName, previousAction)
+		restoreErr := restorePreviousContainer(restoreCtx, deps.docker, previous.ContainerName, previousAction)
 		cancelRestore()
+		if restoreErr != nil {
+			if revertErr != nil {
+				return fmt.Errorf("%w: save state: %v; caddy revert also failed: %v; cleanup also failed: %v", ErrRollbackFailed, err, revertErr, restoreErr)
+			}
+			return fmt.Errorf("%w: save state: %v; cleanup also failed: %v", ErrRollbackFailed, err, restoreErr)
+		}
 		if revertErr != nil {
 			return fmt.Errorf("%w: save state: %v; caddy revert also failed: %v", ErrRollbackFailed, err, revertErr)
 		}
@@ -243,10 +255,21 @@ func ensurePreviousRunningAndHealthy(ctx context.Context, cfg RuntimeConfig, dep
 	}
 
 	if err := pollHealth(ctx, candidate.HealthURL, cfg.HealthTimeout); err != nil {
+		// Health check failed. Restore the previous container to
+		// its pre-rollback runtime state so the rollback is
+		// transparent when the only thing that went wrong is
+		// the health check. The restore uses a bounded recovery
+		// context so a cancelled caller cannot prevent it. Any
+		// restore error is reported alongside the primary health
+		// failure; the caller wraps the chain in ErrRollbackFailed.
+		var cleanupErr error
 		if action != previousContainerUntouched {
 			cleanupCtx, cancel := recoveryContext()
-			_ = removeContainerForce(cleanupCtx, runner, dep.ContainerName)
+			cleanupErr = restorePreviousContainer(cleanupCtx, runner, dep.ContainerName, action)
 			cancel()
+		}
+		if cleanupErr != nil {
+			return nil, action, fmt.Errorf("%w: %v; cleanup also failed: %v", ErrHealthCheckFailed, err, cleanupErr)
 		}
 		return nil, action, fmt.Errorf("%w: %v", ErrHealthCheckFailed, err)
 	}
@@ -276,29 +299,37 @@ const (
 )
 
 // restorePreviousContainer returns the previous container to the
-// runtime state it had before rollback began. It is best-effort
-// and uses the caller-supplied (bounded recovery) context so a
-// cancelled caller cannot prevent the restore.
+// runtime state it had before rollback began. It uses the
+// caller-supplied (bounded recovery) context so a cancelled
+// caller cannot prevent the restore. The returned error is the
+// underlying docker error if the restore call fails; callers
+// must not silently swallow it — they should wrap it so the
+// caller of RollbackDeployment sees both the primary failure
+// and the cleanup failure.
 //
 // Restore semantics:
 //   - previousContainerUntouched: no docker call is made.
 //   - previousContainerStarted:   `docker stop` is called.
 //   - previousContainerCreated:   `docker rm --force` is called.
-func restorePreviousContainer(ctx context.Context, runner commandRunner, containerName string, action previousContainerAction) {
+func restorePreviousContainer(ctx context.Context, runner commandRunner, containerName string, action previousContainerAction) error {
 	switch action {
 	case previousContainerUntouched:
-		return
+		return nil
 	case previousContainerStarted:
 		// Container was stopped before rollback; we started it.
 		// Stop it so the container exists but is stopped again.
-		_, _ = runner.Run(ctx, "docker", "stop", containerName)
+		if _, err := runner.Run(ctx, "docker", "stop", containerName); err != nil {
+			return fmt.Errorf("docker stop %s: %w", containerName, err)
+		}
+		return nil
 	case previousContainerCreated:
 		// Container did not exist before rollback; we created
 		// it. Remove it so the pre-rollback absent state is
-		// restored. Best-effort: "No such container" is
-		// tolerated by removeContainerForce.
-		_ = removeContainerForce(ctx, runner, containerName)
+		// restored. removeContainerForce tolerates "No such
+		// container".
+		return removeContainerForce(ctx, runner, containerName)
 	}
+	return nil
 }
 
 // runContainerFromImage runs a new container from the given

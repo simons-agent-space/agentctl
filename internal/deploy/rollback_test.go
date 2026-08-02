@@ -94,6 +94,13 @@ func matchDockerStart(name string) func([]string) bool {
 	}
 }
 
+// matchDockerStop matches `docker stop <name>`.
+func matchDockerStop(name string) func([]string) bool {
+	return func(a []string) bool {
+		return len(a) >= 2 && a[0] == "stop" && a[1] == name
+	}
+}
+
 // matchDockerRm matches `docker rm --force <name>`.
 func matchDockerRm(name string) func([]string) bool {
 	return func(a []string) bool {
@@ -778,5 +785,122 @@ func TestRollbackDeployment_StateSaveFailureRestoresPrevious(t *testing.T) {
 	}
 	if !sawStop {
 		t.Errorf("expected docker stop for previous container %s after state-save failure", f.previousContainerName)
+	}
+}
+
+// TestRollbackDeployment_HealthFailureAfterStartStopsContainer
+// proves that when the previous container was stopped before
+// rollback and the health check fails after rollback started it,
+// the restore path calls `docker stop` (returning the
+// container to its pre-rollback stopped state) — it must never
+// remove a container that existed before rollback.
+func TestRollbackDeployment_HealthFailureAfterStartStopsContainer(t *testing.T) {
+	f := newRollbackFixture(t)
+	// Close the health server so every health check fails.
+	f.healthSrv.Close()
+
+	// Previous is stopped; rollback starts it, then health
+	// fails. The restore must call `docker stop` on the
+	// previous container.
+	docker := newFakeDockerRunner(
+		fakeDockerEntry{match: matchDockerInspect(f.previousContainerName), resp: dockerResponse{out: "false"}},
+		fakeDockerEntry{match: matchDockerStart(f.previousContainerName), resp: dockerResponse{}},
+		fakeDockerEntry{match: matchDockerStop(f.previousContainerName), resp: dockerResponse{}},
+	)
+	caddy := healthyCaddy(f.cfg.Caddy.RootConfigPath)
+
+	err := rollbackDeployment(context.Background(), f.cfg, rollbackDeps{docker: docker, caddy: caddy})
+	if !errors.Is(err, ErrRollbackFailed) {
+		t.Fatalf("expected ErrRollbackFailed, got %v", err)
+	}
+
+	// `docker stop` must have been issued.
+	sawStop := false
+	for _, call := range docker.Calls() {
+		if len(call) >= 3 && call[1] == "stop" && call[2] == f.previousContainerName {
+			sawStop = true
+		}
+		// `docker rm` must NEVER be issued for a container that
+		// existed before rollback began.
+		if len(call) >= 4 && call[1] == "rm" && call[2] == "--force" && call[3] == f.previousContainerName {
+			t.Errorf("docker rm --force must not be called when restoring a previously-stopped container: %v", call)
+		}
+	}
+	if !sawStop {
+		t.Errorf("expected docker stop for previous container %s after health-check failure", f.previousContainerName)
+	}
+}
+
+// TestRollbackDeployment_HealthFailureAfterCreateRemovesContainer
+// proves that when the previous container was absent before
+// rollback and the health check fails after rollback created it,
+// the restore path calls `docker rm --force` (returning the
+// container to its pre-rollback absent state).
+func TestRollbackDeployment_HealthFailureAfterCreateRemovesContainer(t *testing.T) {
+	f := newRollbackFixture(t)
+	f.healthSrv.Close()
+
+	// Previous is absent; rollback creates it, then health
+	// fails. The restore must call `docker rm --force` on the
+	// previous container.
+	docker := newFakeDockerRunner(
+		fakeDockerEntry{match: matchDockerInspect(f.previousContainerName), resp: dockerResponse{
+			out: "Error: No such object: " + f.previousContainerName,
+			err: errors.New("exit 1"),
+		}},
+		fakeDockerEntry{match: matchDockerRun(f.previousContainerName), resp: dockerResponse{}},
+		fakeDockerEntry{match: matchDockerRm(f.previousContainerName), resp: dockerResponse{}},
+	)
+	caddy := healthyCaddy(f.cfg.Caddy.RootConfigPath)
+
+	err := rollbackDeployment(context.Background(), f.cfg, rollbackDeps{docker: docker, caddy: caddy})
+	if !errors.Is(err, ErrRollbackFailed) {
+		t.Fatalf("expected ErrRollbackFailed, got %v", err)
+	}
+
+	sawRm := false
+	for _, call := range docker.Calls() {
+		if len(call) >= 4 && call[1] == "rm" && call[2] == "--force" && call[3] == f.previousContainerName {
+			sawRm = true
+		}
+		if len(call) >= 3 && call[1] == "stop" && call[2] == f.previousContainerName {
+			t.Errorf("docker stop must not be called for a previously-absent container: %v", call)
+		}
+	}
+	if !sawRm {
+		t.Errorf("expected docker rm --force for previous container %s after health-check failure", f.previousContainerName)
+	}
+}
+
+// TestRollbackDeployment_CleanupFailureIsReported proves that
+// when the restore call itself fails, the error is reported
+// alongside the primary failure and the returned error still
+// preserves ErrRollbackFailed.
+func TestRollbackDeployment_CleanupFailureIsReported(t *testing.T) {
+	f := newRollbackFixture(t)
+	f.healthSrv.Close()
+
+	// Previous is stopped; rollback starts it, health fails,
+	// and the restore `docker stop` ALSO fails. The returned
+	// error must mention the cleanup failure.
+	docker := newFakeDockerRunner(
+		fakeDockerEntry{match: matchDockerInspect(f.previousContainerName), resp: dockerResponse{out: "false"}},
+		fakeDockerEntry{match: matchDockerStart(f.previousContainerName), resp: dockerResponse{}},
+		fakeDockerEntry{match: matchDockerStop(f.previousContainerName), resp: dockerResponse{err: errors.New("stop exploded")}},
+	)
+	caddy := healthyCaddy(f.cfg.Caddy.RootConfigPath)
+
+	err := rollbackDeployment(context.Background(), f.cfg, rollbackDeps{docker: docker, caddy: caddy})
+	if err == nil {
+		t.Fatalf("expected error from rollback, got nil")
+	}
+	if !errors.Is(err, ErrRollbackFailed) {
+		t.Errorf("error must preserve ErrRollbackFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "cleanup") {
+		t.Errorf("error must mention cleanup failure, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "stop exploded") {
+		t.Errorf("error must include the underlying stop error, got: %v", err)
 	}
 }
