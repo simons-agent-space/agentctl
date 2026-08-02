@@ -268,11 +268,12 @@ func TestDataContainerPathIsFixed(t *testing.T) {
 	}
 }
 
-func TestAppDataDir_RejectsSymlinkedDataRoot(t *testing.T) {
-	// A symlinked DataRoot must not be allowed to redirect the
-	// derived path outside the trusted layout. AppDataDir is the
-	// only consumer that resolves the path; EnsureAppDataDir and
-	// RemoveAppDataDir both go through it.
+func TestAppDataDir_AllowsSymlinkedDataRoot(t *testing.T) {
+	// AppDataDir is a pure-derive helper: it does not touch
+	// disk. A symlinked DataRoot does not change the path it
+	// returns. The actual symlink rejection happens in
+	// EnsureAppDataDir and RemoveAppDataDir — see the
+	// *RejectsSymlinkedDataRoot tests below.
 	real := t.TempDir()
 	linkParent := t.TempDir()
 	link := filepath.Join(linkParent, "root")
@@ -284,12 +285,89 @@ func TestAppDataDir_RejectsSymlinkedDataRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AppDataDir: %v", err)
 	}
-	// The path should resolve through the symlink to a real
-	// location, and EnsureAppDataDir should be able to create it.
-	if _, err := EnsureAppDataDir(cfg, "myapp", false); err != nil {
-		t.Errorf("EnsureAppDataDir with symlinked root: %v", err)
+	want := filepath.Join(link, "myapp", "data")
+	if data.HostPath != want {
+		t.Errorf("HostPath = %q, want %q", data.HostPath, want)
 	}
-	if _, err := os.Stat(data.HostPath); err != nil {
-		t.Errorf("host path not created: %v", err)
+}
+
+func TestEnsureAppDataDir_RejectsSymlinkedDataRoot(t *testing.T) {
+	// A symlinked DataRoot could otherwise redirect MkdirAll
+	// outside the trusted layout. The pre-MkdirAll symlink
+	// check must catch it.
+	real := t.TempDir()
+	linkParent := t.TempDir()
+	link := filepath.Join(linkParent, "root")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	cfg := DataConfig{DataRoot: link}
+	if _, err := EnsureAppDataDir(cfg, "myapp", false); !errors.Is(err, ErrSymlinkedAppData) {
+		t.Errorf("expected ErrSymlinkedAppData, got %v", err)
+	}
+	// Nothing must have been created inside the trusted real root.
+	if _, err := os.Stat(filepath.Join(real, "myapp")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("data dir leaked into real root: %v", err)
+	}
+}
+
+func TestEnsureAppDataDir_RejectsSymlinkedAppParent(t *testing.T) {
+	// <DataRoot>/<app> as a symlink would let MkdirAll create
+	// the data directory under the symlink target, outside the
+	// trusted layout. The pre-MkdirAll check must catch it.
+	dataDir := t.TempDir()
+	appDir := filepath.Join(dataDir, "myapp")
+	target := t.TempDir()
+	if err := os.Symlink(target, appDir); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	cfg := DataConfig{DataRoot: dataDir}
+	if _, err := EnsureAppDataDir(cfg, "myapp", false); !errors.Is(err, ErrSymlinkedAppData) {
+		t.Errorf("expected ErrSymlinkedAppData, got %v", err)
+	}
+	// The symlink target must be untouched — no `data` directory
+	// must have appeared inside it.
+	if _, err := os.Stat(filepath.Join(target, "data")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("data dir leaked into symlink target: %v", err)
+	}
+}
+
+func TestRemoveAppDataDir_RejectsSymlinkedDataRoot(t *testing.T) {
+	real := t.TempDir()
+	linkParent := t.TempDir()
+	link := filepath.Join(linkParent, "root")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	cfg := DataConfig{DataRoot: link}
+	if err := RemoveAppDataDir(cfg, "myapp", true); !errors.Is(err, ErrSymlinkedAppData) {
+		t.Errorf("expected ErrSymlinkedAppData, got %v", err)
+	}
+}
+
+func TestRemoveAppDataDir_RejectsSymlinkedAppParent(t *testing.T) {
+	// A symlinked <DataRoot>/<app> must not let RemoveAll
+	// walk into the symlink target.
+	dataDir := t.TempDir()
+	appDir := filepath.Join(dataDir, "myapp")
+	target := t.TempDir()
+	if err := os.Symlink(target, appDir); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	// Seed the symlink target with a "data" directory that
+	// must NOT be touched by RemoveAppDataDir.
+	if err := os.MkdirAll(filepath.Join(target, "data"), 0o755); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "data", "user.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cfg := DataConfig{DataRoot: dataDir}
+	if err := RemoveAppDataDir(cfg, "myapp", true); !errors.Is(err, ErrSymlinkedAppData) {
+		t.Errorf("expected ErrSymlinkedAppData, got %v", err)
+	}
+	// The user file inside the symlink target must survive.
+	if _, err := os.Stat(filepath.Join(target, "data", "user.json")); err != nil {
+		t.Errorf("user file was deleted through symlinked parent: %v", err)
 	}
 }

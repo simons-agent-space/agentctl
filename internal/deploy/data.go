@@ -20,7 +20,11 @@ var (
 	ErrInvalidDataConfig = errors.New("invalid data configuration")
 	ErrAppDataNotFound   = errors.New("app data directory not found")
 	ErrAppDataNotEmpty   = errors.New("app data directory not empty")
-	ErrSymlinkedAppData  = errors.New("app data directory is a symlink")
+	// ErrSymlinkedAppData is returned when any component of the
+	// data layout — DataRoot, the existing <DataRoot>/<app>
+	// parent, or the final data path — is a symlink. The symlink
+	// target is never followed and is left untouched.
+	ErrSymlinkedAppData = errors.New("app data path component is a symlink")
 )
 
 // DataConfig holds the trusted host-side configuration for the
@@ -30,9 +34,11 @@ var (
 //
 // DataRoot is expected to live outside the repository root and
 // outside any path the deployment process can write into except
-// through this layer. A symlink at any component of the path
-// (including <DataRoot> or <DataRoot>/<app>) is rejected as
-// defense in depth.
+// through this layer. EnsureAppDataDir and RemoveAppDataDir
+// reject symlinks at DataRoot, at the existing <DataRoot>/<app>
+// parent, and at the final data path before any follow-on
+// filesystem call, so a symlinked root or parent cannot redirect
+// creation or deletion outside the trusted layout.
 type DataConfig struct {
 	// DataRoot is the trusted host directory under which every
 	// per-app data directory is created. The trailing slash is
@@ -70,9 +76,12 @@ type AppData struct {
 //
 // The app name is validated against the existing appNameRe. The
 // resolved host path is verified to live under cfg.DataRoot
-// (defense in depth against a symlinked DataRoot). If the data
-// directory exists as a symlink, the operation is rejected with
-// ErrSymlinkedAppData and the symlink target is left untouched.
+// (defense in depth against a symlinked DataRoot). Symlinks at
+// DataRoot, at an existing <DataRoot>/<app> parent, or at the
+// final data path are rejected with ErrSymlinkedAppData and the
+// symlink targets are left untouched; the checks run BEFORE any
+// Mkdir, MkdirAll, ReadDir, or RemoveAll so a redirected parent
+// cannot escape creation.
 //
 // EnsureAppDataDir is the call Deploy / Rollback make on every
 // deployment to guarantee the bind-mount target exists before
@@ -83,11 +92,38 @@ func EnsureAppDataDir(cfg DataConfig, app string, readOnly bool) (*AppData, erro
 		return nil, err
 	}
 
+	appDir := filepath.Dir(data.HostPath) // <DataRoot>/<app>
+
+	// Reject symlinks at DataRoot and at any existing app
+	// parent BEFORE touching disk. MkdirAll follows symlinked
+	// parents, so the only safe way to guarantee creation
+	// cannot escape is to Lstat every component up front and
+	// create each missing level explicitly with Mkdir.
+	if err := noSymlinkAt(cfg.DataRoot, ErrSymlinkedAppData); err != nil {
+		return nil, err
+	}
+	if err := noSymlinkAt(appDir, ErrSymlinkedAppData); err != nil {
+		return nil, err
+	}
+
 	info, err := os.Lstat(data.HostPath)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		// Create the directory (and any missing parents).
-		if err := os.MkdirAll(data.HostPath, 0o755); err != nil {
+		// Create the parent and the final dir with two
+		// separate Mkdir calls — never MkdirAll — so a
+		// symlink that races in between the layout check and
+		// the create cannot redirect creation.
+		if err := os.Mkdir(appDir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("%w: mkdir %s: %v", ErrInvalidDataConfig, appDir, err)
+		}
+		// Re-check the parent after Mkdir in case a symlink
+		// was inserted between the layout check and the
+		// create (TOCTOU). Without this re-check a symlink
+		// installed in the gap would not be caught.
+		if err := noSymlinkAt(appDir, ErrSymlinkedAppData); err != nil {
+			return nil, err
+		}
+		if err := os.Mkdir(data.HostPath, 0o755); err != nil {
 			return nil, fmt.Errorf("%w: mkdir %s: %v", ErrInvalidDataConfig, data.HostPath, err)
 		}
 		return data, nil
@@ -144,11 +180,13 @@ func AppDataDir(cfg DataConfig, app string, readOnly bool) (*AppData, error) {
 //   - The app name is validated (appNameRe) and the derived host
 //     path is verified to live under cfg.DataRoot. Both checks
 //     fail before disk is touched.
+//   - Symlinks at DataRoot, at an existing <DataRoot>/<app>
+//     parent, or at the final data path are rejected with
+//     ErrSymlinkedAppData before any ReadDir or RemoveAll runs,
+//     so a redirected parent cannot redirect deletion outside
+//     the trusted layout.
 //   - If the directory does not exist, ErrAppDataNotFound is
 //     returned (consistent with the state layer's behavior).
-//   - If the directory is a symlink, the operation is rejected
-//     with ErrSymlinkedAppData; the symlink target is left
-//     untouched.
 //   - If force is false and the directory contains any entries,
 //     ErrAppDataNotEmpty is returned and nothing is removed.
 //   - If force is true, the directory and its contents are
@@ -160,6 +198,19 @@ func AppDataDir(cfg DataConfig, app string, readOnly bool) (*AppData, error) {
 func RemoveAppDataDir(cfg DataConfig, app string, force bool) error {
 	data, err := AppDataDir(cfg, app, false)
 	if err != nil {
+		return err
+	}
+
+	appDir := filepath.Dir(data.HostPath) // <DataRoot>/<app>
+
+	// Reject symlinks at DataRoot and the app parent BEFORE
+	// any ReadDir or RemoveAll runs. A symlinked parent would
+	// otherwise redirect deletion (or its readdir contents
+	// check) through the symlink target.
+	if err := noSymlinkAt(cfg.DataRoot, ErrSymlinkedAppData); err != nil {
+		return err
+	}
+	if err := noSymlinkAt(appDir, ErrSymlinkedAppData); err != nil {
 		return err
 	}
 
@@ -189,6 +240,25 @@ func RemoveAppDataDir(cfg DataConfig, app string, force bool) error {
 
 	if err := os.RemoveAll(data.HostPath); err != nil {
 		return fmt.Errorf("%w: remove %s: %v", ErrInvalidDataConfig, data.HostPath, err)
+	}
+	return nil
+}
+
+// noSymlinkAt Lstats path and reports whether it is a symlink.
+// The returned sentinel is the one passed in (typically
+// ErrSymlinkedAppData) so callers get the layer-appropriate error
+// type for free. Missing paths return nil so callers can layer
+// the missing-path semantics on top.
+func noSymlinkAt(path string, symlinkErr error) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: stat %s: %v", ErrInvalidDataConfig, path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s", symlinkErr, path)
 	}
 	return nil
 }

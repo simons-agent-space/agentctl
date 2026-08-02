@@ -72,7 +72,7 @@ The `data` object has the following fields:
 
 | Field | Type | Constraints |
 |---|---|---|
-| `mount` | boolean | Required when `data` is present. When `true`, the deployment mounts the per-app data directory at `/data` inside the container. |
+| `mount` | boolean | Optional, default `false`. When `true`, the deployment mounts the per-app data directory at `/data` inside the container. When `false` (or omitted), the deployment behaves identically to a manifest without a `data` field at all. |
 | `read_only` | boolean | Optional, default `false`. When `true`, the in-container mount is read-only. Has no effect when `mount` is `false`; the orchestrator normalizes this combination on save. |
 
 A version-2 manifest without the `data` field is functionally
