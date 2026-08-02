@@ -678,9 +678,12 @@ Sentinel errors:
 
 ### Constraints
 
-- The manifest is expected to be validated by the caller. The
-  commit is re-validated by the source layer.
-- Retrying Deploy with the same commit is safe: a fresh deploy
+- `Deploy` validates untrusted manifest input internally
+  (version, app, container port, health path) before any side
+  effect, so an autonomous caller does not have to pre-validate
+  the manifest to get a clear error.
+- The commit is re-validated by the source layer.
+- Retrying `Deploy` with the same commit is safe: a fresh deploy
   attempt validates everything from scratch and leaves the host
   in a consistent state on failure.
 - HTTP handlers, Telegram approval, and systemd integration are

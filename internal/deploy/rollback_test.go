@@ -120,11 +120,18 @@ func matchDockerRun(name string) func([]string) bool {
 	}
 }
 
-// cancellingCaddyRunner wraps a fakeCaddyRunner and cancels the
+// caddyRunnerLike is the minimal interface the deploy function
+// needs from a Caddy runner. Both *fakeCaddyRunner and the
+// orchestrator's *sequentialCaddyRunner implement it.
+type caddyRunnerLike interface {
+	Run(ctx context.Context, name string, args ...string) (string, error)
+}
+
+// cancellingCaddyRunner wraps any caddyRunnerLike and cancels the
 // caller's context on the first invocation. This lets tests
 // simulate caller cancellation during the Caddy promotion phase.
 type cancellingCaddyRunner struct {
-	inner  *fakeCaddyRunner
+	inner  caddyRunnerLike
 	cancel context.CancelFunc
 	mu     sync.Mutex
 	called int

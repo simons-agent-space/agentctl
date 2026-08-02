@@ -76,10 +76,10 @@ func orchRunGitOut(t *testing.T, dir string, args ...string) ([]byte, error) {
 }
 
 // dockerDeployRunner is a fake commandRunner for the deploy tests.
-// It routes docker invocations by subcommand to handlers registered
-// via onBuild / onRun / onInspect / onRm / onStart. Unhandled
-// commands return an error so tests fail loudly if the orchestrator
-// makes an unexpected call.
+// It routes docker invocations by subcommand to registered
+// handlers via onBuild / onRun / onInspect / onRm / onStart.
+// Unhandled commands return an error so tests fail loudly if the
+// orchestrator makes an unexpected call.
 type dockerDeployRunner struct {
 	mu       sync.Mutex
 	calls    [][]string
@@ -189,8 +189,7 @@ func newDeployFixture(t *testing.T) *deployFixture {
 
 	// Override the port allocator so it does not bind a real TCP
 	// listener (which would conflict with the health server
-	// already listening on `port`). The allocator just returns
-	// the start port.
+	// already listening on `port`).
 	oldAllocate := allocatePortFunc
 	allocatePortFunc = func(start, end int) (int, error) {
 		return start, nil
@@ -220,21 +219,14 @@ func (f *deployFixture) validManifest() Manifest {
 }
 
 // dockerInspectAbsent returns a handler that reports the named
-// container as absent (matching real docker's stderr output for a
-// non-existent container). The inspectContainerStatus helper keys
-// off the "No such object" string in the captured output.
+// container as absent (matching real docker's stderr output).
 func dockerInspectAbsent(containerName string) func(args []string) (string, error) {
 	return func(args []string) (string, error) {
 		return "Error: No such object: " + containerName, errors.New("exit 1")
 	}
 }
 
-func (f *deployFixture) dockerAllSuccess(containerName string) {
-	f.docker.onInspect(dockerInspectAbsent(containerName))
-	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
-	f.docker.onRun(func(args []string) (string, error) { return containerName, nil })
-	f.docker.onRm(func(args []string) (string, error) { return "", nil })
-}
+// --- Original deploy tests (carried over from PR #10) -------------
 
 func TestDeploy_FirstDeployment(t *testing.T) {
 	f := newDeployFixture(t)
@@ -266,9 +258,6 @@ func TestDeploy_FirstDeployment(t *testing.T) {
 
 func TestDeploy_ReplacementDeployment(t *testing.T) {
 	f := newDeployFixture(t)
-
-	// Seed the state with the first deployment so the new one
-	// is a replacement.
 	seedState(t, f.cfg.State, Deployment{
 		App: f.expectedApp, Commit: f.commitA,
 		Image:         deriveImage(f.expectedApp, f.commitA),
@@ -278,8 +267,6 @@ func TestDeploy_ReplacementDeployment(t *testing.T) {
 		Upstream:   fmt.Sprintf("127.0.0.1:%d", parseHTTPPort(f.healthSrv.URL)),
 		DeployedAt: time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC),
 	})
-
-	// Deploy the second commit.
 	f.commit = f.commitB
 	newContainer := deriveContainerName(f.expectedApp, f.commitB)
 	f.dockerAllSuccess(newContainer)
@@ -314,9 +301,7 @@ func TestDeploy_BuildFailure(t *testing.T) {
 	f.docker.onBuild(func(args []string) (string, error) {
 		return "build error output", errors.New("exit 1")
 	})
-	f.docker.onRun(func(args []string) (string, error) {
-		return "container", nil
-	})
+	f.docker.onRun(func(args []string) (string, error) { return "container", nil })
 	f.docker.onRm(func(args []string) (string, error) { return "", nil })
 
 	manifest := f.validManifest()
@@ -388,153 +373,9 @@ func TestDeploy_CaddyFailure(t *testing.T) {
 	if !sawRm {
 		t.Errorf("expected docker rm --force for candidate container %s", containerName)
 	}
-
 	stateFile := filepath.Join(f.cfg.State.StateDir, f.expectedApp+".state.json")
 	if _, err := os.Stat(stateFile); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("state file must not exist after failed deploy: stat err = %v", err)
-	}
-}
-
-func TestDeploy_StateFailure(t *testing.T) {
-	f := newDeployFixture(t)
-	seedState(t, f.cfg.State, Deployment{
-		App: f.expectedApp, Commit: f.commitA,
-		Image:         deriveImage(f.expectedApp, f.commitA),
-		ContainerName: deriveContainerName(f.expectedApp, f.commitA),
-		HostPort:      parseHTTPPort(f.healthSrv.URL), ContainerPort: 8080,
-		Hostname:   f.expectedApp + "." + testBaseDomain,
-		Upstream:   fmt.Sprintf("127.0.0.1:%d", parseHTTPPort(f.healthSrv.URL)),
-		DeployedAt: time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC),
-	})
-	f.commit = f.commitB
-	newContainer := deriveContainerName(f.expectedApp, f.commitB)
-	f.docker.onInspect(dockerInspectAbsent(newContainer))
-	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
-	f.docker.onRun(func(args []string) (string, error) { return newContainer, nil })
-	f.docker.onRm(func(args []string) (string, error) { return "", nil })
-
-	if err := os.Chmod(f.cfg.State.StateDir, 0o555); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(f.cfg.State.StateDir, 0o755) })
-
-	manifest := f.validManifest()
-	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
-		docker: f.docker,
-		caddy:  f.caddy,
-	})
-	if !errors.Is(err, ErrDeploymentFailed) {
-		t.Fatalf("expected ErrDeploymentFailed, got %v", err)
-	}
-
-	sawRm := false
-	for _, call := range f.docker.Calls() {
-		if len(call) >= 4 && call[1] == "rm" && call[2] == "--force" && call[3] == newContainer {
-			sawRm = true
-		}
-	}
-	if !sawRm {
-		t.Errorf("expected docker rm --force for candidate container %s", newContainer)
-	}
-
-	state, err := LoadDeploymentState(f.cfg.State, f.expectedApp)
-	if err != nil {
-		t.Fatalf("LoadDeploymentState: %v", err)
-	}
-	if state.Current == nil || state.Current.Commit != f.commitA {
-		t.Errorf("state.Current.commit = %q, want %q (unchanged)", state.Current.Commit, f.commitA)
-	}
-}
-
-func TestDeploy_CleanupFailureStillSucceeds(t *testing.T) {
-	f := newDeployFixture(t)
-	seedState(t, f.cfg.State, Deployment{
-		App: f.expectedApp, Commit: f.commitA,
-		Image:         deriveImage(f.expectedApp, f.commitA),
-		ContainerName: deriveContainerName(f.expectedApp, f.commitA),
-		HostPort:      parseHTTPPort(f.healthSrv.URL), ContainerPort: 8080,
-		Hostname:   f.expectedApp + "." + testBaseDomain,
-		Upstream:   fmt.Sprintf("127.0.0.1:%d", parseHTTPPort(f.healthSrv.URL)),
-		DeployedAt: time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC),
-	})
-	f.commit = f.commitB
-	newContainer := deriveContainerName(f.expectedApp, f.commitB)
-	oldContainer := deriveContainerName(f.expectedApp, f.commitA)
-	f.docker.onInspect(dockerInspectAbsent(newContainer))
-	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
-	f.docker.onRun(func(args []string) (string, error) { return newContainer, nil })
-	// rm --force for the old container fails. Deploy should
-	// still succeed (state is correct, Caddy serves new).
-	f.docker.onRm(func(args []string) (string, error) {
-		for _, a := range args {
-			if a == oldContainer {
-				return "rm failed", errors.New("exit 1")
-			}
-		}
-		return "", nil
-	})
-
-	manifest := f.validManifest()
-	result, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
-		docker: f.docker,
-		caddy:  f.caddy,
-	})
-	if err != nil {
-		t.Fatalf("deploy should succeed despite cleanup failure: %v", err)
-	}
-	if result == nil || result.Commit != f.commitB {
-		t.Errorf("unexpected result: %+v", result)
-	}
-
-	state, err := LoadDeploymentState(f.cfg.State, f.expectedApp)
-	if err != nil {
-		t.Fatalf("LoadDeploymentState: %v", err)
-	}
-	if state.Current.Commit != f.commitB || state.Previous.Commit != f.commitA {
-		t.Errorf("state not swapped: current=%q previous=%q", state.Current.Commit, state.Previous.Commit)
-	}
-}
-
-func TestDeploy_CallerCancellationUsesRecoveryContext(t *testing.T) {
-	f := newDeployFixture(t)
-	containerName := deriveContainerName(f.expectedApp, f.commit)
-	f.docker.onInspect(dockerInspectAbsent(containerName))
-	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
-	f.docker.onRun(func(args []string) (string, error) { return containerName, nil })
-	f.docker.onRm(func(args []string) (string, error) { return "", nil })
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// The cancelling wrapper cancels the caller context on the
-	// first caddy call. We make validate succeed but reload fail
-	// so the deploy returns an error (the fake caddy runner
-	// does not observe the cancelled context itself).
-	caddyInner := newFakeCaddyRunner(
-		fakeCaddyEntry{match: matchCaddy("validate", "--config", f.cfg.Caddy.RootConfigPath), resp: caddyResponse{}},
-		fakeCaddyEntry{match: matchCaddy("reload", "--config", f.cfg.Caddy.RootConfigPath), resp: caddyResponse{err: errors.New("reload failed")}},
-	)
-	caddy := &cancellingCaddyRunner{inner: caddyInner, cancel: cancel}
-
-	manifest := f.validManifest()
-	_, err := deploy(ctx, f.cfg, manifest, f.commit, deployDeps{
-		docker: f.docker,
-		caddy:  caddy,
-	})
-	if err == nil {
-		t.Fatalf("expected error from cancelled context")
-	}
-
-	// The candidate container must be removed by the bounded
-	// recovery context (the caller context is already cancelled).
-	sawRm := false
-	for _, call := range f.docker.Calls() {
-		if len(call) >= 4 && call[1] == "rm" && call[2] == "--force" && call[3] == containerName {
-			sawRm = true
-		}
-	}
-	if !sawRm {
-		t.Errorf("expected docker rm --force for candidate container after cancellation")
 	}
 }
 
@@ -553,16 +394,7 @@ func TestDeploy_RetryIsSafe(t *testing.T) {
 		t.Fatalf("first deploy: %v", err)
 	}
 
-	// Second deploy with the same commit: the candidate
-	// container is already running from the first deploy.
-	// removeIfStopped inspects, sees the container is running
-	// (we change the inspect handler to return "true"), and
-	// returns ErrContainerRunning, which the runtime turns
-	// into a failure. Deploy returns an error; state remains
-	// consistent.
-	f.docker.onInspect(func(args []string) (string, error) {
-		return "true", nil
-	})
+	f.docker.onInspect(func(args []string) (string, error) { return "true", nil })
 	_, err = deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
 		docker: f.docker,
 		caddy:  f.caddy,
@@ -580,9 +412,535 @@ func TestDeploy_RetryIsSafe(t *testing.T) {
 	}
 }
 
+func (f *deployFixture) dockerAllSuccess(containerName string) {
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(func(args []string) (string, error) { return containerName, nil })
+	f.docker.onRm(func(args []string) (string, error) { return "", nil })
+}
+
 func seedState(t *testing.T, cfg StateConfig, dep Deployment) {
 	t.Helper()
 	if err := SaveDeployment(cfg, dep); err != nil {
 		t.Fatalf("seed state: %v", err)
+	}
+}
+
+// --- New tests for autonomous-use safety -------------------------
+
+// sequentialCaddyRunner returns canned responses in order. The
+// n-th matching call returns responses[n]. This lets tests model
+// "initial promote succeeds, recovery fails" without writing
+// per-call matchers (fakeCaddyRunner returns the first match, not
+// the n-th).
+type sequentialCaddyRunner struct {
+	mu        sync.Mutex
+	calls     int
+	responses []caddyResponse
+	match     func(args []string) bool
+}
+
+func (r *sequentialCaddyRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.match != nil && !r.match(args) {
+		return "", fmt.Errorf("sequentialCaddyRunner: unexpected args: %v", args)
+	}
+	if r.calls >= len(r.responses) {
+		return "", fmt.Errorf("sequentialCaddyRunner: no response for call %d (args=%v)", r.calls, args)
+	}
+	resp := r.responses[r.calls]
+	r.calls++
+	return resp.out, resp.err
+}
+
+// matchCaddyValidateOrReload matches both validate and reload
+// subcommands. The deploy test pipeline always calls them in
+// the order validate, reload. The args slice does not include
+// the binary name, so a[0] is the subcommand.
+func matchCaddyValidateOrReload() func([]string) bool {
+	return func(a []string) bool {
+		return len(a) >= 1 && (a[0] == "validate" || a[0] == "reload")
+	}
+}
+
+// TestDeploy_InvalidManifestFailsBeforeSideEffects proves that a
+// manifest with an invalid app name is rejected before any Docker /
+// git / Caddy / state operation runs.
+func TestDeploy_InvalidManifestFailsBeforeSideEffects(t *testing.T) {
+	f := newDeployFixture(t)
+	f.docker.onInspect(func(args []string) (string, error) {
+		t.Fatalf("docker inspect must not be called before validation")
+		return "", nil
+	})
+	f.docker.onBuild(func(args []string) (string, error) {
+		t.Fatalf("docker build must not be called before validation")
+		return "", nil
+	})
+
+	manifest := Manifest{
+		Version:       1,
+		App:           "MyApp", // invalid: uppercase
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
+	}
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Errorf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+	if !errors.Is(err, ErrInvalidDeployInput) {
+		t.Errorf("error must preserve ErrInvalidDeployInput, got %v", err)
+	}
+}
+
+// TestDeploy_InvalidAppPortHealthPathPreservesSentinel proves
+// that each of the manifest identity fields, when wrong, returns
+// an error preserving BOTH ErrDeploymentFailed and
+// ErrInvalidDeployInput.
+func TestDeploy_InvalidAppPortHealthPathPreservesSentinel(t *testing.T) {
+	f := newDeployFixture(t)
+
+	cases := []struct {
+		name   string
+		mutate func(*Manifest)
+	}{
+		{"bad-app", func(m *Manifest) { m.App = "BadApp" }},
+		{"bad-port-low", func(m *Manifest) { m.ContainerPort = 80 }},
+		{"bad-port-high", func(m *Manifest) { m.ContainerPort = 70000 }},
+		{"empty-health", func(m *Manifest) { m.HealthPath = "" }},
+		{"bad-health-no-slash", func(m *Manifest) { m.HealthPath = "healthz" }},
+		{"bad-health-query", func(m *Manifest) { m.HealthPath = "/healthz?x=1" }},
+		{"bad-version", func(m *Manifest) { m.Version = 99 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := f.validManifest()
+			tc.mutate(&manifest)
+			_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+				docker: f.docker,
+				caddy:  f.caddy,
+			})
+			if err == nil {
+				t.Fatalf("expected validation error")
+			}
+			if !errors.Is(err, ErrDeploymentFailed) {
+				t.Errorf("error must preserve ErrDeploymentFailed, got %v", err)
+			}
+			if !errors.Is(err, ErrInvalidDeployInput) {
+				t.Errorf("error must preserve ErrInvalidDeployInput, got %v", err)
+			}
+		})
+	}
+}
+
+// TestDeploy_MismatchedBaseDomainsFailBeforeSideEffects proves
+// that Caddy.BaseDomain != State.BaseDomain is rejected before
+// any git / Docker / Caddy call lands.
+func TestDeploy_MismatchedBaseDomainsFailBeforeSideEffects(t *testing.T) {
+	f := newDeployFixture(t)
+	f.cfg.State.BaseDomain = "other.example.com"
+
+	f.docker.onInspect(func(args []string) (string, error) {
+		t.Fatalf("docker inspect must not be called before validation")
+		return "", nil
+	})
+
+	manifest := f.validManifest()
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected validation error for mismatched base domains")
+	}
+	if !errors.Is(err, ErrDeploymentFailed) || !errors.Is(err, ErrInvalidDeployInput) {
+		t.Errorf("error must preserve both sentinels, got %v", err)
+	}
+}
+
+// TestDeploy_CorruptStateFailsBeforeCheckoutBuild proves that an
+// existing state file that is corrupt / fails parsing is rejected
+// before the source checkout or Docker build runs.
+func TestDeploy_CorruptStateFailsBeforeCheckoutBuild(t *testing.T) {
+	f := newDeployFixture(t)
+	corrupt := filepath.Join(f.cfg.State.StateDir, f.expectedApp+".state.json")
+	if err := os.WriteFile(corrupt, []byte("{not valid json"), 0o644); err != nil {
+		t.Fatalf("seed corrupt state: %v", err)
+	}
+
+	f.docker.onInspect(func(args []string) (string, error) {
+		t.Fatalf("docker inspect must not be called before state check")
+		return "", nil
+	})
+	f.docker.onBuild(func(args []string) (string, error) {
+		t.Fatalf("docker build must not be called before state check")
+		return "", nil
+	})
+
+	manifest := f.validManifest()
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected error from corrupt state")
+	}
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Errorf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+	if !errors.Is(err, ErrCorruptDeploymentState) {
+		t.Errorf("error must preserve underlying ErrCorruptDeploymentState, got %v", err)
+	}
+}
+
+// TestDeploy_FirstDeploymentStateFailureRemovesRouteBeforeRemovingCandidate
+// proves that on a first deployment whose state save fails, the
+// orchestrator calls RemovePromotion (so the new route is gone
+// from Caddy) BEFORE removing the candidate container.
+func TestDeploy_FirstDeploymentStateFailureRemovesRouteBeforeRemovingCandidate(t *testing.T) {
+	f := newDeployFixture(t)
+	newContainer := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(newContainer))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(func(args []string) (string, error) { return newContainer, nil })
+
+	// Caddy: initial promote succeeds (calls 1-2). Recovery
+	// RemovePromotion also succeeds (calls 3-4).
+	caddy := &sequentialCaddyRunner{
+		match:     matchCaddyValidateOrReload(),
+		responses: []caddyResponse{{}, {}, {}, {}},
+	}
+
+	if err := os.Chmod(f.cfg.State.StateDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(f.cfg.State.StateDir, 0o755) })
+
+	manifest := f.validManifest()
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  caddy,
+	})
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Fatalf("expected ErrDeploymentFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "save state") {
+		t.Errorf("error must mention save state, got: %v", err)
+	}
+
+	// Docker call order: build, inspect, run. The candidate
+	// cleanup is the final docker call.
+	calls := f.docker.Calls()
+	if len(calls) < 4 {
+		t.Fatalf("expected at least 4 docker calls, got %d: %v", len(calls), calls)
+	}
+	if calls[0][1] != "build" || calls[1][1] != "inspect" || calls[2][1] != "run" {
+		t.Errorf("unexpected first-three call order: %v", calls)
+	}
+	last := calls[len(calls)-1]
+	if !(len(last) >= 4 && last[1] == "rm" && last[2] == "--force" && last[3] == newContainer) {
+		t.Errorf("expected final docker call to be rm --force on candidate %s, got %v", newContainer, last)
+	}
+	if caddy.calls != 4 {
+		t.Errorf("expected exactly 4 caddy calls, got %d", caddy.calls)
+	}
+}
+
+// TestDeploy_ReplacementStateFailureRestoresOriginalRoute proves
+// that on a replacement deployment whose state save fails, the
+// orchestrator re-promotes the snapshotted old Current BEFORE
+// removing the candidate container. If the recovery re-promote
+// fails, the candidate must be left running.
+func TestDeploy_ReplacementStateFailureRestoresOriginalRoute(t *testing.T) {
+	f := newDeployFixture(t)
+	seedState(t, f.cfg.State, Deployment{
+		App: f.expectedApp, Commit: f.commitA,
+		Image:         deriveImage(f.expectedApp, f.commitA),
+		ContainerName: deriveContainerName(f.expectedApp, f.commitA),
+		HostPort:      parseHTTPPort(f.healthSrv.URL), ContainerPort: 8080,
+		Hostname:   f.expectedApp + "." + testBaseDomain,
+		Upstream:   fmt.Sprintf("127.0.0.1:%d", parseHTTPPort(f.healthSrv.URL)),
+		DeployedAt: time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC),
+	})
+	f.commit = f.commitB
+	newContainer := deriveContainerName(f.expectedApp, f.commitB)
+	f.docker.onInspect(dockerInspectAbsent(newContainer))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(func(args []string) (string, error) { return newContainer, nil })
+
+	// Caddy: initial promote succeeds (calls 1-2). Recovery
+	// re-promote fails on the reload (call 4).
+	caddy := &sequentialCaddyRunner{
+		match: matchCaddyValidateOrReload(),
+		responses: []caddyResponse{
+			{},
+			{},
+			{},
+			{err: errors.New("recovery reload failed")},
+		},
+	}
+	if err := os.Chmod(f.cfg.State.StateDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(f.cfg.State.StateDir, 0o755) })
+
+	manifest := f.validManifest()
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  caddy,
+	})
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Fatalf("expected ErrDeploymentFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "save state") {
+		t.Errorf("error must mention save state, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "caddy recovery also failed") {
+		t.Errorf("error must mention caddy recovery failure, got: %v", err)
+	}
+
+	// Candidate must NOT be removed: Caddy recovery failed.
+	for _, call := range f.docker.Calls() {
+		if len(call) >= 4 && call[1] == "rm" && call[2] == "--force" && call[3] == newContainer {
+			t.Errorf("candidate %s must NOT be removed when Caddy recovery fails: %v", newContainer, call)
+		}
+	}
+	if caddy.calls != 4 {
+		t.Errorf("expected exactly 4 caddy calls, got %d", caddy.calls)
+	}
+}
+
+// TestDeploy_CaddyRecoveryFailureKeepsCandidateRunning proves that
+// when state-save recovery (Caddy revert) fails, the candidate
+// container is left running (Caddy may still route to it) and the
+// returned error includes BOTH the state-save failure and the
+// Caddy recovery failure.
+func TestDeploy_CaddyRecoveryFailureKeepsCandidateRunning(t *testing.T) {
+	f := newDeployFixture(t)
+	seedState(t, f.cfg.State, Deployment{
+		App: f.expectedApp, Commit: f.commitA,
+		Image:         deriveImage(f.expectedApp, f.commitA),
+		ContainerName: deriveContainerName(f.expectedApp, f.commitA),
+		HostPort:      parseHTTPPort(f.healthSrv.URL), ContainerPort: 8080,
+		Hostname:   f.expectedApp + "." + testBaseDomain,
+		Upstream:   fmt.Sprintf("127.0.0.1:%d", parseHTTPPort(f.healthSrv.URL)),
+		DeployedAt: time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC),
+	})
+	f.commit = f.commitB
+	newContainer := deriveContainerName(f.expectedApp, f.commitB)
+	f.docker.onInspect(dockerInspectAbsent(newContainer))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(func(args []string) (string, error) { return newContainer, nil })
+
+	// Caddy: initial promote succeeds (calls 1-2). Recovery
+	// re-promote fails on the validate (call 3).
+	caddy := &sequentialCaddyRunner{
+		match: matchCaddyValidateOrReload(),
+		responses: []caddyResponse{
+			{},
+			{},
+			{err: errors.New("recovery validate failed")},
+		},
+	}
+	if err := os.Chmod(f.cfg.State.StateDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(f.cfg.State.StateDir, 0o755) })
+
+	manifest := f.validManifest()
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Errorf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "save state") {
+		t.Errorf("error must mention the state-save failure, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "caddy recovery also failed") {
+		t.Errorf("error must mention the caddy recovery failure, got: %v", err)
+	}
+
+	for _, call := range f.docker.Calls() {
+		if len(call) >= 4 && call[1] == "rm" && call[2] == "--force" && call[3] == newContainer {
+			t.Errorf("candidate %s must not be removed when Caddy recovery fails: %v", newContainer, call)
+		}
+	}
+}
+
+// TestDeploy_CleanupFailureOnSuccessPathReported proves that a
+// failure to remove the formerly-current container on the
+// success path is REPORTED, not silently swallowed.
+func TestDeploy_CleanupFailureOnSuccessPathReported(t *testing.T) {
+	f := newDeployFixture(t)
+	seedState(t, f.cfg.State, Deployment{
+		App: f.expectedApp, Commit: f.commitA,
+		Image:         deriveImage(f.expectedApp, f.commitA),
+		ContainerName: deriveContainerName(f.expectedApp, f.commitA),
+		HostPort:      parseHTTPPort(f.healthSrv.URL), ContainerPort: 8080,
+		Hostname:   f.expectedApp + "." + testBaseDomain,
+		Upstream:   fmt.Sprintf("127.0.0.1:%d", parseHTTPPort(f.healthSrv.URL)),
+		DeployedAt: time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC),
+	})
+	f.commit = f.commitB
+	newContainer := deriveContainerName(f.expectedApp, f.commitB)
+	oldContainer := deriveContainerName(f.expectedApp, f.commitA)
+	f.docker.onInspect(dockerInspectAbsent(newContainer))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(func(args []string) (string, error) { return newContainer, nil })
+	// Old-container rm fails; candidate rm succeeds.
+	f.docker.onRm(func(args []string) (string, error) {
+		for _, a := range args {
+			if a == oldContainer {
+				return "rm failed", errors.New("exit 1")
+			}
+		}
+		return "", nil
+	})
+
+	manifest := f.validManifest()
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected error from cleanup failure (not silently swallowed)")
+	}
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Errorf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "post-deploy cleanup of old container") {
+		t.Errorf("error must mention post-deploy cleanup, got: %v", err)
+	}
+
+	state, lerr := LoadDeploymentState(f.cfg.State, f.expectedApp)
+	if lerr != nil {
+		t.Fatalf("LoadDeploymentState: %v", lerr)
+	}
+	if state.Current.Commit != f.commitB || state.Previous.Commit != f.commitA {
+		t.Errorf("state not swapped: current=%q previous=%q", state.Current.Commit, state.Previous.Commit)
+	}
+}
+
+// TestDeploy_CandidateCleanupFailureReported proves that when the
+// candidate container cleanup fails after a successful Caddy
+// recovery, the failure is reported in the returned error.
+func TestDeploy_CandidateCleanupFailureReported(t *testing.T) {
+	f := newDeployFixture(t)
+	seedState(t, f.cfg.State, Deployment{
+		App: f.expectedApp, Commit: f.commitA,
+		Image:         deriveImage(f.expectedApp, f.commitA),
+		ContainerName: deriveContainerName(f.expectedApp, f.commitA),
+		HostPort:      parseHTTPPort(f.healthSrv.URL), ContainerPort: 8080,
+		Hostname:   f.expectedApp + "." + testBaseDomain,
+		Upstream:   fmt.Sprintf("127.0.0.1:%d", parseHTTPPort(f.healthSrv.URL)),
+		DeployedAt: time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC),
+	})
+	f.commit = f.commitB
+	newContainer := deriveContainerName(f.expectedApp, f.commitB)
+	oldContainer := deriveContainerName(f.expectedApp, f.commitA)
+	f.docker.onInspect(dockerInspectAbsent(newContainer))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(func(args []string) (string, error) { return newContainer, nil })
+	// Candidate rm fails; old-container rm succeeds.
+	f.docker.onRm(func(args []string) (string, error) {
+		for _, a := range args {
+			if a == newContainer {
+				return "rm failed", errors.New("exit 1")
+			}
+		}
+		return "", nil
+	})
+
+	// All four Caddy calls succeed (initial promote + recovery
+	// re-promote).
+	caddy := &sequentialCaddyRunner{
+		match:     matchCaddyValidateOrReload(),
+		responses: []caddyResponse{{}, {}, {}, {}},
+	}
+	if err := os.Chmod(f.cfg.State.StateDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(f.cfg.State.StateDir, 0o755) })
+
+	manifest := f.validManifest()
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected error from candidate cleanup failure")
+	}
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Errorf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "save state") {
+		t.Errorf("error must mention the primary save-state failure, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "candidate cleanup failed") {
+		t.Errorf("error must mention candidate cleanup failure, got: %v", err)
+	}
+	for _, call := range f.docker.Calls() {
+		if len(call) >= 4 && call[1] == "rm" && call[2] == "--force" && call[3] == oldContainer {
+			t.Errorf("old container %s must not be removed in candidate-cleanup-failure path", oldContainer)
+		}
+	}
+}
+
+// TestDeploy_CallerCancellationUsesFreshRecoveryContext proves
+// that even when the caller context is cancelled, the
+// orchestrator uses a bounded recovery context for cleanup so
+// cleanup actually runs.
+func TestDeploy_CallerCancellationUsesFreshRecoveryContext(t *testing.T) {
+	f := newDeployFixture(t)
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(func(args []string) (string, error) { return containerName, nil })
+	f.docker.onRm(func(args []string) (string, error) { return "", nil })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Caddy validate cancels the caller context; reload fails.
+	caddyInner := &sequentialCaddyRunner{
+		match: matchCaddyValidateOrReload(),
+		responses: []caddyResponse{
+			{},
+			{err: errors.New("reload failed")},
+		},
+	}
+	caddy := &cancellingCaddyRunner{inner: caddyInner, cancel: cancel}
+
+	manifest := f.validManifest()
+	_, err := deploy(ctx, f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected error from cancelled context")
+	}
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Errorf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+
+	sawRm := false
+	for _, call := range f.docker.Calls() {
+		if len(call) >= 4 && call[1] == "rm" && call[2] == "--force" && call[3] == containerName {
+			sawRm = true
+		}
+	}
+	if !sawRm {
+		t.Errorf("expected docker rm --force for candidate container after cancellation")
 	}
 }

@@ -262,6 +262,14 @@ func RemovePromotion(ctx context.Context, cfg CaddyConfig, app string) error {
 	return removePromotion(ctx, cfg, app, caddyRunner{})
 }
 
+// RemovePromotionWithRunner is like RemovePromotion but uses the
+// supplied command runner instead of the production caddyRunner.
+// The deployment orchestrator passes its injected test runner so
+// Caddy recovery can be exercised in tests.
+func RemovePromotionWithRunner(ctx context.Context, cfg CaddyConfig, app string, runner commandRunner) error {
+	return removePromotion(ctx, cfg, app, runner)
+}
+
 func removePromotion(ctx context.Context, cfg CaddyConfig, app string, runner commandRunner) error {
 	if err := validateCaddyConfig(cfg); err != nil {
 		return err
