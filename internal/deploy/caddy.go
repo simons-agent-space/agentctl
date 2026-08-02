@@ -38,11 +38,14 @@ var domainLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 // root Caddyfile (RootConfigPath). That root file is expected to
 // import the managed fragments from ConfigDir; for example:
 //
-//	import <ConfigDir>/*.caddy*
+//	import <ConfigDir>/*.caddy
 //
-// — the import glob must match both the final fragments
-// (<app>.caddy) and the temporary fragments (<app>.caddy.partial)
-// that the promotion flow writes for validation. Every caddy
+// — the import glob matches only the final fragments
+// (<app>.caddy). The promotion flow uses <app>.caddy.partial and
+// <app>.caddy.bak as transient staging paths during the
+// install/validate/reload dance, but neither suffix is ever part
+// of the import glob, so a stale or in-flight partial or backup
+// can never leak into the running configuration. Every caddy
 // invocation in this package targets the canonical root file; no
 // individual app fragment is ever passed to caddy directly.
 type CaddyConfig struct {
@@ -113,76 +116,95 @@ func promote(ctx context.Context, cfg CaddyConfig, candidate CandidateResult, ru
 	body := renderCaddyfile(hostname, candidate.HostPort)
 
 	// 1. Write the new fragment to a temporary file in ConfigDir.
-	//    The temp lives alongside the final so the root config's
-	//    import statement can pick it up while we validate the
-	//    prospective configuration.
+	//    The temp uses a suffix (.partial) that the root config's
+	//    import statement does NOT match, so writing it cannot
+	//    affect what the running Caddy sees. It only becomes
+	//    visible to Caddy once it is renamed to the final .caddy
+	//    path in step 3.
 	if err := atomicWrite(tempPath, []byte(body)); err != nil {
 		return nil, err
 	}
-	removeTemp := func() { _ = os.Remove(tempPath) }
 
-	// 2. Validate the complete prospective configuration through the
-	//    canonical root config. Caddy expands the root's imports, so
-	//    the temp fragment is part of the validated set iff the
-	//    root's import glob matches it.
-	if _, err := runner.Run(ctx, binary, "validate", "--config", cfg.RootConfigPath); err != nil {
-		removeTemp()
-		return nil, fmt.Errorf("%w: caddy validate --config %s: %v", ErrCaddyValidateFailed, cfg.RootConfigPath, err)
-	}
-
-	// 3. Preserve the previous final fragment, if present, by
-	//    renaming it to a backup path. We do this only after
-	//    validation succeeds so we never overwrite a previous
-	//    fragment that the caller might still rely on if the
-	//    validate outcome is rejected.
+	// 2. Preserve the previous final fragment, if present, by
+	//    renaming it to a backup path before installing the new
+	//    final. The backup uses a suffix (.bak) that the root
+	//    config's import statement does NOT match, so the running
+	//    Caddy is unaffected by this rename: the import glob sees
+	//    no <app>.caddy for this app from this point until the
+	//    new final is installed in step 3.
 	var hadPrevious bool
 	if _, err := os.Stat(configPath); err == nil {
 		hadPrevious = true
 		if err := os.Rename(configPath, backupPath); err != nil {
-			removeTemp()
+			_ = os.Remove(tempPath)
 			return nil, fmt.Errorf("%w: backup %s -> %s: %v", ErrAtomicWriteFailed, configPath, backupPath, err)
 		}
 	}
 
-	// 4. Atomically install the new final fragment by renaming the
-	//    temp into place. If this rename fails we restore the
-	//    previous fragment so the disk matches the running Caddy
+	// 3. Atomically install the new final fragment by renaming the
+	//    temp into place. From this point the root config's import
+	//    statement picks up the new fragment and the previous
+	//    fragment lives only at the backup path (not imported). If
+	//    this rename fails we remove the temp and restore the
+	//    previous fragment so disk matches the pre-promotion
 	//    state.
 	if err := os.Rename(tempPath, configPath); err != nil {
-		removeTemp()
+		_ = os.Remove(tempPath)
 		if hadPrevious {
 			_ = os.Rename(backupPath, configPath)
 		}
 		return nil, fmt.Errorf("%w: rename %s -> %s: %v", ErrAtomicWriteFailed, tempPath, configPath, err)
 	}
 
-	// 5. Reload Caddy through the canonical root config. On failure
-	//    we restore the previous fragment (parking the new one at
-	//    tempPath so we can rename the backup on top of it) and
-	//    best-effort reload so the running Caddy state matches disk.
+	// 4. Validate the canonical root config. The root imports
+	//    only the final <app>.caddy fragments; the .partial and
+	//    .bak siblings on disk are invisible to this validation.
+	//    On failure we restore the previous fragment: park the
+	//    new content at tempPath (a non-imported suffix) so we
+	//    can move the backup on top of configPath without
+	//    overwriting it, then remove the parked content. No
+	//    reload is needed on the validate-failure path because
+	//    validate never changes the running Caddy.
+	if _, err := runner.Run(ctx, binary, "validate", "--config", cfg.RootConfigPath); err != nil {
+		_ = os.Rename(configPath, tempPath)
+		if hadPrevious {
+			_ = os.Rename(backupPath, configPath)
+		} else {
+			_ = os.Remove(configPath)
+		}
+		_ = os.Remove(tempPath)
+		return nil, fmt.Errorf("%w: caddy validate --config %s: %v", ErrCaddyValidateFailed, cfg.RootConfigPath, err)
+	}
+
+	// 5. Reload Caddy through the canonical root config. On
+	//    failure we restore the previous fragment: park the new
+	//    content at tempPath (a non-imported suffix) so we can
+	//    move the backup on top of configPath without overwriting
+	//    it, issue a best-effort reload so the running Caddy
+	//    state matches the restored disk state, then remove the
+	//    parked content. The parked content never became part of
+	//    the running config on the failure path.
 	if _, err := runner.Run(ctx, binary, "reload", "--config", cfg.RootConfigPath); err != nil {
-		// Park the new content back at tempPath so we can move the
-		// previous fragment into configPath without overwriting it.
 		_ = os.Rename(configPath, tempPath)
 		if hadPrevious {
 			if rerr := os.Rename(backupPath, configPath); rerr == nil {
 				_, _ = runner.Run(ctx, binary, "reload", "--config", cfg.RootConfigPath)
 			}
 		} else {
-			if rerr := os.Remove(configPath); rerr == nil {
-				_, _ = runner.Run(ctx, binary, "reload", "--config", cfg.RootConfigPath)
-			}
+			// No previous fragment: after parking, configPath is
+			// gone, so a reload now sees the pre-promotion state
+			// (no route for this app).
+			_, _ = runner.Run(ctx, binary, "reload", "--config", cfg.RootConfigPath)
 		}
-		// The parked new content never became part of the running
-		// config; remove it so it cannot be picked up by a later
-		// reload.
 		_ = os.Remove(tempPath)
 		return nil, fmt.Errorf("%w: caddy reload --config %s: %v", ErrCaddyReloadFailed, cfg.RootConfigPath, err)
 	}
 
-	// 6. On success, the backup is no longer needed. Removing it is
-	//    best-effort: a leftover .bak file is harmless because
-	//    nothing in this package imports .bak files.
+	// 6. On success, the backup is no longer needed. Removing it
+	//    is best-effort: a leftover .bak file is harmless because
+	//    the root config's import statement does NOT match .bak,
+	//    and the next promotion for the same app would simply
+	//    overwrite it as part of its own backup step.
 	if hadPrevious {
 		_ = os.Remove(backupPath)
 	}
@@ -259,11 +281,15 @@ func removePromotion(ctx context.Context, cfg CaddyConfig, app string, runner co
 		return fmt.Errorf("%w: caddy reload --config %s: %v", ErrCaddyReloadFailed, cfg.RootConfigPath, err)
 	}
 
-	// 4. On success the backup is no longer needed; delete it so
-	//    leftover .bak files cannot confuse a future promotion.
-	if err := os.Remove(backupPath); err != nil {
-		return fmt.Errorf("remove backup %s: %w", backupPath, err)
-	}
+	// 4. On success the backup is no longer needed. Deleting it
+	//    is best-effort: by this point the route has already been
+	//    removed from the running Caddy via a successful reload,
+	//    so a leftover .bak file on disk is harmless (the root
+	//    config's import glob does NOT match .bak) and must not
+	//    turn a successful removal into an error. Any future
+	//    promotion for the same app would overwrite the leftover
+	//    .bak as part of its own backup step.
+	_ = os.Remove(backupPath)
 	return nil
 }
 
