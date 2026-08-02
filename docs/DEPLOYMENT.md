@@ -224,3 +224,187 @@ func RemoveCandidate(
 This layer does not yet implement Caddy, public routing, deployment
 state, rollback orchestration, sockets, HTTP handlers, systemd units,
 or the final deployment orchestrator. Those come in later layers.
+
+## Caddy promotion
+
+Once a candidate is health-checked and healthy, `agentctld` promotes
+it through Caddy so external traffic can reach it. Promotion is the
+bridge between the localhost-only candidate phase and the public
+hostname.
+
+### Inputs
+
+Promotion receives a validated `CandidateResult` and a trusted
+`CaddyConfig`. No caller input is accepted for hostnames, paths,
+upstreams, or raw Caddy configuration.
+
+```
+type CaddyConfig struct {
+    BaseDomain     string  // e.g., "apps.simonontheweb.de"
+    ConfigDir      string  // trusted directory for managed fragments
+    RootConfigPath string  // canonical Caddyfile Caddy is running
+    CaddyBinary    string  // defaults to "caddy" when empty
+}
+```
+
+Caddy is expected to run as a single long-lived process whose
+canonical config file is `RootConfigPath`. That root file is
+expected to import the managed fragments from `ConfigDir`, e.g.
+
+```
+import <ConfigDir>/*.caddy
+```
+
+The import glob matches only the final fragments
+(`<app>.caddy`). The promotion flow uses `<app>.caddy.partial` and
+`<app>.caddy.bak` as transient staging paths during the
+install/validate/reload dance, but neither suffix is ever part of
+the import glob, so a stale or in-flight partial or backup can
+never leak into the running configuration. Every `caddy validate`
+and `caddy reload` invocation this package makes targets the
+canonical root file; no individual app fragment is ever passed to
+Caddy directly.
+
+### Derived names
+
+- **Hostname** is derived as `<app>.<BaseDomain>`. The `app` comes from
+  the candidate's identity, the `BaseDomain` from the trusted host
+  configuration. The caller cannot influence either.
+- **Upstream** is always `127.0.0.1:<candidate.HostPort>`. No
+  `0.0.0.0`, no other interfaces, no caller-supplied addresses.
+- **Config path** is `<ConfigDir>/<app>.caddy`.
+
+### Managed config fragment
+
+The runtime writes a Caddyfile fragment of the form:
+
+```
+<hostname> {
+    reverse_proxy 127.0.0.1:<hostPort>
+}
+```
+
+The fragment is staged through two transient siblings of the final
+path:
+
+- `<config>.partial` — holds the new content during the
+  install/validate/reload dance. The root config's import glob
+  (`*.caddy`) does not match this suffix, so a parked partial is
+  invisible to Caddy.
+- `<config>.bak` — holds the previous final fragment while the new
+  one is being installed. The root config's import glob does not
+  match this suffix either, so the backup is invisible to Caddy
+  and can never be served to a client.
+
+Neither `<config>.partial` nor `<config>.bak` is ever passed to
+`caddy validate` or `caddy reload` directly. Every Caddy
+invocation in this flow targets the canonical root config, never
+the per-app fragment or any of its siblings.
+
+### Validation and reload
+
+1. The new fragment body is written to `<config>.partial`. The
+   root config's import glob does not match `.partial`, so writing
+   the temp cannot affect what the running Caddy sees.
+2. If a previous final fragment exists, it is renamed to
+   `<config>.bak`. The root config's import glob does not match
+   `.bak` either, so this rename is also invisible to Caddy:
+   from this point until step 4, the root config sees no
+   `<app>.caddy` for this app.
+3. `<config>.partial` is renamed to the final `<config>` path. On
+   rename failure, the temp is removed and the previous fragment
+   (if any) is restored from the backup; the function returns
+   `ErrAtomicWriteFailed`.
+4. `caddy validate --config <RootConfigPath>` runs against the
+   canonical root. The root imports only the final `<app>.caddy`
+   fragments; the `.partial` and `.bak` siblings on disk are
+   invisible to this validation. On failure the function returns
+   `ErrCaddyValidateFailed`. The restore path:
+   - Parks the new content back at `<config>.partial` (a
+     non-imported suffix) so the backup can be moved into place
+     without overwriting it.
+   - Renames the backup (or, for first-time promotions, removes
+     the new final) back to `<config>`.
+   - Removes the parked partial.
+   - No reload is needed on the validate-failure path because
+     validate never changes the running Caddy.
+5. `caddy reload --config <RootConfigPath>` applies the new
+   configuration to the running Caddy. On failure:
+   - The new fragment is parked back at `<config>.partial` so the
+     backup can be moved into its place without overwriting.
+   - The backup (or absence of one, for first-time promotions) is
+     restored at `<config>` and a best-effort reload is issued so
+     the running Caddy state matches disk.
+   - The parked partial is removed so it cannot leak into a later
+     reload.
+   - The function returns `ErrCaddyReloadFailed`.
+6. On success, the backup is removed (best-effort; a leftover `.bak`
+   is harmless because the root config's import glob does not
+   match `.bak`, and the next promotion for the same app would
+   simply overwrite it as part of its own backup step).
+
+### Identity validation
+
+Before writing or invoking Caddy, the candidate identity is
+re-derived and required to match exactly:
+
+- `app` matches the app-name regex.
+- `commit` matches `^[0-9a-f]{40}$`.
+- `image` equals `agentctl/<app>:<commit>`.
+- `container name` equals `agentctl-<app>-<first-12-chars-of-commit>`.
+- `host port` is a valid port number.
+
+`HealthURL` is intentionally not part of the promotion identity:
+promotion derives its upstream exclusively from `HostPort`, and
+`HealthURL` is the runtime layer's concern. Fabricated candidates
+are rejected with `ErrInvalidCandidate` before any disk or Caddy
+operation runs.
+
+### Result
+
+```
+type PromotionResult struct {
+    App        string
+    Commit     string
+    Hostname   string
+    Upstream   string
+    ConfigPath string
+}
+```
+
+### Removal
+
+```go
+func RemovePromotion(ctx context.Context, cfg CaddyConfig, app string) error
+```
+
+- Validates `app` against the app-name regex.
+- The derived config path `<ConfigDir>/<app>.caddy` must exist;
+  otherwise `ErrPromotionNotFound`.
+- Moves the fragment to `<config>.bak`. The root config's import
+  statement no longer sees the fragment after this rename, so the
+  following validate/reload reflects the post-removal state.
+- `caddy validate --config <RootConfigPath>` confirms the canonical
+  config is still valid without the fragment. On failure the
+  fragment is restored from the backup and `ErrCaddyValidateFailed`
+  is returned.
+- `caddy reload --config <RootConfigPath>` applies the change to the
+  running Caddy. On failure the fragment is restored from the
+  backup, a best-effort reload is issued, and
+  `ErrCaddyReloadFailed` is returned.
+- On success, the backup is removed. Backup deletion is
+  best-effort: by this point the route has already been removed
+  from the running Caddy via a successful reload, so a leftover
+  `.bak` file on disk is harmless (the root config's import glob
+  does not match `.bak`) and must not turn a successful removal
+  into an error. Any future promotion for the same app would
+  overwrite the leftover `.bak` as part of its own backup step.
+- Only the exact derived app config is touched; other apps' configs
+  are left alone.
+
+### Out of scope
+
+This layer does not yet implement deployment state, rollback
+orchestration, multi-replica routing, rate limiting, authentication
+middleware, or the final deployment orchestrator. Those come in
+later layers.
