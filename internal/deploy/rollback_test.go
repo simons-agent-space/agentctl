@@ -180,6 +180,7 @@ func newRollbackFixtureWithHealthHandler(t *testing.T, handler http.HandlerFunc)
 
 	stateDir := t.TempDir()
 	caddyDir := t.TempDir()
+	dataDir := t.TempDir()
 	rootConfig := filepath.Join(caddyDir, "Caddyfile")
 	if err := os.WriteFile(rootConfig, []byte("import "+filepath.Join(caddyDir, "*.caddy")+"\n"), 0o644); err != nil {
 		t.Fatalf("seed root config: %v", err)
@@ -201,6 +202,9 @@ func newRollbackFixtureWithHealthHandler(t *testing.T, handler http.HandlerFunc)
 			ConfigDir:      caddyDir,
 			RootConfigPath: rootConfig,
 			CaddyBinary:    "caddy",
+		},
+		Data: DataConfig{
+			DataRoot: dataDir,
 		},
 		HealthPath: "/healthz",
 	}
@@ -910,4 +914,174 @@ func TestRollbackDeployment_CleanupFailureIsReported(t *testing.T) {
 	if !strings.Contains(err.Error(), "stop exploded") {
 		t.Errorf("error must include the underlying stop error, got: %v", err)
 	}
+}
+
+// TestRollbackDeployment_FreshRunAppliesDataMount proves that when
+// the previous container is absent and its persisted Deployment
+// declares MountData=true, the fresh `docker run` includes the
+// matching --mount flag and the host-side data directory is
+// created. The read-only flag on the mount matches
+// Deployment.DataReadOnly. This is the data-layer counterpart to
+// TestRollbackDeployment_RestorePrevious_CreatedFromAbsent; the
+// only difference is that the previous deployment opted into the
+// per-app data mount.
+func TestRollbackDeployment_FreshRunAppliesDataMount(t *testing.T) {
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(healthSrv.Close)
+	port := parseHTTPPort(healthSrv.URL)
+
+	stateDir := t.TempDir()
+	caddyDir := t.TempDir()
+	dataDir := t.TempDir()
+	rootConfig := filepath.Join(caddyDir, "Caddyfile")
+	if err := os.WriteFile(rootConfig, []byte("import "+filepath.Join(caddyDir, "*.caddy")+"\n"), 0o644); err != nil {
+		t.Fatalf("seed root config: %v", err)
+	}
+
+	cfg := RollbackConfig{
+		App: "myapp",
+		State: StateConfig{
+			StateDir:   stateDir,
+			BaseDomain: testBaseDomain,
+		},
+		Runtime: RuntimeConfig{
+			PortRangeStart: 49152,
+			PortRangeEnd:   65535,
+			HealthTimeout:  2 * time.Second,
+		},
+		Caddy: CaddyConfig{
+			BaseDomain:     testBaseDomain,
+			ConfigDir:      caddyDir,
+			RootConfigPath: rootConfig,
+			CaddyBinary:    "caddy",
+		},
+		Data: DataConfig{
+			DataRoot: dataDir,
+		},
+		HealthPath: "/healthz",
+	}
+
+	commitA := strings.Repeat("a", 40)
+	commitB := strings.Repeat("b", 40)
+
+	previous := Deployment{
+		App:           "myapp",
+		Commit:        commitA,
+		Image:         deriveImage("myapp", commitA),
+		ContainerName: deriveContainerName("myapp", commitA),
+		HostPort:      port,
+		ContainerPort: 8080,
+		Hostname:      "myapp." + testBaseDomain,
+		Upstream:      fmt.Sprintf("127.0.0.1:%d", port),
+		DeployedAt:    time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC),
+		MountData:     true,
+		DataReadOnly:  true,
+	}
+	current := Deployment{
+		App:           "myapp",
+		Commit:        commitB,
+		Image:         deriveImage("myapp", commitB),
+		ContainerName: deriveContainerName("myapp", commitB),
+		HostPort:      port,
+		ContainerPort: 8080,
+		Hostname:      "myapp." + testBaseDomain,
+		Upstream:      fmt.Sprintf("127.0.0.1:%d", port),
+		DeployedAt:    time.Date(2026, 8, 2, 10, 5, 0, 0, time.UTC),
+	}
+
+	if err := SaveDeployment(cfg.State, previous); err != nil {
+		t.Fatalf("seed previous: %v", err)
+	}
+	if err := SaveDeployment(cfg.State, current); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+
+	docker := dockerAbsent(previous.ContainerName, nil)
+	// Also handle the post-swap `docker rm --force <currentContainer>`.
+	docker.responses = append(docker.responses,
+		fakeDockerEntry{match: matchDockerRm(current.ContainerName), resp: dockerResponse{}},
+	)
+	caddy := healthyCaddy(rootConfig)
+
+	if err := rollbackDeployment(context.Background(), cfg, rollbackDeps{docker: docker, caddy: caddy}); err != nil {
+		t.Fatalf("rollbackDeployment: %v", err)
+	}
+
+	// The fresh `docker run` for the previous container must
+	// include a --mount flag pointing at the derived host path,
+	// with the read-only flag matching the persisted
+	// DataReadOnly. The in-container target must be /data.
+	var runCall []string
+	for _, call := range docker.Calls() {
+		if len(call) >= 2 && call[0] == "docker" && call[1] == "run" && !containsString(call, current.ContainerName) && containsString(call, previous.ContainerName) {
+			runCall = call
+			break
+		}
+	}
+	if runCall == nil {
+		t.Fatalf("expected docker run for previous container %s, calls: %v", previous.ContainerName, docker.Calls())
+	}
+	joined := strings.Join(runCall, " ")
+	wantHost := filepath.Join(dataDir, "myapp", "data")
+	for _, want := range []string{
+		"--mount",
+		"type=bind",
+		"source=" + wantHost,
+		"target=/data",
+		"readonly=true",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("docker run missing %q in %v", want, runCall)
+		}
+	}
+
+	// The host-side data directory must exist after rollback.
+	if _, err := os.Stat(wantHost); err != nil {
+		t.Errorf("data dir %s not created: %v", wantHost, err)
+	}
+}
+
+// TestRollbackDeployment_FreshRunNoDataMount proves that when the
+// previous deployment did NOT opt into the data mount, the fresh
+// docker run does not include a --mount flag and no data dir is
+// created. This guards against accidentally enabling mount for
+// legacy deployments that never had the data field.
+func TestRollbackDeployment_FreshRunNoDataMount(t *testing.T) {
+	f := newRollbackFixture(t)
+
+	docker := dockerAbsent(f.previous.ContainerName, nil)
+	docker.responses = append(docker.responses,
+		fakeDockerEntry{match: matchDockerRm(f.current.ContainerName), resp: dockerResponse{}},
+	)
+	caddy := healthyCaddy(f.cfg.Caddy.RootConfigPath)
+
+	if err := rollbackDeployment(context.Background(), f.cfg, rollbackDeps{docker: docker, caddy: caddy}); err != nil {
+		t.Fatalf("rollbackDeployment: %v", err)
+	}
+
+	// Confirm there is no --mount in the previous container's run.
+	for _, call := range docker.Calls() {
+		if len(call) >= 2 && call[0] == "docker" && call[1] == "run" && containsString(call, f.previous.ContainerName) {
+			if strings.Contains(strings.Join(call, " "), "--mount") {
+				t.Errorf("docker run for previous container must not include --mount when MountData is false: %v", call)
+			}
+		}
+	}
+	// And no data directory was created.
+	wantHost := filepath.Join(f.cfg.Data.DataRoot, "myapp", "data")
+	if _, err := os.Stat(wantHost); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("data dir %s should not exist, got err=%v", wantHost, err)
+	}
+}
+
+// containsString returns true if s appears anywhere in xs.
+func containsString(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }

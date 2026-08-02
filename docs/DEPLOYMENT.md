@@ -11,12 +11,12 @@ fields:
 
 | Field | Type | Constraints |
 |---|---|---|
-| `version` | integer | Must equal `1`. |
+| `version` | integer | Must equal `1` or `2`. See [Version 2 contract](#version-2-contract). |
 | `app` | string | Must match `^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])$`. The first character must be a lowercase letter, the last character must be a lowercase letter or digit, and the middle characters may be lowercase letters, digits, or hyphens. Total length is 2–32. Must equal the expected repository short name passed to `Validate`. |
 | `container_port` | integer | Must be in `[1024, 65535]`. |
 | `health_path` | string | Must start with `/`. Must not contain `?` or `#`. |
 
-### Example
+### Example (version 1)
 
 ```json
 {
@@ -32,10 +32,14 @@ fields:
 - Unknown fields are rejected (`json.Decoder.DisallowUnknownFields()`).
 - Trailing data after the manifest object is rejected: a second
   `Decode` call must return `io.EOF`.
+- A version-1 manifest containing a `data` field is rejected at parse
+  time. The v1 contract explicitly did not support per-app persistent
+  data, so silently accepting the field would be a silent contract
+  change.
 
 ### Validator rules (`internal/deploy.Validate`)
 
-- `version` must equal `1`.
+- `version` must equal `1` or `2`.
 - `app` must match `^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])$`.
 - `container_port` must be in `[1024, 65535]`.
 - `health_path` must start with `/` and must not contain `?` or `#`.
@@ -52,10 +56,56 @@ require a future version bump:
 - Environment variables
 - Secrets
 - Databases
-- Volumes
-- Cron jobs
-- Custom domains
 - Multiple services per manifest
+- Per-app persistent data mounts (use version 2; see below)
+
+## Version 2 contract
+
+Version 2 is a strict superset of version 1. It adds one optional
+top-level field:
+
+| Field | Type | Constraints |
+|---|---|---|
+| `data` | object \| absent | Optional. When absent, the deployment is identical to version 1 in behaviour. When present, the deployment opts into the per-app persistent data directory; see [Per-app persistent data](#per-app-persistent-data). |
+
+The `data` object has the following fields:
+
+| Field | Type | Constraints |
+|---|---|---|
+| `mount` | boolean | Optional, default `false`. When `true`, the deployment mounts the per-app data directory at `/data` inside the container. When `false` (or omitted), the deployment behaves identically to a manifest without a `data` field at all. |
+| `read_only` | boolean | Optional, default `false`. When `true`, the in-container mount is read-only. Has no effect when `mount` is `false`; the orchestrator normalizes this combination on save. |
+
+A version-2 manifest without the `data` field is functionally
+identical to a version-1 manifest; existing manifests can move from
+version `1` to version `2` without changing any other field. Unknown
+fields anywhere in the manifest (including inside `data`) are still
+rejected.
+
+### Example (version 2 with data mount)
+
+```json
+{
+  "version": 2,
+  "app": "price-tracker",
+  "container_port": 8080,
+  "health_path": "/healthz",
+  "data": {
+    "mount": true,
+    "read_only": true
+  }
+}
+```
+
+### Example (version 2 without data mount)
+
+```json
+{
+  "version": 2,
+  "app": "agentctl",
+  "container_port": 8080,
+  "health_path": "/healthz"
+}
+```
 
 ## Source resolution
 
@@ -543,6 +593,188 @@ rather than silently succeeding.
 Multi-replica routing, rate limiting, authentication middleware,
 and the final deployment orchestrator are out of scope for this
 layer. The state record is the input to those layers.
+
+## Per-app persistent data
+
+Version-2 deployments may opt into a single per-app persistent
+data directory. The feature is deliberately narrow: one host
+directory per app, one fixed in-container target, no env-var
+interpolation, no caller-supplied paths, no multiple mounts.
+
+### Goals
+
+- The host path is derived from a **trusted root** (host
+  configuration) and the **validated app name**; the deployment
+  manifest never specifies a host path.
+- The host path is `/srv/agentctl/apps/<app>/data` by default,
+  where `<DataRoot>` is `/srv/agentctl/apps` (operator-overridable
+  via the trusted `DataConfig.DataRoot`).
+- The in-container mount target is the **fixed constant `/data`**;
+  the manifest cannot change it.
+- The directory is **created and managed** by the `agentctl` data
+  layer (`internal/deploy/data.go`); the deployment flow never
+  touches it with raw `os.MkdirAll` or `rm -rf`.
+- The directory is **preserved across every normal operation**:
+  initial deploy, replacement deploy, rollback, container
+  recreation, `docker rm --force` of an unrouted container.
+- The directory is **never deleted implicitly** by deploy,
+  rollback, or any cleanup path. Deletion is an explicit
+  operator action (`RemoveAppDataDir(cfg, app, force=true)`).
+- The in-container mount can be **read-only** for applications
+  like Price Tracker that mount a shared store and must not
+  mutate it from inside the container.
+
+### Host-side layout
+
+The data layer derives the host path as:
+
+```
+<DataRoot>/<app>/data
+```
+
+`<DataRoot>` is supplied by trusted host configuration as
+`DataConfig.DataRoot`. The default is `/srv/agentctl/apps` but
+operators can point it elsewhere (for example, a dedicated
+data volume mounted at `/var/lib/agentctl/apps`). The value is
+never taken from the manifest, the caller, or the deployment
+artifact.
+
+`<app>` is the same `appNameRe`-validated name the rest of the
+deployment pipeline uses (`^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])$`).
+The data layer validates the resolved path against `<DataRoot>`
+(abs + rel containment check) and rejects symlinks at any
+component of the path.
+
+### Container-side mount
+
+Every persistent-data bind mount uses the canonical Docker
+syntax:
+
+```
+--mount type=bind,source=<DataRoot>/<app>/data,target=/data,readonly=<true|false>
+```
+
+The `readonly` flag matches the manifest's `data.read_only`.
+A read-write mount (the default) lets the application write
+freely; a read-only mount forbids writes from inside the
+container. The whole container is **not** marked `--read-only`
+— only the `/data` mount is restricted.
+
+### State record
+
+When a deployment opts into the data mount, the persisted
+`Deployment` records two booleans:
+
+```
+MountData    bool  // whether the data directory is mounted
+DataReadOnly bool  // true if and only if MountData && data.read_only
+```
+
+The orchestrator normalizes `DataReadOnly=false` whenever
+`MountData=false`, so a "no mount but read-only" record never
+appears in state. The rollback layer uses these two booleans to
+re-apply the same mount when it has to start the previous
+container fresh from its image.
+
+### API
+
+```go
+type DataConfig struct {
+    DataRoot string // trusted host directory
+}
+
+type AppData struct {
+    App           string  // validated app name
+    HostPath      string  // resolved absolute host path
+    ContainerPath string  // fixed: "/data"
+    ReadOnly      bool
+}
+
+// EnsureAppDataDir ensures the per-app data directory exists.
+// Idempotent: an existing directory is left untouched (never
+// chmod'd, never wiped). Refuses symlinked data paths. Returns
+// the derived AppData for use in docker run argv.
+func EnsureAppDataDir(cfg DataConfig, app string, readOnly bool) (*AppData, error)
+
+// AppDataDir returns the derived AppData without touching disk.
+func AppDataDir(cfg DataConfig, app string, readOnly bool) (*AppData, error)
+
+// RemoveAppDataDir is the EXPLICIT destructive operation. The
+// deployment flow, the rollback flow, and every cleanup path
+// MUST NOT call this. Refuses non-empty directories unless
+// force is true.
+func RemoveAppDataDir(cfg DataConfig, app string, force bool) error
+```
+
+Sentinel errors returned by the data layer:
+
+- `ErrInvalidDataConfig` — `DataRoot` is empty or the app name
+  fails the `appNameRe` check.
+- `ErrAppDataNotFound` — `RemoveAppDataDir` was called for a
+  directory that does not exist.
+- `ErrAppDataNotEmpty` — `RemoveAppDataDir` was called without
+  `force=true` for a non-empty directory.
+- `ErrSymlinkedAppData` — the data directory (or any component
+  of the path) is a symlink; the symlink target is left
+  untouched.
+
+### Lifecycle guarantees
+
+The data directory is preserved across every normal agentctl
+operation. Specifically:
+
+- **First deployment** with `data.mount=true`: `EnsureAppDataDir`
+  creates the directory before `docker run`. If `docker run`
+  fails, the empty directory remains (it is harmless and a
+  re-deploy will reuse it idempotently).
+- **Replacement deployment**: a second deploy for the same app
+  leaves the directory and its contents in place, even if the
+  new manifest no longer opts into the mount. The old
+  container is removed; the data is not.
+- **Rollback**: the data directory is never deleted. The
+  rollback's fresh `docker run` for the previous container
+  re-applies the matching mount; `docker start` for a still-
+  present previous container preserves the existing mount.
+- **Container recreation** (`docker rm --force` of an
+  unrouted container): the data directory on the host is
+  unrelated to the container's lifecycle and survives any
+  `docker rm` operation.
+- **Image retention**: deleting an image does not affect the
+  data directory.
+
+### Explicit deletion
+
+The only operation that removes the data directory is
+`RemoveAppDataDir(cfg, app, force)`. It is **not** called by
+deploy, rollback, state save, candidate cleanup, or any other
+flow in `agentctl`. Operators invoke it directly when an app's
+data should be discarded — for example, after decommissioning
+an app or before reinstalling it with a different schema.
+
+`RemoveAppDataDir` requires an explicit `force` boolean:
+
+- `force=false`: refuses to remove a non-empty directory
+  (returns `ErrAppDataNotEmpty`). This is the safe default
+  and is what callers should pass when in doubt.
+- `force=true`: removes the directory and its contents
+  recursively. The caller is asserting they understand the
+  data loss.
+
+Refusing non-empty directories without `force` is the explicit
+"are you sure?" gate the task requires.
+
+### Out of scope
+
+The data layer does not implement any of the following. Each is
+explicitly left to a future milestone:
+
+- Multiple data directories per app.
+- Per-app custom host paths or custom in-container targets.
+- Volume drivers other than the host bind mount.
+- Backup, snapshot, or migration of data directories.
+- Environment-variable interpolation into the path.
+- Multiple mounts per app, read-only-on-the-host mounts, or
+  any other generalisation of the volume model.
 
 ## Rollback orchestration
 

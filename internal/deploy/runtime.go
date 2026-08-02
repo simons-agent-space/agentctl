@@ -78,11 +78,18 @@ func (dockerRunner) Run(ctx context.Context, name string, args ...string) (strin
 // candidate on a localhost-only port, health-checks it, and returns a
 // fully-derived CandidateResult. The function never logs, prints, or
 // returns Docker output beyond a small bounded prefix.
-func StartCandidate(ctx context.Context, cfg RuntimeConfig, manifest Manifest, source SourceResult) (*CandidateResult, error) {
-	return startCandidate(ctx, cfg, manifest, source, dockerRunner{})
+//
+// If the manifest opts into the per-app persistent data directory
+// (Manifest.Data.Mount is true), the host-side data directory is
+// ensured to exist BEFORE docker run so the bind mount target is
+// present. The data root comes from cfg (trusted host configuration),
+// never from the manifest; the in-container target is the fixed
+// constant dataContainerPath.
+func StartCandidate(ctx context.Context, cfg RuntimeConfig, data DataConfig, manifest Manifest, source SourceResult) (*CandidateResult, error) {
+	return startCandidate(ctx, cfg, data, manifest, source, dockerRunner{})
 }
 
-func startCandidate(ctx context.Context, cfg RuntimeConfig, manifest Manifest, source SourceResult, runner commandRunner) (*CandidateResult, error) {
+func startCandidate(ctx context.Context, cfg RuntimeConfig, data DataConfig, manifest Manifest, source SourceResult, runner commandRunner) (*CandidateResult, error) {
 	if err := validateRuntimeInputs(cfg, manifest, source); err != nil {
 		return nil, err
 	}
@@ -98,7 +105,22 @@ func startCandidate(ctx context.Context, cfg RuntimeConfig, manifest Manifest, s
 		return nil, err
 	}
 
-	return startWithPortRetry(ctx, cfg, runner, containerName, image, manifest.ContainerPort, manifest.HealthPath, manifest.App, source.Commit)
+	// If the manifest opts into the per-app data mount, ensure the
+	// host-side data directory exists before docker run so the bind
+	// mount target is present. EnsureAppDataDir is idempotent and
+	// never deletes or replaces existing data. The returned
+	// AppData is passed to the runtime so docker run can include
+	// the matching --mount flag.
+	var appData *AppData
+	if manifest.Data != nil && manifest.Data.Mount {
+		var err error
+		appData, err = EnsureAppDataDir(data, manifest.App, manifest.Data.ReadOnly)
+		if err != nil {
+			return nil, fmt.Errorf("ensure app data dir: %w", err)
+		}
+	}
+
+	return startWithPortRetry(ctx, cfg, runner, containerName, image, manifest.ContainerPort, manifest.HealthPath, manifest.App, source.Commit, appData)
 }
 
 // RemoveCandidate stops and removes the candidate container identified
@@ -256,13 +278,13 @@ func defaultAllocatePort(start, end int) (int, error) {
 	return 0, fmt.Errorf("%w: %d..%d", ErrNoAvailablePort, start, end)
 }
 
-func startWithPortRetry(ctx context.Context, cfg RuntimeConfig, runner commandRunner, containerName, image string, containerPort int, healthPath, app, commit string) (*CandidateResult, error) {
+func startWithPortRetry(ctx context.Context, cfg RuntimeConfig, runner commandRunner, containerName, image string, containerPort int, healthPath, app, commit string, appData *AppData) (*CandidateResult, error) {
 	port, err := allocatePortFunc(cfg.PortRangeStart, cfg.PortRangeEnd)
 	if err != nil {
 		return nil, err
 	}
 	for {
-		startErr := startContainer(ctx, runner, containerName, image, port, containerPort)
+		startErr := startContainer(ctx, runner, containerName, image, port, containerPort, appData)
 		if startErr != nil {
 			if isPortInUse(startErr) {
 				// A port-binding failure can leave a stopped container with
@@ -319,7 +341,25 @@ func nextAvailablePort(start, end, after int) (int, error) {
 	return after + 1, nil
 }
 
-func startContainer(ctx context.Context, runner commandRunner, containerName, image string, hostPort, containerPort int) error {
+func startContainer(ctx context.Context, runner commandRunner, containerName, image string, hostPort, containerPort int, appData *AppData) error {
+	args := buildDockerRunArgs(containerName, image, hostPort, containerPort, appData)
+	out, err := runner.Run(ctx, "docker", args...)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrContainerStartFailed, truncateForError(out))
+	}
+	return nil
+}
+
+// buildDockerRunArgs constructs the fixed argv for `docker run`.
+// The runtime layer (startContainer) and the rollback layer
+// (runContainerFromImage) both use this function so the docker
+// invocation stays in lockstep: every container agentctl starts
+// uses the same security and resource options.
+//
+// When appData is non-nil the call adds a bind mount of
+// appData.HostPath at the fixed in-container target /data with
+// the read-only flag carried on appData.
+func buildDockerRunArgs(containerName, image string, hostPort, containerPort int, appData *AppData) []string {
 	args := []string{
 		"run",
 		"--detach",
@@ -331,13 +371,21 @@ func startContainer(ctx context.Context, runner commandRunner, containerName, im
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",
 		"--publish", fmt.Sprintf("127.0.0.1:%d:%d", hostPort, containerPort),
-		image,
 	}
-	out, err := runner.Run(ctx, "docker", args...)
-	if err != nil {
-		return fmt.Errorf("%w: %s", ErrContainerStartFailed, truncateForError(out))
+	if appData != nil {
+		args = append(args, "--mount", buildDataMountArg(appData))
 	}
-	return nil
+	args = append(args, image)
+	return args
+}
+
+// buildDataMountArg constructs the --mount flag value for a
+// per-app data bind mount. The mount uses the canonical Docker
+// --mount syntax with type=bind; the host source is the validated
+// AppData.HostPath and the in-container target is the fixed
+// constant dataContainerPath. Read-only is taken from appData.
+func buildDataMountArg(appData *AppData) string {
+	return fmt.Sprintf("type=bind,source=%s,target=%s,readonly=%t", appData.HostPath, appData.ContainerPath, appData.ReadOnly)
 }
 
 func removeContainer(ctx context.Context, runner commandRunner, containerName string) error {

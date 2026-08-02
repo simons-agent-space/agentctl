@@ -22,6 +22,7 @@ type RollbackConfig struct {
 	State      StateConfig
 	Runtime    RuntimeConfig
 	Caddy      CaddyConfig
+	Data       DataConfig
 	HealthPath string // for health-checking the previous container
 }
 
@@ -97,7 +98,7 @@ func rollbackDeployment(ctx context.Context, cfg RollbackConfig, deps rollbackDe
 	previous := *state.Previous
 
 	// 1. Ensure previous container is running and healthy.
-	previousCandidate, previousAction, err := ensurePreviousRunningAndHealthy(ctx, cfg.Runtime, previous, cfg.HealthPath, deps.docker)
+	previousCandidate, previousAction, err := ensurePreviousRunningAndHealthy(ctx, cfg.Runtime, cfg.Data, previous, cfg.HealthPath, deps.docker)
 	if err != nil {
 		return fmt.Errorf("%w: ensure previous container: %v", ErrRollbackFailed, err)
 	}
@@ -216,10 +217,19 @@ func deploymentToCandidate(dep Deployment, healthPath string) CandidateResult {
 // started in this call, it is removed (best-effort, bounded
 // cleanup context).
 //
+// When the previous deployment opted into the per-app data mount
+// (dep.MountData) and the container has to be run fresh from the
+// image, the host-side data directory is ensured to exist and
+// the matching bind mount is added to the docker run argv. This
+// keeps a rollback's freshly-run container on the same data
+// layout as the deployment it replaces. docker start and the
+// already-running paths preserve the existing container's mount
+// configuration automatically.
+//
 // Returns the action taken on the container so rollback can
 // restore its original runtime state if a later step (Caddy
 // promotion, state save) fails.
-func ensurePreviousRunningAndHealthy(ctx context.Context, cfg RuntimeConfig, dep Deployment, healthPath string, runner commandRunner) (*CandidateResult, previousContainerAction, error) {
+func ensurePreviousRunningAndHealthy(ctx context.Context, cfg RuntimeConfig, data DataConfig, dep Deployment, healthPath string, runner commandRunner) (*CandidateResult, previousContainerAction, error) {
 	if !appNameRe.MatchString(dep.App) {
 		return nil, previousContainerUntouched, fmt.Errorf("%w: app %q does not match app-name format", ErrInvalidCandidate, dep.App)
 	}
@@ -246,7 +256,15 @@ func ensurePreviousRunningAndHealthy(ctx context.Context, cfg RuntimeConfig, dep
 		}
 		action = previousContainerStarted
 	case containerStatusAbsent:
-		if err := runContainerFromImage(ctx, runner, dep); err != nil {
+		var appData *AppData
+		if dep.MountData {
+			ad, err := EnsureAppDataDir(data, dep.App, dep.DataReadOnly)
+			if err != nil {
+				return nil, previousContainerUntouched, fmt.Errorf("ensure app data dir: %w", err)
+			}
+			appData = ad
+		}
+		if err := runContainerFromImage(ctx, runner, dep, appData); err != nil {
 			return nil, previousContainerUntouched, err
 		}
 		action = previousContainerCreated
@@ -335,19 +353,10 @@ func restorePreviousContainer(ctx context.Context, runner commandRunner, contain
 // runContainerFromImage runs a new container from the given
 // image. The fixed argv matches the runtime layer: localhost-only
 // publish, no privileged, no new privileges, hard resource caps.
-func runContainerFromImage(ctx context.Context, runner commandRunner, dep Deployment) error {
-	args := []string{
-		"run", "--detach",
-		"--name", dep.ContainerName,
-		"--restart", "unless-stopped",
-		"--memory", "256m",
-		"--cpus", "0.5",
-		"--pids-limit", "128",
-		"--cap-drop", "ALL",
-		"--security-opt", "no-new-privileges",
-		"--publish", fmt.Sprintf("127.0.0.1:%d:%d", dep.HostPort, dep.ContainerPort),
-		dep.Image,
-	}
+// When appData is non-nil the call adds the per-app data bind
+// mount; otherwise the container starts without one.
+func runContainerFromImage(ctx context.Context, runner commandRunner, dep Deployment, appData *AppData) error {
+	args := buildDockerRunArgs(dep.ContainerName, dep.Image, dep.HostPort, dep.ContainerPort, appData)
 	out, err := runner.Run(ctx, "docker", args...)
 	if err != nil {
 		return fmt.Errorf("%w: %s: %v", ErrContainerStartFailed, truncateForError(out), err)

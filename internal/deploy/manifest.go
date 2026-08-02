@@ -22,12 +22,32 @@ import (
 var appNameRe = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])$`)
 
 // Manifest is the deploy.json shape. Version 1 describes a single HTTP
-// container; see docs/DEPLOYMENT.md for the full contract and scope.
+// container; version 2 adds an optional per-app persistent data
+// mount; see docs/DEPLOYMENT.md for the full contract and scope.
+//
+// When Data is non-nil the manifest opts the deployment into the
+// per-app persistent data directory. The host path is derived from
+// the trusted DataConfig (host configuration), never from the
+// manifest, and the container-side mount target is the fixed
+// constant dataContainerPath. Read-only is set via Data.ReadOnly.
 type Manifest struct {
-	Version       int    `json:"version"`
-	App           string `json:"app"`
-	ContainerPort int    `json:"container_port"`
-	HealthPath    string `json:"health_path"`
+	Version       int           `json:"version"`
+	App           string        `json:"app"`
+	ContainerPort int           `json:"container_port"`
+	HealthPath    string        `json:"health_path"`
+	Data          *ManifestData `json:"data,omitempty"`
+}
+
+// ManifestData is the value of a manifest's optional "data" field.
+// It declares whether the deployment mounts the per-app persistent
+// data directory and whether the in-container mount is read-only.
+// The host path and the in-container target are NOT part of this
+// struct: the host path is derived from a trusted host root plus
+// the validated app name, and the in-container target is a fixed
+// constant.
+type ManifestData struct {
+	Mount    bool `json:"mount"`
+	ReadOnly bool `json:"read_only"`
 }
 
 // Load reads and decodes a deploy.json file from path. Unknown fields
@@ -47,6 +67,14 @@ func Load(path string) (*Manifest, error) {
 	// file contained trailing data after the manifest object.
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("trailing data after deploy manifest")
+	}
+	// A version-1 manifest must not declare a data field: the v1
+	// contract explicitly did not support per-app persistent data,
+	// and silently accepting it on v1 would be a silent contract
+	// change. Reject it at parse time so every consumer of Load
+	// (including callers that skip Validate) sees the failure.
+	if m.Version == 1 && m.Data != nil {
+		return nil, fmt.Errorf("data field is not allowed in version 1 manifests (bump to version 2)")
 	}
 	return &m, nil
 }

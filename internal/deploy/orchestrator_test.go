@@ -176,6 +176,7 @@ func newDeployFixture(t *testing.T) *deployFixture {
 	stateDir := t.TempDir()
 	caddyDir := t.TempDir()
 	repoRoot := t.TempDir()
+	dataDir := t.TempDir()
 	rootConfig := filepath.Join(caddyDir, "Caddyfile")
 	if err := os.WriteFile(rootConfig, []byte("import "+filepath.Join(caddyDir, "*.caddy")+"\n"), 0o644); err != nil {
 		t.Fatalf("seed root config: %v", err)
@@ -204,6 +205,9 @@ func newDeployFixture(t *testing.T) *deployFixture {
 		State: StateConfig{
 			StateDir:   stateDir,
 			BaseDomain: testBaseDomain,
+		},
+		Data: DataConfig{
+			DataRoot: dataDir,
 		},
 	}
 
@@ -1386,4 +1390,199 @@ func caddyErrUnwrapSecondaries(err error) []error {
 		out = append(out, s)
 	}
 	return out
+}
+
+// TestDeploy_DataMount_EndToEnd proves that a v2 manifest with
+// data.mount=true and data.read_only=true results in a docker run
+// with the matching --mount flag, that the host-side data
+// directory is created, and that the persisted Deployment
+// records both MountData=true and DataReadOnly=true. This is the
+// end-to-end counterpart to the runtime-layer and rollback-layer
+// mount tests; together they cover the full data-layer surface.
+func TestDeploy_DataMount_EndToEnd(t *testing.T) {
+	f := newDeployFixture(t)
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.dockerAllSuccess(containerName)
+
+	manifest := f.validManifest()
+	manifest.Version = 2
+	manifest.Data = &ManifestData{Mount: true, ReadOnly: true}
+
+	result, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	if result == nil {
+		t.Fatalf("nil result")
+	}
+
+	// Locate the docker run call for the new container and assert
+	// on its argv.
+	var runCall []string
+	for _, call := range f.docker.calls {
+		if len(call) >= 2 && call[0] == "docker" && call[1] == "run" && containsString(call, containerName) {
+			runCall = call
+			break
+		}
+	}
+	if runCall == nil {
+		t.Fatalf("expected docker run for %s, calls: %v", containerName, f.docker.calls)
+	}
+	joined := strings.Join(runCall, " ")
+	wantHost := filepath.Join(f.cfg.Data.DataRoot, f.expectedApp, "data")
+	for _, want := range []string{
+		"--mount",
+		"type=bind",
+		"source=" + wantHost,
+		"target=/data",
+		"readonly=true",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("docker run missing %q in %v", want, runCall)
+		}
+	}
+
+	// The host-side data directory must exist.
+	if _, err := os.Stat(wantHost); err != nil {
+		t.Errorf("data dir %s not created: %v", wantHost, err)
+	}
+
+	// The persisted state must record the mount config.
+	state, err := LoadDeploymentState(f.cfg.State, f.expectedApp)
+	if err != nil {
+		t.Fatalf("LoadDeploymentState: %v", err)
+	}
+	if state.Current == nil {
+		t.Fatalf("state.Current is nil")
+	}
+	if !state.Current.MountData {
+		t.Errorf("state.Current.MountData = false, want true")
+	}
+	if !state.Current.DataReadOnly {
+		t.Errorf("state.Current.DataReadOnly = false, want true")
+	}
+}
+
+// TestDeploy_DataMount_NoMountByDefault proves that a v2 manifest
+// without a data field, or with data.mount=false, does NOT include
+// a --mount flag in docker run and does NOT create a host-side
+// data directory. The data field is opt-in: legacy deployments
+// that never opted in must not be silently migrated.
+func TestDeploy_DataMount_NoMountByDefault(t *testing.T) {
+	cases := []struct {
+		name     string
+		data     *ManifestData
+		wantData bool // whether a data dir should be created
+	}{
+		{"nil data", nil, false},
+		{"mount=false", &ManifestData{Mount: false}, false},
+		{"mount=false read_only=true", &ManifestData{Mount: false, ReadOnly: true}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDeployFixture(t)
+			containerName := deriveContainerName(f.expectedApp, f.commit)
+			f.dockerAllSuccess(containerName)
+
+			manifest := f.validManifest()
+			manifest.Version = 2
+			manifest.Data = tc.data
+
+			if _, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+				docker: f.docker,
+				caddy:  f.caddy,
+			}); err != nil {
+				t.Fatalf("Deploy: %v", err)
+			}
+
+			// No --mount in the run call.
+			for _, call := range f.docker.calls {
+				if len(call) >= 2 && call[0] == "docker" && call[1] == "run" && containsString(call, containerName) {
+					if strings.Contains(strings.Join(call, " "), "--mount") {
+						t.Errorf("docker run must not include --mount when data.mount=false: %v", call)
+					}
+				}
+			}
+
+			wantHost := filepath.Join(f.cfg.Data.DataRoot, f.expectedApp, "data")
+			if tc.wantData {
+				if _, err := os.Stat(wantHost); err != nil {
+					t.Errorf("data dir %s expected: %v", wantHost, err)
+				}
+			} else {
+				if _, err := os.Stat(wantHost); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("data dir %s should not exist, got err=%v", wantHost, err)
+				}
+			}
+
+			// State must record MountData=false (and, by
+			// normalisation in deploy(), DataReadOnly=false as
+			// well — read-only is only meaningful when a mount
+			// is requested).
+			state, err := LoadDeploymentState(f.cfg.State, f.expectedApp)
+			if err != nil {
+				t.Fatalf("LoadDeploymentState: %v", err)
+			}
+			if state.Current.MountData || state.Current.DataReadOnly {
+				t.Errorf("state.Current mount fields should be false, got MountData=%v DataReadOnly=%v", state.Current.MountData, state.Current.DataReadOnly)
+			}
+		})
+	}
+}
+
+// TestDeploy_DataMount_PreservedAcrossReplacement proves that a
+// replacement deployment (second Deploy) does NOT delete the host
+// data directory, even when the previous deployment opted in and
+// the new one does not. The data dir outlives every deployment
+// that ever mounted it; only an explicit RemoveAppDataDir call
+// removes it.
+func TestDeploy_DataMount_PreservedAcrossReplacement(t *testing.T) {
+	f := newDeployFixture(t)
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.dockerAllSuccess(containerName)
+
+	// First deployment: opt into the mount.
+	manifestA := f.validManifest()
+	manifestA.Version = 2
+	manifestA.Data = &ManifestData{Mount: true, ReadOnly: true}
+	if _, err := deploy(context.Background(), f.cfg, manifestA, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	}); err != nil {
+		t.Fatalf("Deploy A: %v", err)
+	}
+
+	// Seed a "user file" inside the data directory so we can
+	// verify it is preserved across the replacement.
+	hostData := filepath.Join(f.cfg.Data.DataRoot, f.expectedApp, "data")
+	userFile := filepath.Join(hostData, "user.json")
+	if err := os.WriteFile(userFile, []byte(`{"saved":true}`), 0o600); err != nil {
+		t.Fatalf("seed user file: %v", err)
+	}
+
+	// Second deployment: new commit, no data field.
+	commitB := f.commitB
+	containerB := deriveContainerName(f.expectedApp, commitB)
+	f.dockerAllSuccess(containerB)
+	manifestB := f.validManifest()
+	manifestB.Version = 2
+
+	if _, err := deploy(context.Background(), f.cfg, manifestB, commitB, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	}); err != nil {
+		t.Fatalf("Deploy B: %v", err)
+	}
+
+	// The host-side data directory and its contents MUST still
+	// be on disk. Only RemoveAppDataDir can remove them.
+	if _, err := os.Stat(hostData); err != nil {
+		t.Errorf("data dir removed by replacement deploy: %v", err)
+	}
+	if _, err := os.Stat(userFile); err != nil {
+		t.Errorf("user file removed by replacement deploy: %v", err)
+	}
 }

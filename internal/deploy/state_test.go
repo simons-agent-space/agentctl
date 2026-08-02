@@ -539,3 +539,73 @@ func TestSaveDeployment_OverwritesCorruptStateRefused(t *testing.T) {
 		t.Errorf("corrupt file was overwritten")
 	}
 }
+
+func TestSaveDeployment_PersistsMountDataAndReadOnly(t *testing.T) {
+	cfg := validStateConfig(t)
+	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
+	dep.MountData = true
+	dep.DataReadOnly = true
+
+	if err := SaveDeployment(cfg, dep); err != nil {
+		t.Fatalf("SaveDeployment: %v", err)
+	}
+
+	state, err := LoadDeploymentState(cfg, "myapp")
+	if err != nil {
+		t.Fatalf("LoadDeploymentState: %v", err)
+	}
+	if state.Current == nil {
+		t.Fatalf("current is nil")
+	}
+	if !state.Current.MountData || !state.Current.DataReadOnly {
+		t.Errorf("current mount fields not preserved: %+v", state.Current)
+	}
+
+	// And the raw JSON on disk should contain both fields.
+	data, err := os.ReadFile(filepath.Join(cfg.StateDir, "myapp.state.json"))
+	if err != nil {
+		t.Fatalf("read state file: %v", err)
+	}
+	if !strings.Contains(string(data), `"mount_data": true`) {
+		t.Errorf("expected mount_data:true in JSON, got: %s", data)
+	}
+	if !strings.Contains(string(data), `"data_read_only": true`) {
+		t.Errorf("expected data_read_only:true in JSON, got: %s", data)
+	}
+}
+
+func TestLoadDeploymentState_BackwardCompatibleWithoutDataFields(t *testing.T) {
+	// A state file written by an older agentctl that did not know
+	// about the data mount fields must still load with MountData=false
+	// and DataReadOnly=false (the natural zero values). The version
+	// number is unchanged; the new fields are optional on read.
+	cfg := validStateConfig(t)
+	legacy := `{
+  "version": 1,
+  "app": "myapp",
+  "current": {
+    "app": "myapp",
+    "commit": "` + strings.Repeat("a", 40) + `",
+    "image": "agentctl/myapp:` + strings.Repeat("a", 40) + `",
+    "container_name": "agentctl-myapp-` + strings.Repeat("a", 12) + `",
+    "host_port": 49152,
+    "container_port": 8080,
+    "hostname": "myapp.apps.simonontheweb.de",
+    "upstream": "127.0.0.1:49152",
+    "deployed_at": "2026-08-02T10:00:00Z"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(cfg.StateDir, "myapp.state.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatalf("seed legacy state: %v", err)
+	}
+	state, err := LoadDeploymentState(cfg, "myapp")
+	if err != nil {
+		t.Fatalf("LoadDeploymentState: %v", err)
+	}
+	if state.Current == nil {
+		t.Fatalf("current is nil")
+	}
+	if state.Current.MountData || state.Current.DataReadOnly {
+		t.Errorf("legacy state should have mount fields false, got %+v", state.Current)
+	}
+}
