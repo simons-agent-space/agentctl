@@ -686,6 +686,24 @@ Sentinel errors:
 - Retrying `Deploy` with the same commit is safe: a fresh deploy
   attempt validates everything from scratch and leaves the host
   in a consistent state on failure.
+- **Old-container removal after successful state persistence is
+  NON-FATAL**: a failure here surfaces as a warning on
+  `DeployResult.Warnings` (not as an error), so an autonomous
+  caller does not retry a deployment that actually succeeded.
+  Candidate-cleanup failures on *failed* deployment paths
+  remain fatal.
+- **Combined failures are preserved structurally**: when more
+  than one underlying failure occurs (e.g. state-save failure
+  AND Caddy-recovery failure, or state-save failure AND
+  candidate-cleanup failure), the returned `deployError`
+  preserves them as separate entries in `deployError.secondaries`
+  (for the Caddy layer, as `caddyCommandError.cause` /
+  `caddyCommandError.rollback`). Callers can detect every
+  underlying failure with `errors.Is`; `errors.Is(err,
+  ErrDeploymentFailed)` is always true. Go 1.19 has no
+  `errors.Join`, so the equivalent is each layer's multi-
+  sentinel `Is` method that walks the slice of preserved
+  errors.
 - HTTP handlers, Telegram approval, and systemd integration are
   intentionally out of scope; this layer is the daemon's
   building block.

@@ -15,6 +15,29 @@ import (
 	"time"
 )
 
+// Test-only sentinels returned by the fake docker / caddy runners
+// to prove that the orchestrator preserves underlying errors via
+// errors.Is. They are package-level so tests can refer to the
+// exact sentinel identity (errors.Is checks pointer-equality of
+// the *errors.errorString), and so we have a single source of
+// truth for both the runner response and the assertion target.
+//
+// errSimulatedCaddyReload is returned by the fake Caddy runner on
+// a specific validate/reload call to drive the combined-failure
+// orchestrator paths. The orchestrator's deployError preserves
+// the wrapped sentinel via the caddy layer's caddyCommandError,
+// and the deployError.Is method walks every secondary so callers
+// can errors.Is for it across the chain.
+//
+// errSimulatedDockerRm is returned by the fake Docker runner on a
+// specific rm call. removeContainerForce wraps the runner err
+// with %w, so errors.Is finds it through the orchestrator's
+// deployError chain.
+var (
+	errSimulatedCaddyReload = errors.New("simulated caddy reload failure")
+	errSimulatedDockerRm    = errors.New("simulated docker rm failure")
+)
+
 // setupTestGitRepo creates a local bare origin and a working
 // repository with two commits. Each commit contains a Dockerfile.
 // Returns the origin URL (file://) and the two commit SHAs. The
@@ -657,6 +680,16 @@ func TestDeploy_FirstDeploymentStateFailureRemovesRouteBeforeRemovingCandidate(t
 // orchestrator re-promotes the snapshotted old Current BEFORE
 // removing the candidate container. If the recovery re-promote
 // fails, the candidate must be left running.
+//
+// The 4th Caddy call (the recovery reload) returns
+// errSimulatedCaddyReload. The orchestrator's deployError
+// preserves both the state-save failure and the Caddy recovery
+// failure as separate secondaries, so an autonomous caller can
+// errors.Is for either:
+//
+//   - errors.Is(err, ErrDeploymentFailed)        // always true
+//   - errors.Is(err, ErrCaddyReloadFailed)       // Caddy-layer sentinel
+//   - errors.Is(err, errSimulatedCaddyReload)    // specific runner error
 func TestDeploy_ReplacementStateFailureRestoresOriginalRoute(t *testing.T) {
 	f := newDeployFixture(t)
 	seedState(t, f.cfg.State, Deployment{
@@ -675,14 +708,15 @@ func TestDeploy_ReplacementStateFailureRestoresOriginalRoute(t *testing.T) {
 	f.docker.onRun(func(args []string) (string, error) { return newContainer, nil })
 
 	// Caddy: initial promote succeeds (calls 1-2). Recovery
-	// re-promote fails on the reload (call 4).
+	// re-promote validate succeeds (call 3) and reload fails
+	// with the test sentinel (call 4).
 	caddy := &sequentialCaddyRunner{
 		match: matchCaddyValidateOrReload(),
 		responses: []caddyResponse{
 			{},
 			{},
 			{},
-			{err: errors.New("recovery reload failed")},
+			{err: errSimulatedCaddyReload},
 		},
 	}
 	if err := os.Chmod(f.cfg.State.StateDir, 0o555); err != nil {
@@ -695,8 +729,17 @@ func TestDeploy_ReplacementStateFailureRestoresOriginalRoute(t *testing.T) {
 		docker: f.docker,
 		caddy:  caddy,
 	})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
 	if !errors.Is(err, ErrDeploymentFailed) {
-		t.Fatalf("expected ErrDeploymentFailed, got %v", err)
+		t.Fatalf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+	if !errors.Is(err, errSimulatedCaddyReload) {
+		t.Errorf("error must preserve underlying errSimulatedCaddyReload so callers can errors.Is, got %v", err)
+	}
+	if !errors.Is(err, ErrCaddyReloadFailed) {
+		t.Errorf("error must preserve Caddy-layer ErrCaddyReloadFailed, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "save state") {
 		t.Errorf("error must mention save state, got: %v", err)
@@ -719,8 +762,18 @@ func TestDeploy_ReplacementStateFailureRestoresOriginalRoute(t *testing.T) {
 // TestDeploy_CaddyRecoveryFailureKeepsCandidateRunning proves that
 // when state-save recovery (Caddy revert) fails, the candidate
 // container is left running (Caddy may still route to it) and the
-// returned error includes BOTH the state-save failure and the
-// Caddy recovery failure.
+// returned error preserves BOTH the state-save failure and the
+// Caddy recovery failure as structurally detectable sentinels.
+//
+// The 3rd Caddy call (the recovery validate) returns
+// errSimulatedCaddyReload. The orchestrator's deployError
+// preserves both the state-save failure and the Caddy recovery
+// failure as separate secondaries, so an autonomous caller can
+// errors.Is for either:
+//
+//   - errors.Is(err, ErrDeploymentFailed)        // always true
+//   - errors.Is(err, ErrCaddyValidateFailed)     // Caddy-layer sentinel
+//   - errors.Is(err, errSimulatedCaddyReload)    // specific runner error
 func TestDeploy_CaddyRecoveryFailureKeepsCandidateRunning(t *testing.T) {
 	f := newDeployFixture(t)
 	seedState(t, f.cfg.State, Deployment{
@@ -739,13 +792,13 @@ func TestDeploy_CaddyRecoveryFailureKeepsCandidateRunning(t *testing.T) {
 	f.docker.onRun(func(args []string) (string, error) { return newContainer, nil })
 
 	// Caddy: initial promote succeeds (calls 1-2). Recovery
-	// re-promote fails on the validate (call 3).
+	// re-promote validate fails with the test sentinel (call 3).
 	caddy := &sequentialCaddyRunner{
 		match: matchCaddyValidateOrReload(),
 		responses: []caddyResponse{
 			{},
 			{},
-			{err: errors.New("recovery validate failed")},
+			{err: errSimulatedCaddyReload},
 		},
 	}
 	if err := os.Chmod(f.cfg.State.StateDir, 0o555); err != nil {
@@ -764,6 +817,12 @@ func TestDeploy_CaddyRecoveryFailureKeepsCandidateRunning(t *testing.T) {
 	if !errors.Is(err, ErrDeploymentFailed) {
 		t.Errorf("error must preserve ErrDeploymentFailed, got %v", err)
 	}
+	if !errors.Is(err, errSimulatedCaddyReload) {
+		t.Errorf("error must preserve underlying errSimulatedCaddyReload so callers can errors.Is, got %v", err)
+	}
+	if !errors.Is(err, ErrCaddyValidateFailed) {
+		t.Errorf("error must preserve Caddy-layer ErrCaddyValidateFailed, got %v", err)
+	}
 	if !strings.Contains(err.Error(), "save state") {
 		t.Errorf("error must mention the state-save failure, got: %v", err)
 	}
@@ -780,7 +839,14 @@ func TestDeploy_CaddyRecoveryFailureKeepsCandidateRunning(t *testing.T) {
 
 // TestDeploy_CleanupFailureOnSuccessPathReported proves that a
 // failure to remove the formerly-current container on the
-// success path is REPORTED, not silently swallowed.
+// success path is reported as a warning, not silently swallowed
+// and not converted into a deployment error.
+//
+// Rationale (autonomous-use safety): once the new deployment is
+// committed (state persisted, Caddy serving the new route), the
+// deploy has SUCCEEDED. An autonomous caller that sees an error
+// would retry a deployment that already worked. The fix is to
+// return success with a single warning on result.Warnings.
 func TestDeploy_CleanupFailureOnSuccessPathReported(t *testing.T) {
 	f := newDeployFixture(t)
 	seedState(t, f.cfg.State, Deployment{
@@ -802,25 +868,34 @@ func TestDeploy_CleanupFailureOnSuccessPathReported(t *testing.T) {
 	f.docker.onRm(func(args []string) (string, error) {
 		for _, a := range args {
 			if a == oldContainer {
-				return "rm failed", errors.New("exit 1")
+				return "rm failed", errSimulatedDockerRm
 			}
 		}
 		return "", nil
 	})
 
 	manifest := f.validManifest()
-	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+	result, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
 		docker: f.docker,
 		caddy:  f.caddy,
 	})
-	if err == nil {
-		t.Fatalf("expected error from cleanup failure (not silently swallowed)")
+	if err != nil {
+		t.Fatalf("deploy must succeed despite old-container cleanup failure (deployment is live); got err: %v", err)
 	}
-	if !errors.Is(err, ErrDeploymentFailed) {
-		t.Errorf("error must preserve ErrDeploymentFailed, got %v", err)
+	if result == nil {
+		t.Fatalf("result must be non-nil on success")
 	}
-	if !strings.Contains(err.Error(), "post-deploy cleanup of old container") {
-		t.Errorf("error must mention post-deploy cleanup, got: %v", err)
+	if result.Commit != f.commitB {
+		t.Errorf("result.Commit = %q, want %q", result.Commit, f.commitB)
+	}
+	if len(result.Warnings) != 1 {
+		t.Fatalf("expected exactly 1 warning on result.Warnings, got %d: %v", len(result.Warnings), result.Warnings)
+	}
+	if !strings.Contains(result.Warnings[0].Error(), "post-deploy cleanup of old container") {
+		t.Errorf("warning must mention post-deploy cleanup, got: %v", result.Warnings[0])
+	}
+	if !errors.Is(result.Warnings[0], errSimulatedDockerRm) {
+		t.Errorf("warning must wrap the underlying errSimulatedDockerRm so callers can errors.Is it, got: %v", result.Warnings[0])
 	}
 
 	state, lerr := LoadDeploymentState(f.cfg.State, f.expectedApp)
@@ -835,6 +910,11 @@ func TestDeploy_CleanupFailureOnSuccessPathReported(t *testing.T) {
 // TestDeploy_CandidateCleanupFailureReported proves that when the
 // candidate container cleanup fails after a successful Caddy
 // recovery, the failure is reported in the returned error.
+//
+// Candidate-cleanup failures on FAILED deployment paths remain
+// fatal: the deployment did not commit, so the caller must see
+// an error and may retry. This is in contrast to the success
+// path (step 7), where cleanup failure is non-fatal.
 func TestDeploy_CandidateCleanupFailureReported(t *testing.T) {
 	f := newDeployFixture(t)
 	seedState(t, f.cfg.State, Deployment{
@@ -856,7 +936,7 @@ func TestDeploy_CandidateCleanupFailureReported(t *testing.T) {
 	f.docker.onRm(func(args []string) (string, error) {
 		for _, a := range args {
 			if a == newContainer {
-				return "rm failed", errors.New("exit 1")
+				return "rm failed", errSimulatedDockerRm
 			}
 		}
 		return "", nil
@@ -883,6 +963,9 @@ func TestDeploy_CandidateCleanupFailureReported(t *testing.T) {
 	}
 	if !errors.Is(err, ErrDeploymentFailed) {
 		t.Errorf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+	if !errors.Is(err, errSimulatedDockerRm) {
+		t.Errorf("error must preserve underlying errSimulatedDockerRm so callers can errors.Is, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "save state") {
 		t.Errorf("error must mention the primary save-state failure, got: %v", err)

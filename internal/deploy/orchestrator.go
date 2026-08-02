@@ -26,6 +26,14 @@ type DeployConfig struct {
 }
 
 // DeployResult is the outcome of a successful deployment.
+//
+// Warnings collects non-fatal issues that occurred after the
+// deployment was already committed and live (Caddy promotion and
+// state persistence both succeeded). The deployment is considered
+// successful: the caller should NOT retry. Each warning is a
+// self-contained cleanup task the caller may want to schedule
+// (e.g. remove the formerly-current container that is now
+// unrouted but still running).
 type DeployResult struct {
 	App           string
 	Commit        string
@@ -37,6 +45,7 @@ type DeployResult struct {
 	Upstream      string
 	DeployedAt    time.Time
 	StateFile     string
+	Warnings      []error
 }
 
 // Deploy runs the full deployment pipeline. It is safe for
@@ -55,7 +64,8 @@ type DeployResult struct {
 //  4. build and start the candidate container (includes health check)
 //  5. promote the candidate route through Caddy
 //  6. persist deployment state (moves Current → Previous)
-//  7. remove the formerly-current container
+//  7. remove the formerly-current container (NON-FATAL: a
+//     cleanup failure here becomes a warning on the result)
 //
 // Failure semantics:
 //
@@ -68,12 +78,17 @@ type DeployResult struct {
 //     deployments, or RemovePromotion for first deployments.
 //   - Caddy recovery failure keeps the candidate container
 //     running (Caddy may still route to it) and the returned
-//     error preserves both the state-save failure and the Caddy
-//     recovery failure.
-//   - Candidate-cleanup failures are not silently swallowed:
-//     the returned error preserves ErrDeploymentFailed and
-//     includes the cleanup failure alongside the primary
-//     failure.
+//     error preserves ErrDeploymentFailed, the state-save
+//     failure, and the Caddy recovery failure as separate
+//     sentinels detectable with errors.Is.
+//   - Candidate-cleanup failures on failed deployment paths are
+//     NOT silently swallowed: the returned error preserves
+//     ErrDeploymentFailed and the primary and cleanup failures
+//     as separate sentinels detectable with errors.Is.
+//   - Old-container removal after successful state persistence
+//     is NON-FATAL: the deployment is already committed and
+//     live, so the failure is reported as a warning on the
+//     result (not an error).
 //   - Every post-failure cleanup runs under
 //     context.Background() plus a 10s timeout so a cancelled
 //     caller cannot strand the host with inconsistent state.
@@ -91,26 +106,42 @@ type deployDeps struct {
 	caddy  commandRunner
 }
 
-// deployError preserves ErrDeploymentFailed and an underlying
-// error (which may itself wrap a sentinel). Both errors.Is(err,
-// ErrDeploymentFailed) and errors.Is(err, underlyingSentinel) are
-// true. Go 1.19 does not support multiple %w, so we implement the
-// dual-sentinel semantics explicitly via the Is method.
+// deployError preserves ErrDeploymentFailed (always) and one or
+// more underlying errors (the primary and any cleanup or recovery
+// failures). errors.Is works for ErrDeploymentFailed AND for every
+// preserved underlying error, so callers can branch on any of
+// them. Go 1.19 does not support multiple %w, so we implement the
+// multi-sentinel semantics explicitly via the Is method and
+// Unwrap (returns the first secondary so the standard library
+// can walk the chain).
 type deployError struct {
-	primary   error
-	secondary error
-	message   string
+	primary     error
+	secondaries []error
+	message     string
 }
 
 func (e *deployError) Error() string { return e.message }
 
-func (e *deployError) Unwrap() error { return e.secondary }
+// Unwrap returns the first secondary so the standard library's
+// errors.Is and errors.Unwrap walk the chain in the natural way.
+// The Is method below gives callers access to every secondary.
+func (e *deployError) Unwrap() error {
+	if len(e.secondaries) > 0 {
+		return e.secondaries[0]
+	}
+	return nil
+}
 
 func (e *deployError) Is(target error) bool {
 	if target == e.primary {
 		return true
 	}
-	return errors.Is(e.secondary, target)
+	for _, secondary := range e.secondaries {
+		if errors.Is(secondary, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // validateDeployConfig validates the complete DeployConfig and the
@@ -133,121 +164,121 @@ func (e *deployError) Is(target error) bool {
 func validateDeployConfig(cfg DeployConfig, manifest Manifest) error {
 	if cfg.Source.RepositoryRoot == "" {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidDeployInput,
-			message:   "Source.RepositoryRoot is required",
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     "Source.RepositoryRoot is required",
 		}
 	}
 	if cfg.Source.OriginURL == "" {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidDeployInput,
-			message:   "Source.OriginURL is required",
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     "Source.OriginURL is required",
 		}
 	}
 	if cfg.Source.AllowedOrg == "" {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidDeployInput,
-			message:   "Source.AllowedOrg is required",
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     "Source.AllowedOrg is required",
 		}
 	}
 	if cfg.Runtime.PortRangeStart < 1024 || cfg.Runtime.PortRangeStart > 65535 {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidRuntimeConfig,
-			message:   fmt.Sprintf("Runtime.PortRangeStart %d not in [1024, 65535]", cfg.Runtime.PortRangeStart),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidRuntimeConfig},
+			message:     fmt.Sprintf("Runtime.PortRangeStart %d not in [1024, 65535]", cfg.Runtime.PortRangeStart),
 		}
 	}
 	if cfg.Runtime.PortRangeEnd < 1024 || cfg.Runtime.PortRangeEnd > 65535 {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidRuntimeConfig,
-			message:   fmt.Sprintf("Runtime.PortRangeEnd %d not in [1024, 65535]", cfg.Runtime.PortRangeEnd),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidRuntimeConfig},
+			message:     fmt.Sprintf("Runtime.PortRangeEnd %d not in [1024, 65535]", cfg.Runtime.PortRangeEnd),
 		}
 	}
 	if cfg.Runtime.PortRangeStart > cfg.Runtime.PortRangeEnd {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidRuntimeConfig,
-			message:   fmt.Sprintf("Runtime.PortRangeStart %d > PortRangeEnd %d", cfg.Runtime.PortRangeStart, cfg.Runtime.PortRangeEnd),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidRuntimeConfig},
+			message:     fmt.Sprintf("Runtime.PortRangeStart %d > PortRangeEnd %d", cfg.Runtime.PortRangeStart, cfg.Runtime.PortRangeEnd),
 		}
 	}
 	if cfg.Runtime.HealthTimeout <= 0 {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidRuntimeConfig,
-			message:   "Runtime.HealthTimeout must be positive",
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidRuntimeConfig},
+			message:     "Runtime.HealthTimeout must be positive",
 		}
 	}
 	if cfg.Runtime.RepositoryRoot == "" {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidRuntimeConfig,
-			message:   "Runtime.RepositoryRoot is required",
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidRuntimeConfig},
+			message:     "Runtime.RepositoryRoot is required",
 		}
 	}
 	if err := validateCaddyConfig(cfg.Caddy); err != nil {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: err,
-			message:   fmt.Sprintf("Caddy config: %v", err),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{err},
+			message:     fmt.Sprintf("Caddy config: %v", err),
 		}
 	}
 	if err := validateStateConfig(cfg.State); err != nil {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: err,
-			message:   fmt.Sprintf("State config: %v", err),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{err},
+			message:     fmt.Sprintf("State config: %v", err),
 		}
 	}
 	if cfg.Caddy.BaseDomain != cfg.State.BaseDomain {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidDeployInput,
-			message:   fmt.Sprintf("Caddy.BaseDomain %q != State.BaseDomain %q", cfg.Caddy.BaseDomain, cfg.State.BaseDomain),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     fmt.Sprintf("Caddy.BaseDomain %q != State.BaseDomain %q", cfg.Caddy.BaseDomain, cfg.State.BaseDomain),
 		}
 	}
 	if manifest.App == "" {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidDeployInput,
-			message:   "manifest app is required",
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     "manifest app is required",
 		}
 	}
 	if !appNameRe.MatchString(manifest.App) {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidDeployInput,
-			message:   fmt.Sprintf("manifest app %q does not match app-name format", manifest.App),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     fmt.Sprintf("manifest app %q does not match app-name format", manifest.App),
 		}
 	}
 	if manifest.Version != 1 {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidDeployInput,
-			message:   fmt.Sprintf("manifest version %d is not supported (only version 1)", manifest.Version),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     fmt.Sprintf("manifest version %d is not supported (only version 1)", manifest.Version),
 		}
 	}
 	if manifest.ContainerPort < 1024 || manifest.ContainerPort > 65535 {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidDeployInput,
-			message:   fmt.Sprintf("manifest container_port %d out of range [1024, 65535]", manifest.ContainerPort),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     fmt.Sprintf("manifest container_port %d out of range [1024, 65535]", manifest.ContainerPort),
 		}
 	}
 	if !strings.HasPrefix(manifest.HealthPath, "/") {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidDeployInput,
-			message:   fmt.Sprintf("manifest health_path %q must start with /", manifest.HealthPath),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     fmt.Sprintf("manifest health_path %q must start with /", manifest.HealthPath),
 		}
 	}
 	if strings.ContainsAny(manifest.HealthPath, "?#") {
 		return &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: ErrInvalidDeployInput,
-			message:   fmt.Sprintf("manifest health_path %q must not contain ? or #", manifest.HealthPath),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     fmt.Sprintf("manifest health_path %q must not contain ? or #", manifest.HealthPath),
 		}
 	}
 	return nil
@@ -265,9 +296,9 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 	existing, err := LoadDeploymentState(cfg.State, manifest.App)
 	if err != nil && !errors.Is(err, ErrDeploymentStateNotFound) {
 		return nil, &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: err,
-			message:   fmt.Sprintf("load existing state: %v", err),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{err},
+			message:     fmt.Sprintf("load existing state: %v", err),
 		}
 	}
 	var snapshotCurrent *Deployment
@@ -281,9 +312,9 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 	source, err := CheckoutSource(ctx, cfg.Source, cfg.Source.AllowedOrg, manifest.App, commit)
 	if err != nil {
 		return nil, &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: err,
-			message:   fmt.Sprintf("source checkout: %v", err),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{err},
+			message:     fmt.Sprintf("source checkout: %v", err),
 		}
 	}
 
@@ -293,9 +324,9 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 	candidate, err := startCandidate(ctx, cfg.Runtime, manifest, *source, deps.docker)
 	if err != nil {
 		return nil, &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: err,
-			message:   fmt.Sprintf("start candidate: %v", err),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{err},
+			message:     fmt.Sprintf("start candidate: %v", err),
 		}
 	}
 	createdContainer := candidate.ContainerName
@@ -310,9 +341,9 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 		removeErr := removeContainerForce(cleanupCtx, deps.docker, createdContainer)
 		cancel()
 		return nil, &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: err,
-			message:   fmt.Sprintf("promote: %v; cleanup: %v", err, removeErr),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{err, removeErr},
+			message:     fmt.Sprintf("promote: %v; cleanup: %v", err, removeErr),
 		}
 	}
 
@@ -356,9 +387,9 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 			// route. Return an error preserving ErrDeploymentFailed
 			// that includes both failures.
 			return nil, &deployError{
-				primary:   ErrDeploymentFailed,
-				secondary: saveErr,
-				message:   fmt.Sprintf("save state: %v; caddy recovery also failed: %v", saveErr, recoverErr),
+				primary:     ErrDeploymentFailed,
+				secondaries: []error{saveErr, recoverErr},
+				message:     fmt.Sprintf("save state: %v; caddy recovery also failed: %v", saveErr, recoverErr),
 			}
 		}
 		// Caddy recovery succeeded. Now (and only now) it is safe
@@ -367,34 +398,26 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 		removeErr := removeContainerForce(cleanupCtx, deps.docker, createdContainer)
 		if removeErr != nil {
 			return nil, &deployError{
-				primary:   ErrDeploymentFailed,
-				secondary: saveErr,
-				message:   fmt.Sprintf("save state: %v; candidate cleanup failed: %v", saveErr, removeErr),
+				primary:     ErrDeploymentFailed,
+				secondaries: []error{saveErr, removeErr},
+				message:     fmt.Sprintf("save state: %v; candidate cleanup failed: %v", saveErr, removeErr),
 			}
 		}
 		return nil, &deployError{
-			primary:   ErrDeploymentFailed,
-			secondary: saveErr,
-			message:   fmt.Sprintf("save state: %v", saveErr),
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{saveErr},
+			message:     fmt.Sprintf("save state: %v", saveErr),
 		}
 	}
 
 	// 7. Remove the formerly-current container. State is already
 	//    swapped (Current=new, Previous/old). Caddy is serving
-	//    the new route. A cleanup failure here is reported (not
-	//    silently swallowed) so the caller knows the old
-	//    container is still running but not routed.
-	if snapshotCurrent != nil {
-		if removeErr := removeContainerCandidate(ctx, *snapshotCurrent, manifest.HealthPath, deps.docker); removeErr != nil {
-			return nil, &deployError{
-				primary:   ErrDeploymentFailed,
-				secondary: removeErr,
-				message:   fmt.Sprintf("post-deploy cleanup of old container: %v", removeErr),
-			}
-		}
-	}
-
-	return &DeployResult{
+	//    the new route. A cleanup failure here is NON-FATAL: the
+	//    deployment is already committed and live, so the
+	//    failure is reported as a warning on the result (not an
+	//    error). This prevents an autonomous caller from
+	//    retrying a deployment that actually succeeded.
+	result := &DeployResult{
 		App:           dep.App,
 		Commit:        dep.Commit,
 		Image:         dep.Image,
@@ -405,5 +428,12 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 		Upstream:      dep.Upstream,
 		DeployedAt:    dep.DeployedAt,
 		StateFile:     filepath.Join(cfg.State.StateDir, dep.App+".state.json"),
-	}, nil
+	}
+	if snapshotCurrent != nil {
+		if removeErr := removeContainerCandidate(ctx, *snapshotCurrent, manifest.HealthPath, deps.docker); removeErr != nil {
+			result.Warnings = append(result.Warnings, fmt.Errorf("post-deploy cleanup of old container: %w", removeErr))
+		}
+	}
+
+	return result, nil
 }

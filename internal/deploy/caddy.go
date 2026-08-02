@@ -33,6 +33,41 @@ var (
 	ErrPromotionStillExists = errors.New("promotion config still exists")
 )
 
+// caddyCommandError preserves the Caddy-layer sentinel
+// (ErrCaddyValidateFailed or ErrCaddyReloadFailed), the underlying
+// runner error (cause), and an optional rollback reload error when
+// the recovery reload also failed. errors.Is works for the sentinel,
+// the cause, and the rollback (whichever is present), so callers
+// can branch on any of them. Go 1.19 does not support multiple %w
+// in fmt.Errorf, so we implement the multi-sentinel semantics
+// explicitly via the Is method.
+type caddyCommandError struct {
+	sentinel error
+	cause    error
+	rollback error
+	message  string
+}
+
+func (e *caddyCommandError) Error() string { return e.message }
+
+// Unwrap returns cause so the standard library's errors.Is walks
+// the chain naturally. The Is method below also checks the
+// sentinel and rollback so callers can errors.Is for any of them.
+func (e *caddyCommandError) Unwrap() error { return e.cause }
+
+func (e *caddyCommandError) Is(target error) bool {
+	if target == e.sentinel {
+		return true
+	}
+	if errors.Is(e.cause, target) {
+		return true
+	}
+	if e.rollback != nil && errors.Is(e.rollback, target) {
+		return true
+	}
+	return false
+}
+
 // hostPortRe matches a numeric port in [1, 65535].
 var hostPortRe = regexp.MustCompile(`^[1-9][0-9]{0,4}$`)
 
@@ -183,7 +218,11 @@ func promote(ctx context.Context, cfg CaddyConfig, candidate CandidateResult, ru
 			_ = os.Remove(configPath)
 		}
 		_ = os.Remove(tempPath)
-		return nil, fmt.Errorf("%w: caddy validate --config %s: %v", ErrCaddyValidateFailed, cfg.RootConfigPath, err)
+		return nil, &caddyCommandError{
+			sentinel: ErrCaddyValidateFailed,
+			cause:    err,
+			message:  fmt.Sprintf("caddy validate --config %s: %v", cfg.RootConfigPath, err),
+		}
 	}
 
 	// 5. Reload Caddy through the canonical root config. On
@@ -222,9 +261,18 @@ func promote(ctx context.Context, cfg CaddyConfig, candidate CandidateResult, ru
 		}
 		_ = os.Remove(tempPath)
 		if rollbackErr != nil {
-			return nil, fmt.Errorf("%w: caddy reload --config %s: %v; rollback reload also failed: %v", ErrCaddyReloadFailed, cfg.RootConfigPath, err, rollbackErr)
+			return nil, &caddyCommandError{
+				sentinel: ErrCaddyReloadFailed,
+				cause:    err,
+				rollback: rollbackErr,
+				message:  fmt.Sprintf("caddy reload --config %s: %v; rollback reload also failed: %v", cfg.RootConfigPath, err, rollbackErr),
+			}
 		}
-		return nil, fmt.Errorf("%w: caddy reload --config %s: %v", ErrCaddyReloadFailed, cfg.RootConfigPath, err)
+		return nil, &caddyCommandError{
+			sentinel: ErrCaddyReloadFailed,
+			cause:    err,
+			message:  fmt.Sprintf("caddy reload --config %s: %v", cfg.RootConfigPath, err),
+		}
 	}
 
 	// 6. On success, the backup is no longer needed. Removing it
@@ -304,7 +352,11 @@ func removePromotion(ctx context.Context, cfg CaddyConfig, app string, runner co
 	// 2. Validate the canonical root config without the fragment.
 	if _, err := runner.Run(ctx, binary, "validate", "--config", cfg.RootConfigPath); err != nil {
 		_ = os.Rename(backupPath, configPath) // restore
-		return fmt.Errorf("%w: caddy validate --config %s: %v", ErrCaddyValidateFailed, cfg.RootConfigPath, err)
+		return &caddyCommandError{
+			sentinel: ErrCaddyValidateFailed,
+			cause:    err,
+			message:  fmt.Sprintf("caddy validate --config %s: %v", cfg.RootConfigPath, err),
+		}
 	}
 
 	// 3. Reload the canonical root config so the route is gone from
@@ -329,9 +381,18 @@ func removePromotion(ctx context.Context, cfg CaddyConfig, app string, runner co
 			rollbackErr = fmt.Errorf("disk restore failed: %v", rerr)
 		}
 		if rollbackErr != nil {
-			return fmt.Errorf("%w: caddy reload --config %s: %v; rollback reload also failed: %v", ErrCaddyReloadFailed, cfg.RootConfigPath, err, rollbackErr)
+			return &caddyCommandError{
+				sentinel: ErrCaddyReloadFailed,
+				cause:    err,
+				rollback: rollbackErr,
+				message:  fmt.Sprintf("caddy reload --config %s: %v; rollback reload also failed: %v", cfg.RootConfigPath, err, rollbackErr),
+			}
 		}
-		return fmt.Errorf("%w: caddy reload --config %s: %v", ErrCaddyReloadFailed, cfg.RootConfigPath, err)
+		return &caddyCommandError{
+			sentinel: ErrCaddyReloadFailed,
+			cause:    err,
+			message:  fmt.Sprintf("caddy reload --config %s: %v", cfg.RootConfigPath, err),
+		}
 	}
 
 	// 4. On success the backup is no longer needed. Deleting it
