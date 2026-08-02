@@ -10,7 +10,17 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// recoveryReloadTimeout bounds the rollback reload that runs after
+// a failed primary reload. The rollback uses a fresh context
+// derived from context.Background() (not the caller's) so a
+// cancelled or expired caller context cannot prevent Caddy from
+// being restored to a consistent state. The timeout is generous
+// enough for a normal caddy reload but tight enough that a stuck
+// rollback does not block the caller indefinitely.
+const recoveryReloadTimeout = 10 * time.Second
 
 // Sentinel errors returned by the Caddy promotion layer.
 var (
@@ -184,19 +194,36 @@ func promote(ctx context.Context, cfg CaddyConfig, candidate CandidateResult, ru
 	//    state matches the restored disk state, then remove the
 	//    parked content. The parked content never became part of
 	//    the running config on the failure path.
+	//
+	//    The recovery reload uses a fresh bounded context
+	//    (context.Background() + recoveryReloadTimeout) so a
+	//    cancelled or expired caller context cannot prevent
+	//    Caddy from being restored to a consistent state. If the
+	//    recovery reload also fails, the returned error wraps
+	//    ErrCaddyReloadFailed and clearly reports that the
+	//    rollback reload also failed; a successful rollback is
+	//    not silently swallowed.
 	if _, err := runner.Run(ctx, binary, "reload", "--config", cfg.RootConfigPath); err != nil {
+		recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), recoveryReloadTimeout)
+		defer cancelRecovery()
 		_ = os.Rename(configPath, tempPath)
+		var rollbackErr error
 		if hadPrevious {
 			if rerr := os.Rename(backupPath, configPath); rerr == nil {
-				_, _ = runner.Run(ctx, binary, "reload", "--config", cfg.RootConfigPath)
+				_, rollbackErr = runner.Run(recoveryCtx, binary, "reload", "--config", cfg.RootConfigPath)
+			} else {
+				rollbackErr = fmt.Errorf("disk restore failed: %v", rerr)
 			}
 		} else {
 			// No previous fragment: after parking, configPath is
 			// gone, so a reload now sees the pre-promotion state
 			// (no route for this app).
-			_, _ = runner.Run(ctx, binary, "reload", "--config", cfg.RootConfigPath)
+			_, rollbackErr = runner.Run(recoveryCtx, binary, "reload", "--config", cfg.RootConfigPath)
 		}
 		_ = os.Remove(tempPath)
+		if rollbackErr != nil {
+			return nil, fmt.Errorf("%w: caddy reload --config %s: %v; rollback reload also failed: %v", ErrCaddyReloadFailed, cfg.RootConfigPath, err, rollbackErr)
+		}
 		return nil, fmt.Errorf("%w: caddy reload --config %s: %v", ErrCaddyReloadFailed, cfg.RootConfigPath, err)
 	}
 
@@ -275,9 +302,27 @@ func removePromotion(ctx context.Context, cfg CaddyConfig, app string, runner co
 	// 3. Reload the canonical root config so the route is gone from
 	//    running Caddy. On failure we restore the fragment and
 	//    best-effort reload so disk and running Caddy agree.
+	//
+	//    The recovery reload uses a fresh bounded context
+	//    (context.Background() + recoveryReloadTimeout) so a
+	//    cancelled or expired caller context cannot prevent
+	//    Caddy from being restored to a consistent state. If the
+	//    recovery reload also fails, the returned error wraps
+	//    ErrCaddyReloadFailed and clearly reports that the
+	//    rollback reload also failed; a successful rollback is
+	//    not silently swallowed.
 	if _, err := runner.Run(ctx, binary, "reload", "--config", cfg.RootConfigPath); err != nil {
-		_ = os.Rename(backupPath, configPath) // restore
-		_, _ = runner.Run(ctx, binary, "reload", "--config", cfg.RootConfigPath)
+		recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), recoveryReloadTimeout)
+		defer cancelRecovery()
+		var rollbackErr error
+		if rerr := os.Rename(backupPath, configPath); rerr == nil {
+			_, rollbackErr = runner.Run(recoveryCtx, binary, "reload", "--config", cfg.RootConfigPath)
+		} else {
+			rollbackErr = fmt.Errorf("disk restore failed: %v", rerr)
+		}
+		if rollbackErr != nil {
+			return fmt.Errorf("%w: caddy reload --config %s: %v; rollback reload also failed: %v", ErrCaddyReloadFailed, cfg.RootConfigPath, err, rollbackErr)
+		}
 		return fmt.Errorf("%w: caddy reload --config %s: %v", ErrCaddyReloadFailed, cfg.RootConfigPath, err)
 	}
 

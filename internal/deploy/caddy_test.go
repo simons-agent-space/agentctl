@@ -819,3 +819,159 @@ func TestRemovePromotion_BackupCleanupFailureNotAnError(t *testing.T) {
 		t.Errorf("backup should be a non-empty directory (un-removable), got mode %v", info.Mode())
 	}
 }
+
+// recoveryContextRunner wraps a fakeCaddyRunner and, on the
+// primary caddy reload call, cancels the caller's context and
+// returns an error (simulating a caller-context cancellation
+// during reload). On the recovery reload call it inspects the
+// context it was given and records whether that context is still
+// usable. This proves that the recovery reload receives a fresh
+// context (context.Background() + timeout), not the cancelled
+// caller context.
+type recoveryContextRunner struct {
+	inner  *fakeCaddyRunner
+	cancel context.CancelFunc
+	t      *testing.T
+
+	primaryReloadFailed  bool
+	recoveryReloadCalled bool
+	recoveryCtxErr       error
+}
+
+func (r *recoveryContextRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	if name == "caddy" && len(args) >= 1 && args[0] == "reload" {
+		if !r.primaryReloadFailed {
+			// Primary reload: cancel the caller's context so the
+			// caller's deadline is observed, then return an
+			// error. The recovery path must rebuild state with
+			// a fresh context.
+			r.primaryReloadFailed = true
+			r.cancel()
+			return "", errors.New("reload failed: caller context cancelled")
+		}
+		// Recovery reload: the context passed in MUST be a fresh
+		// bounded context, not the cancelled caller context.
+		r.recoveryReloadCalled = true
+		r.recoveryCtxErr = ctx.Err()
+		return "", nil // success
+	}
+	return r.inner.Run(ctx, name, args...)
+}
+
+// TestPromote_ReloadFailureUsesRecoveryContext proves that the
+// recovery reload after a failed primary reload runs under a
+// fresh bounded context, not the (cancelled) caller context.
+// The caller context is cancelled during the primary reload; the
+// recovery reload must still succeed because it uses an
+// independent context.
+func TestPromote_ReloadFailureUsesRecoveryContext(t *testing.T) {
+	cfg := defaultCaddyConfig(t)
+	commit := strings.Repeat("a", 40)
+	candidate := validCandidate("myapp", commit, 49152)
+	finalPath := filepath.Join(cfg.ConfigDir, "myapp.caddy")
+
+	previous := []byte("previous contents\n")
+	if err := os.WriteFile(finalPath, previous, 0o644); err != nil {
+		t.Fatalf("seed previous: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	inner := newFakeCaddyRunner(
+		fakeCaddyEntry{match: matchCaddy("validate", "--config", cfg.RootConfigPath), resp: caddyResponse{}},
+	)
+	runner := &recoveryContextRunner{
+		inner:  inner,
+		cancel: cancel,
+		t:      t,
+	}
+
+	_, err := promote(ctx, cfg, candidate, runner)
+	if !errors.Is(err, ErrCaddyReloadFailed) {
+		t.Fatalf("expected ErrCaddyReloadFailed, got %v", err)
+	}
+	// Rollback succeeded (recovery reload succeeded), so the
+	// message should attribute the failure to the primary
+	// reload only.
+	if strings.Contains(err.Error(), "rollback reload also failed") {
+		t.Errorf("rollback reload succeeded; error must not mention rollback failure: %v", err)
+	}
+
+	if !runner.primaryReloadFailed {
+		t.Errorf("primary reload was not invoked")
+	}
+	if !runner.recoveryReloadCalled {
+		t.Errorf("recovery reload was not invoked")
+	}
+	if runner.recoveryCtxErr != nil {
+		t.Errorf("recovery reload received a cancelled context: %v", runner.recoveryCtxErr)
+	}
+
+	// Final state: previous content restored, no .partial or .bak leftover.
+	got, err := os.ReadFile(finalPath)
+	if err != nil {
+		t.Fatalf("read final: %v", err)
+	}
+	if string(got) != string(previous) {
+		t.Errorf("previous config not restored on reload failure:\n--- got ---\n%s\n--- want ---\n%s", got, previous)
+	}
+	for _, p := range []string{finalPath + ".partial", finalPath + ".bak"} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("unexpected leftover %s: stat err = %v", p, err)
+		}
+	}
+}
+
+// TestRemovePromotion_ReloadFailureUsesRecoveryContext proves the
+// same property for the removal path: the recovery reload after a
+// failed primary reload uses a fresh bounded context, not the
+// (cancelled) caller context.
+func TestRemovePromotion_ReloadFailureUsesRecoveryContext(t *testing.T) {
+	cfg := defaultCaddyConfig(t)
+	configPath := filepath.Join(cfg.ConfigDir, "myapp.caddy")
+
+	previous := []byte("previous contents\n")
+	if err := os.WriteFile(configPath, previous, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	inner := newFakeCaddyRunner(
+		fakeCaddyEntry{match: matchCaddy("validate", "--config", cfg.RootConfigPath), resp: caddyResponse{}},
+	)
+	runner := &recoveryContextRunner{
+		inner:  inner,
+		cancel: cancel,
+		t:      t,
+	}
+
+	err := removePromotion(ctx, cfg, "myapp", runner)
+	if !errors.Is(err, ErrCaddyReloadFailed) {
+		t.Fatalf("expected ErrCaddyReloadFailed, got %v", err)
+	}
+	if strings.Contains(err.Error(), "rollback reload also failed") {
+		t.Errorf("rollback reload succeeded; error must not mention rollback failure: %v", err)
+	}
+
+	if !runner.primaryReloadFailed {
+		t.Errorf("primary reload was not invoked")
+	}
+	if !runner.recoveryReloadCalled {
+		t.Errorf("recovery reload was not invoked")
+	}
+	if runner.recoveryCtxErr != nil {
+		t.Errorf("recovery reload received a cancelled context: %v", runner.recoveryCtxErr)
+	}
+
+	// Final state: previous content restored.
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read final: %v", err)
+	}
+	if string(got) != string(previous) {
+		t.Errorf("fragment not restored on reload failure:\n--- got ---\n%s\n--- want ---\n%s", got, previous)
+	}
+}
