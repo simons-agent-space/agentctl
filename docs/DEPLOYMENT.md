@@ -615,3 +615,95 @@ Sentinel errors:
 - Rollback is not coupled to a specific source checkout; it
   uses the persisted `Deployment` record directly.
 - Other apps' state files are untouched.
+
+## Deployment orchestrator
+
+`Deploy` is the single entry point that runs the full deployment
+pipeline end-to-end on top of every lower layer: source checkout,
+candidate build/start/health-check, Caddy promotion, state
+persistence, and removal of the formerly-current container.
+
+### Flow
+
+1. `CheckoutSource` produces a detached worktree of the exact
+   merged commit.
+2. `startCandidate` builds the Docker image, runs the container
+   on a localhost-only port, and health-checks it.
+3. `promote` writes the new Caddy route and reloads Caddy
+   atomically (Caddy layer's own restore handles a failed reload).
+4. `SaveDeployment` persists state (Current → Previous, new →
+   Current).
+5. `removeCandidate` removes the formerly-current container
+   (best-effort).
+
+### Failure semantics
+
+The current live deployment is never touched before promotion
+and state persistence both succeed. On any failure, cleanup
+targets only resources created by THIS deployment (the candidate
+container, the new Caddy route). Caddy promotion failure is
+contained by the Caddy layer's own atomic restore. State-save
+failure triggers best-effort Caddy revert before cleanup. Every
+post-failure cleanup path runs under `context.Background()` with
+a 10-second timeout, never the caller context, so a cancelled
+caller cannot strand the host with inconsistent state.
+
+### API
+
+```go
+func Deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit string) (*DeployResult, error)
+
+type DeployConfig struct {
+    Source  SourceConfig
+    Runtime RuntimeConfig
+    Caddy   CaddyConfig
+    State   StateConfig
+}
+
+type DeployResult struct {
+    App, Commit, Image, ContainerName string
+    HostPort, ContainerPort           int
+    Hostname, Upstream                string
+    DeployedAt                        time.Time
+    StateFile                         string
+}
+```
+
+Sentinel errors:
+
+- `ErrDeploymentFailed` — wrapped around the underlying failure
+  (source checkout, candidate start/health, Caddy promotion, or
+  state save). `errors.Is(err, ErrDeploymentFailed)` is true for
+  every failed deploy.
+
+### Constraints
+
+- `Deploy` validates untrusted manifest input internally
+  (version, app, container port, health path) before any side
+  effect, so an autonomous caller does not have to pre-validate
+  the manifest to get a clear error.
+- The commit is re-validated by the source layer.
+- Retrying `Deploy` with the same commit is safe: a fresh deploy
+  attempt validates everything from scratch and leaves the host
+  in a consistent state on failure.
+- **Old-container removal after successful state persistence is
+  NON-FATAL**: a failure here surfaces as a warning on
+  `DeployResult.Warnings` (not as an error), so an autonomous
+  caller does not retry a deployment that actually succeeded.
+  Candidate-cleanup failures on *failed* deployment paths
+  remain fatal.
+- **Combined failures are preserved structurally**: when more
+  than one underlying failure occurs (e.g. state-save failure
+  AND Caddy-recovery failure, or state-save failure AND
+  candidate-cleanup failure), the returned `deployError`
+  preserves them as separate entries in `deployError.secondaries`
+  (for the Caddy layer, as `caddyCommandError.cause` /
+  `caddyCommandError.rollback`). Callers can detect every
+  underlying failure with `errors.Is`; `errors.Is(err,
+  ErrDeploymentFailed)` is always true. Go 1.19 has no
+  `errors.Join`, so the equivalent is each layer's multi-
+  sentinel `Is` method that walks the slice of preserved
+  errors.
+- HTTP handlers, Telegram approval, and systemd integration are
+  intentionally out of scope; this layer is the daemon's
+  building block.
