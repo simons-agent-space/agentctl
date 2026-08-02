@@ -334,16 +334,69 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 	// 5. Promote the candidate route through Caddy. The Caddy
 	//    layer handles its own atomic install + rollback on
 	//    reload failure; on a returned error the previous live
-	//    deployment is still serving. We still need to clean up
-	//    the candidate container we created.
+	//    deployment is still serving — but only if the Caddy
+	//    layer's rollback reload itself succeeded. promote() can
+	//    fail in two structurally different states:
+	//
+	//      (a) initial Caddy reload failed, but rollback reload
+	//          succeeded. Caddy's running configuration no longer
+	//          routes to the candidate. Safe to remove candidate.
+	//      (b) initial Caddy reload failed, AND rollback reload
+	//          also failed. Caddy's running configuration is
+	//          uncertain; the new route may still be live and
+	//          traffic may still be flowing to the candidate.
+	//          Removing the candidate in this state would turn a
+	//          recoverable partial failure into an outage, so we
+	//          deliberately keep it running.
+	//
+	//    Distinguish (a) from (b) via the caddyCommandError
+	//    returned by promote: its rollback field is nil when the
+	//    rollback reload succeeded and non-nil when it also
+	//    failed. Non-caddy errors (e.g. ErrInvalidCaddyConfig,
+	//    ErrInvalidCandidate, ErrAtomicWriteFailed, validate
+	//    failures) all leave Caddy in its pre-promotion state and
+	//    take the safe-to-remove path. errors.As returns false
+	//    for them, so rollbackFailed stays false.
 	if _, err := promote(ctx, cfg.Caddy, *candidate, deps.caddy); err != nil {
-		cleanupCtx, cancel := recoveryContext()
-		removeErr := removeContainerForce(cleanupCtx, deps.docker, createdContainer)
-		cancel()
+		var caddyErr *caddyCommandError
+		rollbackFailed := errors.As(err, &caddyErr) && caddyErr.rollback != nil
+
+		var removeErr error
+		if rollbackFailed {
+			// Caddy recovery failed. Keep the candidate container
+			// running so it remains routable if Caddy still has
+			// the new route loaded. The caller must investigate
+			// and clean up manually.
+		} else {
+			// Caddy recovered (no reload was attempted, or the
+			// rollback reload succeeded). It is safe to remove
+			// the candidate container; the previous deployment
+			// is still serving. The cleanup uses a fresh bounded
+			// recovery context so a cancelled caller cannot
+			// strand the host with a running candidate.
+			cleanupCtx, cancel := recoveryContext()
+			removeErr = removeContainerForce(cleanupCtx, deps.docker, createdContainer)
+			cancel()
+		}
+
+		// Build the returned error. primary is always
+		// ErrDeploymentFailed; secondaries carry the underlying
+		// promote error and (only when attempted) the cleanup
+		// error. Nil entries are dropped so callers never see
+		// "cleanup: <nil>" in the message or a spurious nil
+		// sentinel in secondaries.
+		secondaries := make([]error, 0, 2)
+		parts := make([]string, 0, 2)
+		secondaries = append(secondaries, err)
+		parts = append(parts, fmt.Sprintf("promote: %v", err))
+		if removeErr != nil {
+			secondaries = append(secondaries, removeErr)
+			parts = append(parts, fmt.Sprintf("cleanup: %v", removeErr))
+		}
 		return nil, &deployError{
 			primary:     ErrDeploymentFailed,
-			secondaries: []error{err, removeErr},
-			message:     fmt.Sprintf("promote: %v; cleanup: %v", err, removeErr),
+			secondaries: secondaries,
+			message:     strings.Join(parts, "; "),
 		}
 	}
 

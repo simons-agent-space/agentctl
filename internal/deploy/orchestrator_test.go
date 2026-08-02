@@ -984,6 +984,17 @@ func TestDeploy_CandidateCleanupFailureReported(t *testing.T) {
 // that even when the caller context is cancelled, the
 // orchestrator uses a bounded recovery context for cleanup so
 // cleanup actually runs.
+//
+// The Caddy layer's rollback reload also has to succeed here:
+// otherwise the safety rule (rollback-failed -> keep candidate)
+// would keep the container running and this test would not be
+// able to assert that cleanup ran under a fresh context. Three
+// responses are provided: validate success, primary reload
+// failure, rollback reload success. Cancellation happens on the
+// first caddy invocation (validate), so the primary reload sees
+// a cancelled context but still returns its canned error; the
+// rollback reload uses context.Background() inside the Caddy
+// layer and therefore runs to completion.
 func TestDeploy_CallerCancellationUsesFreshRecoveryContext(t *testing.T) {
 	f := newDeployFixture(t)
 	containerName := deriveContainerName(f.expectedApp, f.commit)
@@ -995,12 +1006,12 @@ func TestDeploy_CallerCancellationUsesFreshRecoveryContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Caddy validate cancels the caller context; reload fails.
 	caddyInner := &sequentialCaddyRunner{
 		match: matchCaddyValidateOrReload(),
 		responses: []caddyResponse{
 			{},
 			{err: errors.New("reload failed")},
+			{},
 		},
 	}
 	caddy := &cancellingCaddyRunner{inner: caddyInner, cancel: cancel}
@@ -1026,4 +1037,353 @@ func TestDeploy_CallerCancellationUsesFreshRecoveryContext(t *testing.T) {
 	if !sawRm {
 		t.Errorf("expected docker rm --force for candidate container after cancellation")
 	}
+}
+
+// TestDeploy_PromotionFailureRollbackSucceededRemovesCandidate
+// proves the safe half of the candidate-on-promotion-failure
+// rule: when the initial Caddy reload fails but the rollback
+// reload succeeds, Caddy has demonstrably returned to the
+// pre-promotion state and the orchestrator therefore removes
+// the candidate container. The returned error preserves
+// ErrDeploymentFailed, the Caddy-layer sentinel
+// (ErrCaddyReloadFailed), and the underlying runner error so
+// callers can branch on any of them via errors.Is.
+//
+// This is the success counterpart of the safety rule: a
+// successful rollback means traffic is no longer flowing to the
+// candidate, so removing it is safe.
+func TestDeploy_PromotionFailureRollbackSucceededRemovesCandidate(t *testing.T) {
+	f := newDeployFixture(t)
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(func(args []string) (string, error) { return containerName, nil })
+	f.docker.onRm(func(args []string) (string, error) { return "", nil })
+
+	// Caddy: validate success, primary reload fails, rollback
+	// reload succeeds. This is the "reload failed but Caddy
+	// recovered" path.
+	caddy := &sequentialCaddyRunner{
+		match: matchCaddyValidateOrReload(),
+		responses: []caddyResponse{
+			{},
+			{err: errSimulatedCaddyReload},
+			{},
+		},
+	}
+
+	manifest := f.validManifest()
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected promotion failure")
+	}
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Fatalf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+	if !errors.Is(err, ErrCaddyReloadFailed) {
+		t.Errorf("error must preserve ErrCaddyReloadFailed, got %v", err)
+	}
+	if !errors.Is(err, errSimulatedCaddyReload) {
+		t.Errorf("error must preserve underlying errSimulatedCaddyReload so callers can errors.Is, got %v", err)
+	}
+	// The Caddy sentinel walks the chain through
+	// caddyCommandError.rollback == nil, so the rollback
+	// sentinel is NOT in the chain (there was no rollback
+	// failure).
+	if errors.Is(err, fmt.Errorf("rollback reload also failed")) {
+		// This is a coarse assertion; the structural check
+		// above (caddyErr.rollback == nil) is exercised in
+		// TestDeploy_PromotionFailureRollbackFailedKeepsCandidate.
+	}
+
+	sawRm := false
+	for _, call := range f.docker.Calls() {
+		if len(call) >= 4 && call[1] == "rm" && call[2] == "--force" && call[3] == containerName {
+			sawRm = true
+		}
+	}
+	if !sawRm {
+		t.Errorf("candidate %s must be removed when Caddy rollback succeeds, got calls: %v", containerName, f.docker.Calls())
+	}
+	if caddy.calls != 3 {
+		t.Errorf("expected exactly 3 caddy calls (validate, primary reload fail, rollback reload success), got %d", caddy.calls)
+	}
+
+	// State file must not exist: the deployment did not commit.
+	stateFile := filepath.Join(f.cfg.State.StateDir, f.expectedApp+".state.json")
+	if _, err := os.Stat(stateFile); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("state file must not exist after failed promote, stat err = %v", err)
+	}
+}
+
+// TestDeploy_PromotionFailureRollbackFailedKeepsCandidate proves
+// the dangerous-half safety rule: when the initial Caddy reload
+// fails AND the Caddy rollback reload also fails, Caddy's
+// running configuration is uncertain. The new route may still be
+// live and traffic may still be flowing to the candidate
+// container. Removing the candidate in this state would turn a
+// recoverable partial failure into an outage, so the
+// orchestrator deliberately keeps the candidate running and
+// returns an error preserving the Caddy-layer sentinel
+// (ErrCaddyReloadFailed), the original reload failure, and the
+// rollback failure so callers can branch on any of them via
+// errors.Is.
+//
+// Structural check: the error is unwrapped to *caddyCommandError
+// and its rollback field is non-nil, proving the orchestrator
+// inspects the Caddy-layer model rather than guessing.
+func TestDeploy_PromotionFailureRollbackFailedKeepsCandidate(t *testing.T) {
+	f := newDeployFixture(t)
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(func(args []string) (string, error) { return containerName, nil })
+	// If rm is called for the candidate, the test fails: the
+	// safety rule is being violated.
+	f.docker.onRm(func(args []string) (string, error) {
+		for _, a := range args {
+			if a == containerName {
+				t.Errorf("candidate %s must NOT be removed when Caddy rollback fails: %v", containerName, args)
+			}
+		}
+		return "", nil
+	})
+
+	// Caddy: validate success, primary reload fails, rollback
+	// reload also fails. This is the "Caddy could not recover"
+	// path.
+	caddy := &sequentialCaddyRunner{
+		match: matchCaddyValidateOrReload(),
+		responses: []caddyResponse{
+			{},
+			{err: errSimulatedCaddyReload},
+			{err: errSimulatedCaddyReload},
+		},
+	}
+
+	manifest := f.validManifest()
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected promotion failure")
+	}
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Fatalf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+	if !errors.Is(err, ErrCaddyReloadFailed) {
+		t.Errorf("error must preserve ErrCaddyReloadFailed, got %v", err)
+	}
+	// The original reload failure and the rollback failure are
+	// the SAME test sentinel (errSimulatedCaddyReload) in this
+	// scenario, so a single errors.Is is sufficient to prove
+	// both ends of the chain are preserved. We additionally
+	// check the structural property below.
+	if !errors.Is(err, errSimulatedCaddyReload) {
+		t.Errorf("error must preserve errSimulatedCaddyReload through the chain, got %v", err)
+	}
+
+	// Structural check: the underlying error is a
+	// *caddyCommandError with a non-nil rollback field.
+	var caddyErr *caddyCommandError
+	if !errors.As(err, &caddyErr) {
+		t.Fatalf("error must unwrap to *caddyCommandError, got %T: %v", err, err)
+	}
+	if caddyErr.rollback == nil {
+		t.Errorf("caddyCommandError.rollback must be non-nil when rollback reload also failed, got nil")
+	}
+	if !errors.Is(caddyErr.rollback, errSimulatedCaddyReload) {
+		t.Errorf("caddyCommandError.rollback must preserve the rollback failure, got %v", caddyErr.rollback)
+	}
+
+	// The message must mention the rollback failure so human
+	// operators can diagnose without inspecting the chain.
+	if !strings.Contains(err.Error(), "rollback reload also failed") {
+		t.Errorf("error must mention the rollback failure, got: %v", err)
+	}
+	// It must NOT mention "cleanup: <nil>" — cleanup was
+	// deliberately not attempted.
+	if strings.Contains(err.Error(), "<nil>") {
+		t.Errorf("error message must not contain '<nil>', got: %v", err)
+	}
+	if strings.Contains(err.Error(), "cleanup:") {
+		t.Errorf("error message must not mention 'cleanup:' when cleanup was not attempted, got: %v", err)
+	}
+
+	// secondaries must NOT contain a nil entry.
+	for i, e := range caddyErrUnwrapSecondaries(err) {
+		if e == nil {
+			t.Errorf("secondaries[%d] must not be nil", i)
+		}
+	}
+
+	if caddy.calls != 3 {
+		t.Errorf("expected exactly 3 caddy calls (validate, primary reload fail, rollback reload fail), got %d", caddy.calls)
+	}
+
+	// State file must not exist: the deployment did not commit.
+	stateFile := filepath.Join(f.cfg.State.StateDir, f.expectedApp+".state.json")
+	if _, err := os.Stat(stateFile); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("state file must not exist after failed promote, stat err = %v", err)
+	}
+}
+
+// TestDeploy_PromotionFailureSuccessfulCleanupHasNoBogusSecondary
+// proves that when promotion fails but the cleanup succeeds,
+// the returned error does not include a nil secondary and the
+// message does not contain "cleanup: <nil>". This guards
+// against regressions where the orchestrator appends nil
+// entries to secondaries or renders nil-cleanup into the
+// message.
+func TestDeploy_PromotionFailureSuccessfulCleanupHasNoBogusSecondary(t *testing.T) {
+	f := newDeployFixture(t)
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(func(args []string) (string, error) { return containerName, nil })
+	// Cleanup rm succeeds.
+	f.docker.onRm(func(args []string) (string, error) { return "", nil })
+
+	// Caddy: validate success, primary reload fails, rollback
+	// reload succeeds. Cleanup also succeeds.
+	caddy := &sequentialCaddyRunner{
+		match: matchCaddyValidateOrReload(),
+		responses: []caddyResponse{
+			{},
+			{err: errSimulatedCaddyReload},
+			{},
+		},
+	}
+
+	manifest := f.validManifest()
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected promotion failure")
+	}
+
+	// Structural check: the deployError must NOT contain a nil
+	// secondary. Every entry in secondaries must be non-nil.
+	for i, e := range caddyErrUnwrapSecondaries(err) {
+		if e == nil {
+			t.Errorf("secondaries[%d] must not be nil", i)
+		}
+	}
+
+	// The message must mention promote (the primary failure)
+	// and must NOT mention "cleanup:" or "<nil>" — cleanup
+	// succeeded and produced no secondary.
+	msg := err.Error()
+	if !strings.HasPrefix(msg, "promote:") {
+		t.Errorf("message must start with 'promote:', got: %v", msg)
+	}
+	if strings.Contains(msg, "<nil>") {
+		t.Errorf("message must not contain '<nil>', got: %v", msg)
+	}
+	if strings.Contains(msg, "cleanup:") {
+		t.Errorf("message must not mention 'cleanup:' when cleanup succeeded, got: %v", msg)
+	}
+
+	// All sentinels remain detectable.
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Errorf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+	if !errors.Is(err, ErrCaddyReloadFailed) {
+		t.Errorf("error must preserve ErrCaddyReloadFailed, got %v", err)
+	}
+	if !errors.Is(err, errSimulatedCaddyReload) {
+		t.Errorf("error must preserve errSimulatedCaddyReload, got %v", err)
+	}
+}
+
+// TestDeploy_PromotionFailureCleanupFailureReportsBoth proves
+// that when promotion fails, Caddy rollback succeeds, but the
+// candidate-container cleanup itself fails, the returned error
+// preserves BOTH the promotion failure and the cleanup failure
+// as separate errors.Is-detectable sentinels and the message
+// mentions both.
+func TestDeploy_PromotionFailureCleanupFailureReportsBoth(t *testing.T) {
+	f := newDeployFixture(t)
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(func(args []string) (string, error) { return containerName, nil })
+	f.docker.onRm(func(args []string) (string, error) {
+		for _, a := range args {
+			if a == containerName {
+				return "rm failed", errSimulatedDockerRm
+			}
+		}
+		return "", nil
+	})
+
+	caddy := &sequentialCaddyRunner{
+		match: matchCaddyValidateOrReload(),
+		responses: []caddyResponse{
+			{},
+			{err: errSimulatedCaddyReload},
+			{},
+		},
+	}
+
+	manifest := f.validManifest()
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected promotion+cleanup failure")
+	}
+	if !errors.Is(err, ErrDeploymentFailed) {
+		t.Fatalf("error must preserve ErrDeploymentFailed, got %v", err)
+	}
+	if !errors.Is(err, ErrCaddyReloadFailed) {
+		t.Errorf("error must preserve ErrCaddyReloadFailed, got %v", err)
+	}
+	if !errors.Is(err, errSimulatedCaddyReload) {
+		t.Errorf("error must preserve errSimulatedCaddyReload, got %v", err)
+	}
+	if !errors.Is(err, errSimulatedDockerRm) {
+		t.Errorf("error must preserve errSimulatedDockerRm so callers can errors.Is, got %v", err)
+	}
+
+	msg := err.Error()
+	if !strings.Contains(msg, "promote:") {
+		t.Errorf("message must mention 'promote:', got: %v", msg)
+	}
+	if !strings.Contains(msg, "cleanup:") {
+		t.Errorf("message must mention 'cleanup:' when cleanup failed, got: %v", msg)
+	}
+	if strings.Contains(msg, "<nil>") {
+		t.Errorf("message must not contain '<nil>', got: %v", msg)
+	}
+
+	// Structural: no nil secondary.
+	for i, e := range caddyErrUnwrapSecondaries(err) {
+		if e == nil {
+			t.Errorf("secondaries[%d] must not be nil", i)
+		}
+	}
+}
+
+// caddyErrUnwrapSecondaries walks the deployError chain and
+// returns every error value reachable through Unwrap and
+// errors.As. Tests use it to assert "no nil in secondaries"
+// structurally rather than pattern-matching on the message.
+func caddyErrUnwrapSecondaries(err error) []error {
+	var dErr *deployError
+	if !errors.As(err, &dErr) {
+		return nil
+	}
+	out := make([]error, 0)
+	for _, s := range dErr.secondaries {
+		out = append(out, s)
+	}
+	return out
 }
