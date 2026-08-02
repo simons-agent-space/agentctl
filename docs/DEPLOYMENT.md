@@ -540,6 +540,78 @@ rather than silently succeeding.
 
 ### Out of scope
 
-This layer does not yet implement container or Caddy rollback
-orchestration. The state is the input to that layer; the layer
-itself comes next.
+Multi-replica routing, rate limiting, authentication middleware,
+and the final deployment orchestrator are out of scope for this
+layer. The state record is the input to those layers.
+
+## Rollback orchestration
+
+`RollbackDeployment` reverses the most recent promotion: it
+restores the `Previous` deployment as the live one and demotes
+the current deployment to `Previous`. Rollback is idempotent in
+the toggle sense — calling it twice swaps `Current` and `Previous`
+twice, ending where the first call started.
+
+### Flow
+
+1. Load state; require `Previous`. `ErrNoPreviousDeployment` is
+   returned when there is nothing to roll back to.
+2. Ensure the previous container is running and healthy. The
+   status is inspected via `docker inspect`; stopped containers
+   are started, absent containers are run fresh from the persisted
+   image. The image is not rebuilt or pulled — rollback restores
+   what promotion already deployed.
+3. Promote the previous route through the existing Caddy layer
+   via the same `Promote` path promotion uses.
+4. Only after a successful promotion: swap `Current` and
+   `Previous` in state and remove the formerly-current container.
+
+If any step before a successful promotion fails, nothing changes
+on disk or in Caddy and the current deployment keeps serving.
+If the state swap fails after promotion, `RollbackDeployment`
+best-effort reverts Caddy to the original current route using a
+bounded recovery context and reports the combined failure. If the
+final remove-current step fails, the rollback is considered
+successful (Caddy serves previous, state is swapped); the old
+container being still running is a minor issue callers can clean
+up later.
+
+### Bounded recovery contexts
+
+All post-failure cleanup (stopping the previous container we
+just started, reverting Caddy after a state-swap failure) runs
+under `context.Background()` with a 10-second timeout, never the
+caller's context. A cancelled or expired caller context cannot
+prevent the rollback layer from restoring disk and Caddy to a
+consistent state. This mirrors the Caddy layer's recovery-context
+pattern.
+
+### API
+
+```go
+func RollbackDeployment(ctx context.Context, cfg RollbackConfig) error
+
+type RollbackConfig struct {
+    App        string       // app to roll back
+    State      StateConfig
+    Runtime    RuntimeConfig
+    Caddy      CaddyConfig
+    HealthPath string       // for health-checking the previous container
+}
+```
+
+Sentinel errors:
+
+- `ErrNoPreviousDeployment` — state has no `Previous` to roll
+  back to.
+- `ErrRollbackFailed` — wrapped around the underlying failure
+  (load, container start, health check, Caddy promotion, state
+  swap, or Caddy revert).
+
+### Constraints
+
+- The image for the previous deployment must already exist
+  locally. Rollback does not build or pull.
+- Rollback is not coupled to a specific source checkout; it
+  uses the persisted `Deployment` record directly.
+- Other apps' state files are untouched.
