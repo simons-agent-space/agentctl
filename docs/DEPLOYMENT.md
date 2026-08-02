@@ -404,7 +404,116 @@ func RemovePromotion(ctx context.Context, cfg CaddyConfig, app string) error
 
 ### Out of scope
 
-This layer does not yet implement deployment state, rollback
+This layer does not yet implement container or Caddy rollback
 orchestration, multi-replica routing, rate limiting, authentication
 middleware, or the final deployment orchestrator. Those come in
 later layers.
+
+## Deployment state
+
+Once a route is promoted, `agentctld` records the deployment so a
+future layer can roll back to either the current or the previous
+build without re-deriving identity from the runtime or Caddy
+layers. State lives in a trusted host-side directory, one JSON
+file per app.
+
+### State directory
+
+`StateDir` is a trusted host path supplied by configuration. Each
+app's state is written to `<StateDir>/<app>.state.json`. The
+app-name regex (`^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])$`) gates the
+filename, so path traversal is rejected before disk is touched.
+
+### Schema
+
+The state file is a single JSON object:
+
+```
+type Deployment struct {
+    App           string    // matches app-name regex
+    Commit        string    // exactly 40 lowercase hex chars
+    Image         string    // "agentctl/<app>:<commit>"
+    ContainerName string    // "agentctl-<app>-<first-12-chars>"
+    HostPort      int       // in [1, 65535]
+    ContainerPort int       // in [1024, 65535]
+    Hostname      string    // "<app>.<BaseDomain>"
+    Upstream      string    // "127.0.0.1:<HostPort>"
+    DeployedAt    time.Time // RFC3339
+}
+
+type DeploymentState struct {
+    Version  int          // must equal 1
+    App      string       // must match the filename's app
+    Current  *Deployment
+    Previous *Deployment  // omitted when absent
+}
+```
+
+Only version 1 is written or accepted on read. Older or newer
+versions return `ErrUnsupportedStateVersion` so a future bump can
+migrate deliberately rather than silently misinterpret old data.
+
+### Identity validation
+
+Before any read, write, or delete, every identity field is
+re-derived and required to match exactly: `Image` must equal
+`deriveImage(App, Commit)`, `ContainerName` must equal
+`deriveContainerName(App, Commit)`, the commit must match the
+40-hex regex, the host port must be in `[1, 65535]`, and the
+container port must be in `[1024, 65535]`. Any mismatch returns
+`ErrInvalidDeploymentState`. This catches both fabricated writes
+and tampered reads.
+
+### Atomic write
+
+`SaveDeployment` writes the new state to a sibling temp file, calls
+`fsync` on the temp file, renames it into place over the existing
+file, and finally calls `fsync` on the parent directory. A reader
+that opens the state file at any instant sees either the full
+previous state or the full new state — never a partial write. The
+temp file is named `<file>.tmp` and is unlinked on any error so a
+failed save leaves no stale temp behind.
+
+### Symlink and path-traversal rejection
+
+`Lstat` is consulted before every read, write, and delete. If the
+state file is a symlink, the operation is rejected with
+`ErrSymlinkedStateFile` and the symlink target is left untouched
+(deletion must not follow symlinks). Path traversal is rejected at
+the app-name regex and again at the resolved-path check inside
+`stateFilePath` (defense in depth against a symlinked state
+directory).
+
+### API
+
+```go
+func SaveDeployment(dir string, dep Deployment) error
+func LoadDeploymentState(dir string, app string) (*DeploymentState, error)
+func DeleteDeploymentState(dir string, app string) error
+```
+
+`SaveDeployment` validates the supplied `Deployment`, refuses to
+write through a symlink, loads any existing state, moves the
+existing `Current` to `Previous`, installs the new `Current`, and
+writes atomically. A corrupt or fabricated existing state causes
+the save to fail rather than be silently overwritten — losing the
+previous deployment record is worse than refusing a save.
+
+`LoadDeploymentState` returns `ErrDeploymentStateNotFound` when no
+state file exists, `ErrCorruptDeploymentState` when the JSON is
+malformed, `ErrUnsupportedStateVersion` when the version field
+does not equal 1, `ErrSymlinkedStateFile` when the state file is a
+symlink, and `ErrInvalidDeploymentState` for any identity
+mismatch.
+
+`DeleteDeploymentState` is "safe" in three ways: the app name is
+validated against the app-name regex (no path traversal), the file
+is rejected if it is a symlink (the symlink target is left alone),
+and deleting an already-absent file returns
+`ErrDeploymentStateNotFound` rather than silently succeeding.
+
+### Out of scope
+
+This layer does not yet implement container or Caddy rollback
+orchestration. The state is the input to that layer; the layer
+itself comes next.
