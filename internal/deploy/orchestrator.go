@@ -23,6 +23,7 @@ type DeployConfig struct {
 	Runtime RuntimeConfig
 	Caddy   CaddyConfig
 	State   StateConfig
+	Data    DataConfig
 }
 
 // DeployResult is the outcome of a successful deployment.
@@ -253,11 +254,11 @@ func validateDeployConfig(cfg DeployConfig, manifest Manifest) error {
 			message:     fmt.Sprintf("manifest app %q does not match app-name format", manifest.App),
 		}
 	}
-	if manifest.Version != 1 {
+	if manifest.Version != 1 && manifest.Version != 2 {
 		return &deployError{
 			primary:     ErrDeploymentFailed,
 			secondaries: []error{ErrInvalidDeployInput},
-			message:     fmt.Sprintf("manifest version %d is not supported (only version 1)", manifest.Version),
+			message:     fmt.Sprintf("manifest version %d is not supported (only versions 1 and 2)", manifest.Version),
 		}
 	}
 	if manifest.ContainerPort < 1024 || manifest.ContainerPort > 65535 {
@@ -321,7 +322,7 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 	// 4. Build and start the candidate container (includes health
 	//    check). On health-check failure the candidate container
 	//    is removed (best-effort) before the error is returned.
-	candidate, err := startCandidate(ctx, cfg.Runtime, manifest, *source, deps.docker)
+	candidate, err := startCandidate(ctx, cfg.Runtime, cfg.Data, manifest, *source, deps.docker)
 	if err != nil {
 		return nil, &deployError{
 			primary:     ErrDeploymentFailed,
@@ -407,6 +408,7 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 	//    candidate container, and we must do so under a bounded
 	//    recovery context so a cancelled caller cannot prevent
 	//    the recovery.
+	mountData := manifest.Data != nil && manifest.Data.Mount
 	dep := Deployment{
 		App:           candidate.App,
 		Commit:        candidate.Commit,
@@ -417,6 +419,12 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 		Hostname:      candidate.App + "." + cfg.Caddy.BaseDomain,
 		Upstream:      fmt.Sprintf("127.0.0.1:%d", candidate.HostPort),
 		DeployedAt:    time.Now().UTC(),
+		MountData:     mountData,
+		// DataReadOnly is only meaningful when the deployment mounts
+		// the data directory. A manifest that sets read_only=true but
+		// mount=false is a no-op; normalizing to false here keeps the
+		// persisted state consistent with the actual runtime behaviour.
+		DataReadOnly: mountData && manifest.Data.ReadOnly,
 	}
 	saveErr := SaveDeployment(cfg.State, dep)
 	if saveErr != nil {

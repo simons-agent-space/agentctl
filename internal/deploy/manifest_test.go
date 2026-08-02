@@ -95,7 +95,7 @@ func TestValidate_Rejections(t *testing.T) {
 	}{
 		{"nil manifest", nil, "agentctl", "nil manifest"},
 		{"version 0", func(m *Manifest) { m.Version = 0 }, "agentctl", "unsupported version"},
-		{"version 2", func(m *Manifest) { m.Version = 2 }, "agentctl", "unsupported version"},
+		{"version 3", func(m *Manifest) { m.Version = 3 }, "agentctl", "unsupported version"},
 		{"version negative", func(m *Manifest) { m.Version = -1 }, "agentctl", "unsupported version"},
 		{"app starts with digit", func(m *Manifest) { m.App = "1agentctl" }, "agentctl", "app-name format"},
 		{"app starts with hyphen", func(m *Manifest) { m.App = "-agentctl" }, "agentctl", "app-name format"},
@@ -195,5 +195,104 @@ func TestValidate_AppNameFormatAppliesToExpectedRepo(t *testing.T) {
 	}
 	if err := Validate(m, "agentctl"); err != nil {
 		t.Errorf("agentctl should validate: %v", err)
+	}
+}
+
+func TestValidate_AcceptsVersion2WithoutData(t *testing.T) {
+	m := &Manifest{
+		Version:       2,
+		App:           "agentctl",
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
+	}
+	if err := Validate(m, "agentctl"); err != nil {
+		t.Errorf("version 2 without data should validate: %v", err)
+	}
+}
+
+func TestValidate_AcceptsVersion2WithDataMount(t *testing.T) {
+	cases := []struct {
+		name     string
+		mount    bool
+		readOnly bool
+	}{
+		{"mount rw", true, false},
+		{"mount ro", true, true},
+		{"no mount", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Manifest{
+				Version:       2,
+				App:           "agentctl",
+				ContainerPort: 8080,
+				HealthPath:    "/healthz",
+				Data:          &ManifestData{Mount: tc.mount, ReadOnly: tc.readOnly},
+			}
+			if err := Validate(m, "agentctl"); err != nil {
+				t.Errorf("version 2 with data %+v should validate: %v", tc, err)
+			}
+		})
+	}
+}
+
+func TestValidate_RejectsVersion1WithDataField(t *testing.T) {
+	m := &Manifest{
+		Version:       1,
+		App:           "agentctl",
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
+		Data:          &ManifestData{Mount: true},
+	}
+	err := Validate(m, "agentctl")
+	if err == nil {
+		t.Fatalf("expected error for version 1 with data field")
+	}
+	if !strings.Contains(err.Error(), "version 1") || !strings.Contains(err.Error(), "data") {
+		t.Errorf("expected error mentioning version 1 and data, got %q", err.Error())
+	}
+}
+
+func TestLoad_Version2WithoutData(t *testing.T) {
+	path := writeDeploy(t, `{"version":2,"app":"agentctl","container_port":8080,"health_path":"/healthz"}`)
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Version != 2 {
+		t.Errorf("Version = %d, want 2", got.Version)
+	}
+	if got.Data != nil {
+		t.Errorf("Data = %+v, want nil", got.Data)
+	}
+}
+
+func TestLoad_Version2WithData(t *testing.T) {
+	path := writeDeploy(t, `{"version":2,"app":"agentctl","container_port":8080,"health_path":"/healthz","data":{"mount":true,"read_only":true}}`)
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Data == nil {
+		t.Fatalf("Data = nil, want non-nil")
+	}
+	if !got.Data.Mount || !got.Data.ReadOnly {
+		t.Errorf("Data = %+v, want {mount:true, read_only:true}", got.Data)
+	}
+}
+
+func TestLoad_RejectsVersion1WithUnknownDataField(t *testing.T) {
+	// A v1 manifest with a "data" field must fail Load (unknown
+	// field) AND fail Validate (v1 + data is a contract change).
+	path := writeDeploy(t, `{"version":1,"app":"agentctl","container_port":8080,"health_path":"/healthz","data":{"mount":true}}`)
+	if _, err := Load(path); err == nil {
+		t.Fatalf("expected Load to reject unknown data field on version 1")
+	}
+}
+
+func TestLoad_RejectsUnknownFieldInData(t *testing.T) {
+	path := writeDeploy(t, `{"version":2,"app":"agentctl","container_port":8080,"health_path":"/healthz","data":{"mount":true,"host_path":"/etc"}}`)
+	if _, err := Load(path); err == nil {
+		t.Errorf("expected Load to reject unknown field inside data")
 	}
 }

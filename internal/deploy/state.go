@@ -42,6 +42,16 @@ type StateConfig struct {
 // Deployment captures the identity of one deployed instance. Every
 // field except DeployedAt is derived from validated inputs and the
 // fixed naming rules; callers cannot inject arbitrary names.
+//
+// MountData and DataReadOnly record whether this deployment mounted
+// the per-app persistent data directory and whether the in-container
+// mount was read-only. The fields are populated from the validated
+// manifest's optional "data" field at deploy time and are persisted
+// in the deployment state so a later rollback layer can re-apply
+// the same mount when it has to start the previous container from
+// its image. A deployment with MountData=false preserves no record
+// of the data layer at all (HostPath is derived, never persisted,
+// and the rollback container is started without a mount).
 type Deployment struct {
 	App           string    `json:"app"`
 	Commit        string    `json:"commit"`
@@ -52,6 +62,8 @@ type Deployment struct {
 	Hostname      string    `json:"hostname"`
 	Upstream      string    `json:"upstream"`
 	DeployedAt    time.Time `json:"deployed_at"`
+	MountData     bool      `json:"mount_data"`
+	DataReadOnly  bool      `json:"data_read_only,omitempty"`
 }
 
 // DeploymentState is the persisted record for a single app. Exactly
