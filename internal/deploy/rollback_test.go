@@ -147,12 +147,21 @@ type rollbackFixture struct {
 }
 
 func newRollbackFixture(t *testing.T) *rollbackFixture {
+	return newRollbackFixtureWithHealthHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+}
+
+// newRollbackFixtureWithHealthHandler is like newRollbackFixture
+// but lets the caller provide the HTTP handler used by the
+// health-check server. Tests use this to prove that rollback hits
+// the configured path (a strict handler returns 200 only for that
+// path).
+func newRollbackFixtureWithHealthHandler(t *testing.T, handler http.HandlerFunc) *rollbackFixture {
 	t.Helper()
 
-	// Health-check server: always returns 200.
-	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	// Health-check server driven by the caller-provided handler.
+	healthSrv := httptest.NewServer(handler)
 	t.Cleanup(healthSrv.Close)
 
 	stateDir := t.TempDir()
@@ -280,10 +289,15 @@ func dockerStopped(containerName string, startErr error) *fakeDockerRunner {
 
 // dockerAbsent returns a fakeDockerRunner that reports the named
 // container as absent and (optionally) fails or succeeds on
-// `docker run`.
+// `docker run`. The inspect response mirrors real docker: the
+// "No such object" string lands in the captured output (stderr
+// via CombinedOutput) and the command exits non-zero.
 func dockerAbsent(containerName string, runErr error) *fakeDockerRunner {
 	entries := []fakeDockerEntry{
-		{match: matchDockerInspect(containerName), resp: dockerResponse{out: "", err: errors.New("No such object")}},
+		{match: matchDockerInspect(containerName), resp: dockerResponse{
+			out: "Error: No such object: " + containerName,
+			err: errors.New("exit 1"),
+		}},
 	}
 	if runErr != nil {
 		entries = append(entries, fakeDockerEntry{
@@ -571,5 +585,198 @@ func TestRollbackDeployment_RequiresConfig(t *testing.T) {
 	bad.State.BaseDomain = "no-tld"
 	if err := rollbackDeployment(context.Background(), bad, rollbackDeps{docker: dockerRunning(f.previousContainerName), caddy: healthyCaddy(f.cfg.Caddy.RootConfigPath)}); !errors.Is(err, ErrRollbackFailed) {
 		t.Errorf("expected ErrRollbackFailed for invalid base domain, got %v", err)
+	}
+}
+
+// TestRollbackDeployment_HealthPathIsConfigured proves that
+// rollback hits the health path supplied via
+// RollbackConfig.HealthPath. A strict server returns 200 only
+// for /healthz; the test runs rollback twice — once with the
+// configured path matching /healthz (succeeds), once with a
+// non-matching path (fails the health check).
+func TestRollbackDeployment_HealthPathIsConfigured(t *testing.T) {
+	// Strict server: 200 only for "/healthz", 500 elsewhere.
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	f := newRollbackFixtureWithHealthHandler(t, handler)
+
+	// 1. Configured path matches the server's allowed path:
+	//    health check succeeds, but Caddy promotion fails so the
+	//    test still observes a clean ErrRollbackFailed path
+	//    without swapping state.
+	docker := dockerRunning(f.previousContainerName)
+	caddy := newFakeCaddyRunner(
+		fakeCaddyEntry{match: matchCaddy("validate", "--config", f.cfg.Caddy.RootConfigPath), resp: caddyResponse{}},
+		fakeCaddyEntry{match: matchCaddy("reload", "--config", f.cfg.Caddy.RootConfigPath), resp: caddyResponse{err: errors.New("reload failed")}},
+	)
+	if err := rollbackDeployment(context.Background(), f.cfg, rollbackDeps{docker: docker, caddy: caddy}); !errors.Is(err, ErrRollbackFailed) {
+		t.Errorf("expected ErrRollbackFailed for matching path (Caddy fails after health passes), got %v", err)
+	}
+
+	// 2. Configured path does NOT match the server's allowed
+	//    path: health check itself fails, before any Caddy call.
+	bad := f.cfg
+	bad.HealthPath = "/wrong"
+	docker2 := dockerRunning(f.previousContainerName)
+	caddy2 := healthyCaddy(f.cfg.Caddy.RootConfigPath)
+	err := rollbackDeployment(context.Background(), bad, rollbackDeps{docker: docker2, caddy: caddy2})
+	if !errors.Is(err, ErrRollbackFailed) {
+		t.Errorf("expected ErrRollbackFailed for non-matching health path, got %v", err)
+	}
+	// No Caddy call should have been made (health check failed first).
+	if calls := caddy2.Calls(); len(calls) != 0 {
+		t.Errorf("expected no Caddy calls for health-check failure, got %v", calls)
+	}
+}
+
+// TestRollbackDeployment_RestorePrevious_AlreadyRunning proves
+// that when the previous container was already running, a Caddy
+// promotion failure leaves it running — the rollback must never
+// remove a container it did not start.
+func TestRollbackDeployment_RestorePrevious_AlreadyRunning(t *testing.T) {
+	f := newRollbackFixture(t)
+
+	docker := dockerRunning(f.previousContainerName)
+	caddy := newFakeCaddyRunner(
+		fakeCaddyEntry{match: matchCaddy("validate", "--config", f.cfg.Caddy.RootConfigPath), resp: caddyResponse{}},
+		fakeCaddyEntry{match: matchCaddy("reload", "--config", f.cfg.Caddy.RootConfigPath), resp: caddyResponse{err: errors.New("reload failed")}},
+	)
+
+	err := rollbackDeployment(context.Background(), f.cfg, rollbackDeps{docker: docker, caddy: caddy})
+	if !errors.Is(err, ErrRollbackFailed) {
+		t.Fatalf("expected ErrRollbackFailed, got %v", err)
+	}
+
+	// No docker stop or rm call must reference the previous
+	// container — the rollback must not touch a container it
+	// did not start.
+	for _, call := range docker.Calls() {
+		if len(call) < 2 {
+			continue
+		}
+		if call[1] == "stop" && call[2] == f.previousContainerName {
+			t.Errorf("docker stop must not be called for an already-running previous container: %v", call)
+		}
+		if call[1] == "rm" && call[3] == f.previousContainerName {
+			t.Errorf("docker rm must not be called for an already-running previous container: %v", call)
+		}
+	}
+}
+
+// TestRollbackDeployment_RestorePrevious_StartedFromStopped
+// proves that when the previous container was stopped and the
+// rollback started it, a Caddy promotion failure stops it again
+// (rather than removing it), so the pre-rollback state is
+// preserved.
+func TestRollbackDeployment_RestorePrevious_StartedFromStopped(t *testing.T) {
+	f := newRollbackFixture(t)
+
+	docker := dockerStopped(f.previousContainerName, nil)
+	caddy := newFakeCaddyRunner(
+		fakeCaddyEntry{match: matchCaddy("validate", "--config", f.cfg.Caddy.RootConfigPath), resp: caddyResponse{}},
+		fakeCaddyEntry{match: matchCaddy("reload", "--config", f.cfg.Caddy.RootConfigPath), resp: caddyResponse{err: errors.New("reload failed")}},
+	)
+
+	err := rollbackDeployment(context.Background(), f.cfg, rollbackDeps{docker: docker, caddy: caddy})
+	if !errors.Is(err, ErrRollbackFailed) {
+		t.Fatalf("expected ErrRollbackFailed, got %v", err)
+	}
+
+	// The restore must call docker stop on the previous
+	// container (not docker rm --force), so the container is
+	// back to its pre-rollback stopped state.
+	sawStop := false
+	for _, call := range docker.Calls() {
+		if len(call) >= 3 && call[1] == "stop" && call[2] == f.previousContainerName {
+			sawStop = true
+		}
+		if len(call) >= 4 && call[1] == "rm" && call[2] == "--force" && call[3] == f.previousContainerName {
+			t.Errorf("docker rm --force must not be called when restoring a previously-stopped container: %v", call)
+		}
+	}
+	if !sawStop {
+		t.Errorf("expected docker stop for previous container %s after rollback failure", f.previousContainerName)
+	}
+}
+
+// TestRollbackDeployment_RestorePrevious_CreatedFromAbsent
+// proves that when the previous container did not exist and the
+// rollback created it, a Caddy promotion failure removes it, so
+// the pre-rollback absent state is preserved.
+func TestRollbackDeployment_RestorePrevious_CreatedFromAbsent(t *testing.T) {
+	f := newRollbackFixture(t)
+
+	docker := dockerAbsent(f.previousContainerName, nil)
+	caddy := newFakeCaddyRunner(
+		fakeCaddyEntry{match: matchCaddy("validate", "--config", f.cfg.Caddy.RootConfigPath), resp: caddyResponse{}},
+		fakeCaddyEntry{match: matchCaddy("reload", "--config", f.cfg.Caddy.RootConfigPath), resp: caddyResponse{err: errors.New("reload failed")}},
+	)
+
+	err := rollbackDeployment(context.Background(), f.cfg, rollbackDeps{docker: docker, caddy: caddy})
+	if !errors.Is(err, ErrRollbackFailed) {
+		t.Fatalf("expected ErrRollbackFailed, got %v", err)
+	}
+
+	// The restore must call docker rm --force on the previous
+	// container so the pre-rollback absent state is restored.
+	sawRm := false
+	for _, call := range docker.Calls() {
+		if len(call) >= 4 && call[1] == "rm" && call[2] == "--force" && call[3] == f.previousContainerName {
+			sawRm = true
+		}
+		if len(call) >= 3 && call[1] == "stop" && call[2] == f.previousContainerName {
+			t.Errorf("docker stop must not be called for a previously-absent container: %v", call)
+		}
+	}
+	if !sawRm {
+		t.Errorf("expected docker rm --force for previous container %s after rollback failure", f.previousContainerName)
+	}
+}
+
+// TestRollbackDeployment_StateSaveFailureRestoresPrevious proves
+// that when state save fails after a successful Caddy promotion,
+// rollback best-effort reverts Caddy AND restores the previous
+// container to its pre-rollback state.
+func TestRollbackDeployment_StateSaveFailureRestoresPrevious(t *testing.T) {
+	f := newRollbackFixture(t)
+
+	// Previous is stopped before rollback; rollback starts it.
+	docker := dockerStopped(f.previousContainerName, nil)
+	// Also register the post-swap rm for the current container
+	// (which won't run because state save fails first, but
+	// defensive against ordering changes).
+	currentContainer := f.current.ContainerName
+	docker.responses = append(docker.responses,
+		fakeDockerEntry{match: matchDockerRm(currentContainer), resp: dockerResponse{}},
+	)
+	caddy := healthyCaddy(f.cfg.Caddy.RootConfigPath)
+
+	// Make state dir read-only so SaveDeployment cannot write.
+	if err := os.Chmod(f.cfg.State.StateDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(f.cfg.State.StateDir, 0o755) })
+
+	err := rollbackDeployment(context.Background(), f.cfg, rollbackDeps{docker: docker, caddy: caddy})
+	if !errors.Is(err, ErrRollbackFailed) {
+		t.Fatalf("expected ErrRollbackFailed, got %v", err)
+	}
+
+	// The previous container must have been restored (docker
+	// stop), proving the state-save-failure cleanup path also
+	// restores the previous container.
+	sawStop := false
+	for _, call := range docker.Calls() {
+		if len(call) >= 3 && call[1] == "stop" && call[2] == f.previousContainerName {
+			sawStop = true
+		}
+	}
+	if !sawStop {
+		t.Errorf("expected docker stop for previous container %s after state-save failure", f.previousContainerName)
 	}
 }

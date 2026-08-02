@@ -97,18 +97,20 @@ func rollbackDeployment(ctx context.Context, cfg RollbackConfig, deps rollbackDe
 	previous := *state.Previous
 
 	// 1. Ensure previous container is running and healthy.
-	previousCandidate, err := ensurePreviousRunningAndHealthy(ctx, cfg.Runtime, previous, deps.docker)
+	previousCandidate, previousAction, err := ensurePreviousRunningAndHealthy(ctx, cfg.Runtime, previous, cfg.HealthPath, deps.docker)
 	if err != nil {
 		return fmt.Errorf("%w: ensure previous container: %v", ErrRollbackFailed, err)
 	}
 
 	// 2. Promote previous route through Caddy.
 	if _, err := promote(ctx, cfg.Caddy, *previousCandidate, deps.caddy); err != nil {
-		// Best-effort cleanup: if we started the container in
-		// this call, stop it so a subsequent rollback does not
-		// see a half-initialised container.
+		// Best-effort cleanup: restore the previous container's
+		// original runtime state so the rollback is transparent
+		// to the caller when promotion fails. Uses the bounded
+		// recovery context so a cancelled caller cannot prevent
+		// the restore.
 		cleanupCtx, cancel := recoveryContext()
-		_ = stopContainerBestEffort(cleanupCtx, deps.docker, previous.ContainerName)
+		restorePreviousContainer(cleanupCtx, deps.docker, previous.ContainerName, previousAction)
 		cancel()
 		return fmt.Errorf("%w: promote previous: %v", ErrRollbackFailed, err)
 	}
@@ -122,10 +124,20 @@ func rollbackDeployment(ctx context.Context, cfg RollbackConfig, deps rollbackDe
 		// Try to revert Caddy to the original current route so
 		// disk and Caddy agree again. Uses the bounded recovery
 		// context so a cancelled caller cannot prevent revert.
+		// After the revert (whether it succeeded or not), restore
+		// the previous container's original runtime state.
 		cleanupCtx, cancel := recoveryContext()
 		defer cancel()
 		currentCandidate := deploymentToCandidate(current, cfg.HealthPath)
-		if _, revertErr := promote(cleanupCtx, cfg.Caddy, currentCandidate, deps.caddy); revertErr != nil {
+		revertErr := error(nil)
+		if _, revertErr = promote(cleanupCtx, cfg.Caddy, currentCandidate, deps.caddy); revertErr != nil {
+			// Caddy revert failed: still restore the previous
+			// container so the rollback is transparent.
+		}
+		restoreCtx, cancelRestore := recoveryContext()
+		restorePreviousContainer(restoreCtx, deps.docker, previous.ContainerName, previousAction)
+		cancelRestore()
+		if revertErr != nil {
 			return fmt.Errorf("%w: save state: %v; caddy revert also failed: %v", ErrRollbackFailed, err, revertErr)
 		}
 		return fmt.Errorf("%w: save state: %v; caddy reverted", ErrRollbackFailed, err)
@@ -187,61 +199,106 @@ func deploymentToCandidate(dep Deployment, healthPath string) CandidateResult {
 // ensurePreviousRunningAndHealthy inspects the previous container
 // and, depending on its status, starts it (if stopped), runs it
 // fresh from the image (if absent), or leaves it alone (if already
-// running). It then health-checks the container on its recorded
-// localhost port. On health-check failure, if the container was
+// running). It then health-checks the container on the configured
+// health path. On health-check failure, if the container was
 // started in this call, it is removed (best-effort, bounded
 // cleanup context).
-func ensurePreviousRunningAndHealthy(ctx context.Context, cfg RuntimeConfig, dep Deployment, runner commandRunner) (*CandidateResult, error) {
+//
+// Returns the action taken on the container so rollback can
+// restore its original runtime state if a later step (Caddy
+// promotion, state save) fails.
+func ensurePreviousRunningAndHealthy(ctx context.Context, cfg RuntimeConfig, dep Deployment, healthPath string, runner commandRunner) (*CandidateResult, previousContainerAction, error) {
 	if !appNameRe.MatchString(dep.App) {
-		return nil, fmt.Errorf("%w: app %q does not match app-name format", ErrInvalidCandidate, dep.App)
+		return nil, previousContainerUntouched, fmt.Errorf("%w: app %q does not match app-name format", ErrInvalidCandidate, dep.App)
 	}
 	if !shaRe.MatchString(dep.Commit) {
-		return nil, fmt.Errorf("%w: commit %q is not exactly 40 lowercase hex characters", ErrInvalidCandidate, dep.Commit)
+		return nil, previousContainerUntouched, fmt.Errorf("%w: commit %q is not exactly 40 lowercase hex characters", ErrInvalidCandidate, dep.Commit)
 	}
 
-	candidate := deploymentToCandidate(dep, mustHealthPathForRuntime(cfg))
+	candidate := deploymentToCandidate(dep, healthPath)
 
 	status, err := inspectContainerStatus(ctx, runner, dep.ContainerName)
 	if err != nil {
-		return nil, err
+		return nil, previousContainerUntouched, err
 	}
 
+	var action previousContainerAction
 	switch status {
 	case containerStatusRunning:
 		// Already running; no docker call needed.
+		action = previousContainerUntouched
 	case containerStatusStopped:
 		out, runErr := runner.Run(ctx, "docker", "start", dep.ContainerName)
 		if runErr != nil {
-			return nil, fmt.Errorf("%w: start %s: %s: %v", ErrContainerStartFailed, dep.ContainerName, truncateForError(out), runErr)
+			return nil, previousContainerUntouched, fmt.Errorf("%w: start %s: %s: %v", ErrContainerStartFailed, dep.ContainerName, truncateForError(out), runErr)
 		}
+		action = previousContainerStarted
 	case containerStatusAbsent:
 		if err := runContainerFromImage(ctx, runner, dep); err != nil {
-			return nil, err
+			return nil, previousContainerUntouched, err
 		}
+		action = previousContainerCreated
 	default:
-		return nil, fmt.Errorf("%w: unknown container status %q for %s", ErrInvalidRuntimeConfig, status, dep.ContainerName)
+		return nil, previousContainerUntouched, fmt.Errorf("%w: unknown container status %q for %s", ErrInvalidRuntimeConfig, status, dep.ContainerName)
 	}
 
 	if err := pollHealth(ctx, candidate.HealthURL, cfg.HealthTimeout); err != nil {
-		if status != containerStatusRunning {
+		if action != previousContainerUntouched {
 			cleanupCtx, cancel := recoveryContext()
 			_ = removeContainerForce(cleanupCtx, runner, dep.ContainerName)
 			cancel()
 		}
-		return nil, fmt.Errorf("%w: %v", ErrHealthCheckFailed, err)
+		return nil, action, fmt.Errorf("%w: %v", ErrHealthCheckFailed, err)
 	}
 
-	return &candidate, nil
+	return &candidate, action, nil
 }
 
-// mustHealthPathForRuntime is a placeholder so ensurePreviousRunningAndHealthy
-// can build a HealthURL; the real health path is plumbed through
-// RollbackConfig.HealthPath, and the only caller that needs this
-// helper is the unit-test path that exercises the runtime helpers
-// directly. It is set to "/" by default; production callers must
-// use RollbackDeployment.
-func mustHealthPathForRuntime(_ RuntimeConfig) string {
-	return "/"
+// previousContainerAction records what ensurePreviousRunningAndHealthy
+// did to the previous container so a later failure can restore the
+// container's original runtime state.
+//
+//	previousContainerUntouched — the container was already running
+//	    before rollback began; rollback did not touch it. On a
+//	    later failure, leave the container running. Never remove.
+//	previousContainerStarted — the container was stopped before
+//	    rollback began; rollback called `docker start`. On a later
+//	    failure, call `docker stop` to put it back to stopped.
+//	previousContainerCreated — the container did not exist before
+//	    rollback began; rollback called `docker run`. On a later
+//	    failure, call `docker rm --force` to remove it.
+type previousContainerAction int
+
+const (
+	previousContainerUntouched previousContainerAction = iota
+	previousContainerStarted
+	previousContainerCreated
+)
+
+// restorePreviousContainer returns the previous container to the
+// runtime state it had before rollback began. It is best-effort
+// and uses the caller-supplied (bounded recovery) context so a
+// cancelled caller cannot prevent the restore.
+//
+// Restore semantics:
+//   - previousContainerUntouched: no docker call is made.
+//   - previousContainerStarted:   `docker stop` is called.
+//   - previousContainerCreated:   `docker rm --force` is called.
+func restorePreviousContainer(ctx context.Context, runner commandRunner, containerName string, action previousContainerAction) {
+	switch action {
+	case previousContainerUntouched:
+		return
+	case previousContainerStarted:
+		// Container was stopped before rollback; we started it.
+		// Stop it so the container exists but is stopped again.
+		_, _ = runner.Run(ctx, "docker", "stop", containerName)
+	case previousContainerCreated:
+		// Container did not exist before rollback; we created
+		// it. Remove it so the pre-rollback absent state is
+		// restored. Best-effort: "No such container" is
+		// tolerated by removeContainerForce.
+		_ = removeContainerForce(ctx, runner, containerName)
+	}
 }
 
 // runContainerFromImage runs a new container from the given
