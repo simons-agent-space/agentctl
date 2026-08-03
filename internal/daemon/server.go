@@ -33,6 +33,23 @@ var appNameRe = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])$`)
 // shaRe matches exactly 40 lowercase hexadecimal characters.
 var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
+// containerNameRe matches the derived Docker container name
+// format produced by deploy.deriveContainerName:
+// "agentctl-<app>-<12-lowercase-hex>" where <app> matches
+// appNameRe. The deploy layer always constructs the name from
+// validated inputs (trusted app name and SHA), so this regex is
+// defense-in-depth rather than a security boundary: it stops a
+// corrupted state file from being passed through to `docker
+// inspect` as a flag value.
+//
+// We deliberately do NOT reuse appNameRe here: the full
+// container name (54 chars for a 32-char app, 9 + 32 + 1 + 12)
+// exceeds appNameRe's 32-char limit, so the previous "validate
+// the container name with the app regex" check rejected every
+// real container and status returned "unknown" without ever
+// calling Docker.
+var containerNameRe = regexp.MustCompile(`^agentctl-[a-z](?:[a-z0-9-]{0,30}[a-z0-9])-[0-9a-f]{12}$`)
+
 // Default socket permissions. Mode 0660 keeps the daemon
 // reachable by the daemon process group while excluding "other".
 // The group is supplied via configuration and resolved to a GID
@@ -209,8 +226,14 @@ type dockerRunner interface {
 type execDockerRunner struct{}
 
 func (execDockerRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	// CombinedOutput (not Output) is required so stderr is
+	// captured alongside stdout. Docker writes the "No such
+	// container" / "No such object" message to stderr;
+	// inspectContainerStatus classifies those messages as
+	// "absent", so dropping stderr would cause absent
+	// containers to be reported as "unknown".
 	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
@@ -1201,9 +1224,18 @@ var errContainerAbsent = errors.New("container is absent")
 // maps the output to a short status string. "No such container"
 // / "No such object" is mapped to errContainerAbsent so callers
 // can distinguish "absent" from a real inspect failure.
+//
+// containerName must match the derived format produced by
+// deploy.deriveContainerName (agentctl-<app>-<12-hex>); the
+// daemon-side containerNameRe enforces this as
+// defense-in-depth so a corrupted state file cannot be passed
+// to `docker inspect` as a flag value. The previous check used
+// the app-name regex and rejected every real container because
+// the full name (54 chars for a 32-char app) exceeds the app
+// regex's 32-char limit.
 func inspectContainerStatus(ctx context.Context, runner dockerRunner, containerName string) (string, error) {
-	if !appNameRe.MatchString(containerName) {
-		return "unknown", fmt.Errorf("container name %q is not a valid app name", containerName)
+	if !containerNameRe.MatchString(containerName) {
+		return "unknown", fmt.Errorf("container name %q does not match the derived container-name format", containerName)
 	}
 	out, err := runner.Run(ctx, "docker", "inspect", "--format", "{{.State.Running}}", containerName)
 	if err != nil {

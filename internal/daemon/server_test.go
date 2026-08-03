@@ -878,6 +878,164 @@ func (s *slowFakeDeployer) Rollback(ctx context.Context, _ deploy.RollbackConfig
 	}
 }
 
+// TestInspectContainerStatus_Accepts32CharAppContainerName is the
+// regression test for the "32-char app container name rejected by
+// the app-name regex" bug. The previous implementation validated
+// the derived container name (e.g. "agentctl-<32-char-app>-<12-hex>",
+// 54 chars total) against the app-name regex which is bounded to
+// 32 chars. A valid app at the regex's length limit produced a
+// container name that never matched, so status returned "unknown"
+// without ever calling Docker.
+//
+// We construct a 32-char app (the longest the app regex allows),
+// derive the container name with deriveContainerName-equivalent
+// formatting, and assert inspectContainerStatus accepts it and
+// passes it through to the runner. A sanity check at the top of
+// the test verifies the container name does NOT match appNameRe,
+// so a regression that re-introduces the wrong regex would be
+// caught immediately.
+func TestInspectContainerStatus_Accepts32CharAppContainerName(t *testing.T) {
+	app := "a" + strings.Repeat("b", 30) + "c" // 32 chars total
+	if len(app) != 32 {
+		t.Fatalf("test setup: app length = %d, want 32", len(app))
+	}
+	if !appNameRe.MatchString(app) {
+		t.Fatalf("test setup: app %q does not match appNameRe", app)
+	}
+	sha12 := strings.Repeat("d", 12)
+	container := "agentctl-" + app + "-" + sha12
+	// Sanity: appNameRe would have rejected this name, so the
+	// test would have failed under the previous implementation.
+	if appNameRe.MatchString(container) {
+		t.Fatalf("test setup: container %q unexpectedly matches appNameRe (test would not catch the regression)", container)
+	}
+
+	runner := &scriptedDockerRunner{out: "true\n", err: nil}
+	status, err := inspectContainerStatus(context.Background(), runner, container)
+	if err != nil {
+		t.Fatalf("inspectContainerStatus: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("status = %q, want running", status)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runner calls = %d, want 1", len(runner.calls))
+	}
+	if got := runner.calls[0].name; got != "docker" {
+		t.Errorf("call name = %q, want docker", got)
+	}
+	if got := runner.calls[0].args[len(runner.calls[0].args)-1]; got != container {
+		t.Errorf("docker inspect last arg = %q, want %q", got, container)
+	}
+}
+
+// TestInspectContainerStatus_NoSuchObjectOnStderrIsAbsent is the
+// regression test for the "absent container reported as unknown"
+// bug. Docker writes "No such container" / "No such object" to
+// stderr when the target container does not exist; the previous
+// execDockerRunner used cmd.Output() which only captures stdout,
+// so inspectContainerStatus fell through to the generic "unknown"
+// branch. execDockerRunner now uses cmd.CombinedOutput(); this test
+// models that combined-output behaviour with a fake runner and
+// asserts the classification branch is reached.
+//
+// This test exercises inspectContainerStatus's classification
+// logic only. The execDockerRunner change itself is covered by
+// TestExecDockerRunner_CombinedOutputCapturesStderr below, which
+// runs the real runner against a shell script that writes to
+// stderr.
+func TestInspectContainerStatus_NoSuchObjectOnStderrIsAbsent(t *testing.T) {
+	container := "agentctl-myapp-1234567890ab"
+	combined := "Error response from daemon: No such object: " + container + "\n"
+
+	runner := &scriptedDockerRunner{out: combined, err: fmt.Errorf("exit status 1")}
+	status, err := inspectContainerStatus(context.Background(), runner, container)
+	if !errors.Is(err, errContainerAbsent) {
+		t.Fatalf("err = %v, want errors.Is(err, errContainerAbsent)", err)
+	}
+	if status != "absent" {
+		t.Fatalf("status = %q, want absent", status)
+	}
+}
+
+// TestExecDockerRunner_CombinedOutputCapturesStderr runs the real
+// execDockerRunner against a shell script that writes the
+// "No such object" message to stderr and exits non-zero, then
+// asserts the message is present in the returned string. This
+// guards the Output-vs-CombinedOutput change: a regression that
+// reverts to cmd.Output() would cause this test to fail because
+// stderr would be dropped.
+func TestExecDockerRunner_CombinedOutputCapturesStderr(t *testing.T) {
+	// The fake binary must live on a filesystem that allows
+	// exec. execTempDir prefers the sandbox's GOTMPDIR
+	// (/workspace/.gotmp) when present and falls back to
+	// os.TempDir() (/tmp on a normal Linux runner) so the test
+	// works in both the development sandbox (where /tmp is
+	// mounted noexec) and the GitHub Actions CI runner (where
+	// /workspace does not exist).
+	fakeDir, err := os.MkdirTemp(execTempDir(t), "fake-docker-")
+	if err != nil {
+		t.Fatalf("mkdir fake docker dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(fakeDir) })
+
+	script := "#!/bin/sh\n" +
+		"echo 'Error response from daemon: No such object: agentctl-x-1234567890ab' >&2\n" +
+		"exit 1\n"
+	binPath := filepath.Join(fakeDir, "docker")
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake docker: %v", err)
+	}
+
+	runner := execDockerRunner{}
+	out, err := runner.Run(context.Background(), binPath, "inspect", "--format", "{{.State.Running}}", "agentctl-x-1234567890ab")
+	if err == nil {
+		t.Fatalf("Run: err = nil, want non-nil (script exits 1)")
+	}
+	if !strings.Contains(out, "No such object") {
+		t.Fatalf("out = %q, want contains 'No such object' (proves CombinedOutput captures stderr)", out)
+	}
+}
+
+// execTempDir returns a temp directory on a filesystem that
+// permits exec. On a typical Linux runner os.TempDir() (i.e.
+// /tmp) is fine, but the development sandbox mounts /tmp with
+// noexec. The helper prefers /workspace/.gotmp when it exists
+// so tests that exec a script from a temp file stay portable
+// across the sandbox and CI.
+//
+// Tests must use this helper instead of hardcoding /workspace/.gotmp
+// or relying on t.TempDir()'s default of /tmp; the former does
+// not exist on CI and the latter is noexec in the sandbox.
+func execTempDir(t *testing.T) string {
+	t.Helper()
+	if info, err := os.Stat("/workspace/.gotmp"); err == nil && info.IsDir() {
+		return "/workspace/.gotmp"
+	}
+	return os.TempDir()
+}
+
+// scriptedDockerRunner is the dockerRunner fake used by status
+// tests that need to assert on what inspectContainerStatus passed
+// to docker and what docker returned. It records every call and
+// returns the configured (out, err) verbatim, so callers can
+// model both success and failure responses.
+type scriptedDockerRunner struct {
+	out   string
+	err   error
+	calls []scriptedDockerCall
+}
+
+type scriptedDockerCall struct {
+	name string
+	args []string
+}
+
+func (r *scriptedDockerRunner) Run(_ context.Context, name string, args ...string) (string, error) {
+	r.calls = append(r.calls, scriptedDockerCall{name: name, args: append([]string(nil), args...)})
+	return r.out, r.err
+}
+
 // TestListenAndServe_ShutdownWaitsForActiveDeploy is the
 // regression test for the "30-second Shutdown timeout cuts off
 // in-flight deploys" bug. With the previous fixed-30s shutdown
