@@ -4,6 +4,10 @@ gitbridge is a small Go binary that brokers GitHub App installation tokens
 over a Unix domain socket. It runs on a host that is more trusted than the
 agent sandbox; the sandbox talks to it via the socket, never over the network.
 
+For the host-side deployment control plane (the companion service that
+drives application deploys, inspects state, and rolls back managed apps),
+see [`AGENTCTLD_INSTALL.md`](AGENTCTLD_INSTALL.md).
+
 ## Build
 
 The repository uses Go 1.19+ and has no third-party dependencies.
