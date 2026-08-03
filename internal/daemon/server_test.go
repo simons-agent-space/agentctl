@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -136,6 +137,204 @@ func TestPrepareSocket_RefusesRegularFile(t *testing.T) {
 		t.Fatalf("regular file was removed despite refusal (stat err=%v)", statErr)
 	}
 }
+
+// TestPrepareSocket_ProbeTimeoutLeavesSocketUntouched verifies
+// that a dial timeout during the stale-socket probe is surfaced
+// as an error and the socket file is left in place. A naive
+// "any error means stale" implementation would unlink the socket
+// of a live but slow listener; that race can disconnect clients
+// of a running daemon, so we deliberately fail startup instead.
+func TestPrepareSocket_ProbeTimeoutLeavesSocketUntouched(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "slow.sock")
+
+	// Seed a real socket file so the lstat passes and the probe
+	// path is exercised. We use syscall.Mknod with S_IFSOCK
+	// because on Linux closing a bound listener removes the
+	// pathname from the filesystem, which would let prepareSocket
+	// short-circuit through the ErrNotExist path and never call
+	// the dialer.
+	if err := syscall.Mknod(path, syscall.S_IFSOCK|0o600, 0); err != nil {
+		t.Fatalf("mknod socket: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+
+	orig := dialUnixSocket
+	dialUnixSocket = func(_ string, _ time.Duration) (net.Conn, error) {
+		return nil, &net.OpError{
+			Op:  "dial",
+			Net: "unix",
+			Err: &syntheticTimeout{msg: "i/o timeout"},
+		}
+	}
+	t.Cleanup(func() { dialUnixSocket = orig })
+
+	err := prepareSocket(path, 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("prepareSocket on probe timeout: want error, got nil")
+	}
+	if errors.Is(err, ErrSocketInUse) {
+		t.Fatalf("prepareSocket on probe timeout: got ErrSocketInUse, want probe error (err=%v)", err)
+	}
+	if !strings.Contains(err.Error(), "probe socket") {
+		t.Errorf("error %q does not advertise probe failure", err.Error())
+	}
+	if _, statErr := os.Lstat(path); statErr != nil {
+		t.Fatalf("socket file was removed on probe timeout: stat err=%v", statErr)
+	}
+}
+
+// TestPrepareSocket_UnexpectedProbeErrorLeavesSocketUntouched
+// verifies that any dial error other than ECONNREFUSED is
+// preserved and the socket file is left untouched. Permission
+// errors, resource exhaustion, and unrecognised transport
+// failures are all "unknown" outcomes: removing the socket would
+// be guessing, and guessing wrong takes down a live daemon.
+func TestPrepareSocket_UnexpectedProbeErrorLeavesSocketUntouched(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "weird.sock")
+
+	if err := syscall.Mknod(path, syscall.S_IFSOCK|0o600, 0); err != nil {
+		t.Fatalf("mknod socket: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+
+	orig := dialUnixSocket
+	dialUnixSocket = func(_ string, _ time.Duration) (net.Conn, error) {
+		return nil, &net.OpError{
+			Op:  "dial",
+			Net: "unix",
+			Err: errors.New("synthetic EACCES: permission denied"),
+		}
+	}
+	t.Cleanup(func() { dialUnixSocket = orig })
+
+	err := prepareSocket(path, 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("prepareSocket on unexpected probe error: want error, got nil")
+	}
+	if errors.Is(err, ErrSocketInUse) {
+		t.Fatalf("prepareSocket on unexpected probe error: got ErrSocketInUse, want probe error (err=%v)", err)
+	}
+	if !strings.Contains(err.Error(), "probe socket") {
+		t.Errorf("error %q does not advertise probe failure", err.Error())
+	}
+	if _, statErr := os.Lstat(path); statErr != nil {
+		t.Fatalf("socket file was removed on unexpected probe error: stat err=%v", statErr)
+	}
+}
+
+// TestPrepareSocket_StaleSocketRemoved is the end-to-end
+// "stale socket with connection refused" test: a socket file
+// exists but nothing is listening, the probe returns
+// ECONNREFUSED, and prepareSocket removes the file. We use
+// syscall.Mknod with S_IFSOCK to create a real socket inode
+// without binding it (closing a bound listener would unlink
+// the pathname on Linux and bypass the probe).
+func TestPrepareSocket_StaleSocketRemoved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "leftover.sock")
+
+	if err := syscall.Mknod(path, syscall.S_IFSOCK|0o600, 0); err != nil {
+		t.Fatalf("mknod socket: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+
+	if err := prepareSocket(path, 200*time.Millisecond); err != nil {
+		t.Fatalf("prepareSocket on stale socket: %v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected stale socket file to be gone, got err=%v", err)
+	}
+}
+
+// TestProbeSocket_Direct exercises the three-way classification
+// directly so a regression in probeSocket is caught without
+// having to reason about prepareSocket's wrapper. It uses the
+// dialUnixSocket hook to inject every outcome without depending
+// on kernel-level listen backlog behaviour.
+func TestProbeSocket_Direct(t *testing.T) {
+	t.Run("active listener", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "live.sock")
+		l, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatalf("seed listen: %v", err)
+		}
+		t.Cleanup(func() { _ = l.Close() })
+
+		stale, err := probeSocket(path, 200*time.Millisecond)
+		if err != nil {
+			t.Fatalf("probeSocket on live listener: %v", err)
+		}
+		if stale {
+			t.Fatalf("probeSocket on live listener: stale=true, want false")
+		}
+	})
+	t.Run("stale socket returns ECONNREFUSED", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "leftover.sock")
+		if err := syscall.Mknod(path, syscall.S_IFSOCK|0o600, 0); err != nil {
+			t.Fatalf("mknod socket: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Remove(path) })
+
+		stale, err := probeSocket(path, 200*time.Millisecond)
+		if err != nil {
+			t.Fatalf("probeSocket on stale socket: %v", err)
+		}
+		if !stale {
+			t.Fatalf("probeSocket on stale socket: stale=false, want true")
+		}
+	})
+	t.Run("timeout preserves error", func(t *testing.T) {
+		orig := dialUnixSocket
+		dialUnixSocket = func(_ string, _ time.Duration) (net.Conn, error) {
+			return nil, &net.OpError{
+				Op:  "dial",
+				Net: "unix",
+				Err: &syntheticTimeout{msg: "i/o timeout"},
+			}
+		}
+		t.Cleanup(func() { dialUnixSocket = orig })
+
+		stale, err := probeSocket("/tmp/whatever.sock", 50*time.Millisecond)
+		if stale {
+			t.Fatalf("probeSocket on timeout: stale=true, want false")
+		}
+		if err == nil {
+			t.Fatal("probeSocket on timeout: err=nil, want timeout error")
+		}
+	})
+	t.Run("unexpected error preserves error", func(t *testing.T) {
+		synthetic := errors.New("synthetic EACCES")
+		orig := dialUnixSocket
+		dialUnixSocket = func(_ string, _ time.Duration) (net.Conn, error) {
+			return nil, &net.OpError{Op: "dial", Net: "unix", Err: synthetic}
+		}
+		t.Cleanup(func() { dialUnixSocket = orig })
+
+		stale, err := probeSocket("/tmp/whatever.sock", 50*time.Millisecond)
+		if stale {
+			t.Fatalf("probeSocket on unexpected error: stale=true, want false")
+		}
+		if err == nil {
+			t.Fatal("probeSocket on unexpected error: err=nil, want error")
+		}
+		if !errors.Is(err, synthetic) {
+			t.Errorf("probeSocket on unexpected error: err=%v, want errors.Is match", err)
+		}
+	})
+}
+
+// syntheticTimeout satisfies net.Error with Timeout()=true so the
+// test errors look like the real "i/o timeout" callers see on a
+// saturate-the-backlog probe.
+type syntheticTimeout struct{ msg string }
+
+func (e *syntheticTimeout) Error() string   { return e.msg }
+func (e *syntheticTimeout) Timeout() bool   { return true }
+func (e *syntheticTimeout) Temporary() bool { return true }
 
 // TestRequireSocketParent_Missing verifies the helper rejects a
 // configuration whose socket parent does not exist.
@@ -403,7 +602,8 @@ func TestConfig_WriteTimeout(t *testing.T) {
 		}
 	})
 	t.Run("explicit margin applied", func(t *testing.T) {
-		cfg := &Config{OperationTimeout: 10 * time.Minute, WriteTimeoutMargin: 30 * time.Second}
+		margin := 30 * time.Second
+		cfg := &Config{OperationTimeout: 10 * time.Minute, WriteTimeoutMargin: &margin}
 		want := 10*time.Minute + 30*time.Second
 		if got := cfg.WriteTimeout(); got != want {
 			t.Errorf("WriteTimeout = %v, want %v (10m op + 30s margin)", got, want)
@@ -411,10 +611,35 @@ func TestConfig_WriteTimeout(t *testing.T) {
 	})
 	t.Run("margin larger than op is preserved", func(t *testing.T) {
 		// Operators that want extra headroom can raise the margin.
-		cfg := &Config{OperationTimeout: 30 * time.Second, WriteTimeoutMargin: 2 * time.Minute}
+		margin := 2 * time.Minute
+		cfg := &Config{OperationTimeout: 30 * time.Second, WriteTimeoutMargin: &margin}
 		want := 30*time.Second + 2*time.Minute
 		if got := cfg.WriteTimeout(); got != want {
 			t.Errorf("WriteTimeout = %v, want %v (30s op + 2m margin)", got, want)
+		}
+	})
+	t.Run("explicit zero disables margin", func(t *testing.T) {
+		// AGENTCTLD_WRITE_TIMEOUT_MARGIN=0 promises to disable the
+		// headroom. Config.WriteTimeoutMargin is a pointer precisely
+		// so we can tell "unset" (nil → default) apart from
+		// "explicitly zero" (→ 0). Operators that want
+		// WriteTimeout == OperationTimeout must be able to ask for
+		// it; the pointer makes that observable.
+		var zero time.Duration
+		cfg := &Config{OperationTimeout: 10 * time.Minute, WriteTimeoutMargin: &zero}
+		want := 10 * time.Minute
+		if got := cfg.WriteTimeout(); got != want {
+			t.Errorf("WriteTimeout = %v, want %v (10m op, no margin)", got, want)
+		}
+	})
+	t.Run("nil margin keeps default", func(t *testing.T) {
+		// Sanity: nil pointer is the "unset" path and must yield
+		// the package default, not zero. Operators get the
+		// default headroom when they do not configure the env var.
+		cfg := &Config{OperationTimeout: 10 * time.Minute, WriteTimeoutMargin: nil}
+		want := 10*time.Minute + defaultWriteTimeoutMargin
+		if got := cfg.WriteTimeout(); got != want {
+			t.Errorf("WriteTimeout = %v, want %v (nil margin → default)", got, want)
 		}
 	})
 }
@@ -431,7 +656,8 @@ func TestListenAndServe_BindsWithConfiguredWriteTimeout(t *testing.T) {
 	sockPath := filepath.Join(dir, "agentctl.sock")
 	cfg := minimalConfig(sockPath)
 	cfg.OperationTimeout = 90 * time.Second
-	cfg.WriteTimeoutMargin = 30 * time.Second
+	margin := 30 * time.Second
+	cfg.WriteTimeoutMargin = &margin
 	if want := 2 * time.Minute; cfg.WriteTimeout() != want {
 		t.Fatalf("cfg.WriteTimeout = %v, want %v", cfg.WriteTimeout(), want)
 	}
@@ -551,7 +777,8 @@ func TestSlowDeployer_ResponseDelivered(t *testing.T) {
 	sockPath := filepath.Join(dir, "agentctl.sock")
 	cfg := minimalConfig(sockPath)
 	cfg.OperationTimeout = operationTimeout
-	cfg.WriteTimeoutMargin = writeMargin
+	margin := writeMargin
+	cfg.WriteTimeoutMargin = &margin
 	if got, want := cfg.WriteTimeout(), operationTimeout+writeMargin; got != want {
 		t.Fatalf("WriteTimeout = %v, want %v", got, want)
 	}

@@ -218,7 +218,13 @@ func loadConfig() (*daemon.Config, error) {
 		if d < 0 {
 			return nil, fmt.Errorf("AGENTCTLD_WRITE_TIMEOUT_MARGIN must not be negative")
 		}
-		cfg.WriteTimeoutMargin = d
+		// Always assign through a pointer so operators can
+		// distinguish "unset" (nil pointer → default margin) from
+		// "explicitly zero" (→ no headroom, WriteTimeout equals
+		// OperationTimeout). The env-var docstring promises this
+		// behaviour and the pointer is what makes it observable
+		// inside the daemon.
+		cfg.WriteTimeoutMargin = &d
 	}
 	if cfg.Caddy.CaddyBinary == "" {
 		cfg.Caddy.CaddyBinary = "caddy"

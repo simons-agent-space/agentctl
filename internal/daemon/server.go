@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/simons-agent-space/agentctl/internal/audit"
@@ -94,9 +95,13 @@ type Config struct {
 	// defaultSocketProbeTimeout.
 	SocketProbeTimeout time.Duration
 	// WriteTimeoutMargin is added to OperationTimeout when
-	// computing the HTTP server's WriteTimeout. Zero means
-	// defaultWriteTimeoutMargin.
-	WriteTimeoutMargin time.Duration
+	// computing the HTTP server's WriteTimeout. nil means
+	// defaultWriteTimeoutMargin; a pointer to a zero duration
+	// explicitly disables the headroom so WriteTimeout equals
+	// OperationTimeout exactly; any other non-nil pointer supplies
+	// the margin. The pointer is what lets callers distinguish
+	// "unset" (nil → default) from "explicit zero" (→ disabled).
+	WriteTimeoutMargin *time.Duration
 	// Source is the trusted source-resolution configuration.
 	Source deploy.SourceConfig
 	// Runtime is the trusted runtime configuration.
@@ -171,11 +176,14 @@ func (c *Config) SocketProbeTimeoutOrDefault() time.Duration {
 
 // WriteTimeoutMarginOrDefault returns the margin added to the
 // operation timeout when computing the HTTP server's WriteTimeout.
+// A nil WriteTimeoutMargin yields the package default; a pointer
+// to any duration (including zero) is taken verbatim so operators
+// can disable the headroom by setting the env var to "0".
 func (c *Config) WriteTimeoutMarginOrDefault() time.Duration {
-	if c.WriteTimeoutMargin > 0 {
-		return c.WriteTimeoutMargin
+	if c.WriteTimeoutMargin == nil {
+		return defaultWriteTimeoutMargin
 	}
-	return defaultWriteTimeoutMargin
+	return *c.WriteTimeoutMargin
 }
 
 // WriteTimeout returns the HTTP WriteTimeout derived from the
@@ -300,16 +308,22 @@ func (s *Server) IsShuttingDown() bool {
 //     daemon is actively listening. A successful probe means
 //     "another agentctld is running here, refuse to start" and is
 //     returned as ErrSocketInUse so the entrypoint exits non-zero
-//     with a clear message. A failed probe (connection refused)
-//     means the socket file is stale and is safe to unlink.
+//     with a clear message. ECONNREFUSED is the only dial failure
+//     classified as "socket file is stale" because it is the one
+//     kernel-level signal that uniquely identifies "socket file
+//     exists but nothing is listening"; every other dial error
+//     (timeout, EACCES on a parent directory, EMFILE, ENFILE, ...)
+//     is preserved and returned so the operator can diagnose it
+//     without losing the socket of a live daemon.
 //
 // The probe-then-unlink order is the difference between this
 // implementation and a naive "always Remove" helper: removing a
 // socket file out from under a running daemon disconnects its
 // clients without warning and races bind attempts, while here we
-// only remove the file when nothing is bound to it. The remaining
-// race between probe and Listen is unavoidable and surfaces as a
-// bind error if another process grabs the path in the gap.
+// only remove the file when the kernel has confirmed nobody is
+// listening. The remaining race between probe and Listen is
+// unavoidable and surfaces as a bind error if another process
+// grabs the path in the gap.
 func prepareSocket(path string, probeTimeout time.Duration) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -321,7 +335,19 @@ func prepareSocket(path string, probeTimeout time.Duration) error {
 	if info.Mode()&os.ModeSocket == 0 {
 		return fmt.Errorf("refusing to remove non-socket file at %s", path)
 	}
-	if probeSocket(path, probeTimeout) {
+	stale, perr := probeSocket(path, probeTimeout)
+	if perr != nil {
+		// Timeout, permission denied, resource exhaustion, or any
+		// other unrecognised dial failure: leave the socket file
+		// untouched and surface the underlying error so the
+		// operator can decide what to do. We deliberately do not
+		// try to classify the error here; only ECONNREFUSED is
+		// recognised as "stale" because it is the only signal
+		// that uniquely means "socket file exists but no
+		// listener is bound to it".
+		return fmt.Errorf("probe socket %s: %w", path, perr)
+	}
+	if !stale {
 		return fmt.Errorf("%w: %s", ErrSocketInUse, path)
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -330,21 +356,47 @@ func prepareSocket(path string, probeTimeout time.Duration) error {
 	return nil
 }
 
-// probeSocket returns true when a daemon is actively accepting
-// connections on path. A short dial timeout avoids hanging on a
-// listener that has accepted its queue but stopped processing; the
-// caller's definition of "stale" is "not accepting a connection
-// inside the probe budget".
-func probeSocket(path string, timeout time.Duration) bool {
+// dialUnixSocket is the function used by probeSocket to dial a
+// candidate path. The package-level indirection exists so tests
+// can inject timeouts and synthetic dial errors without juggling
+// kernel-level listen backlog behaviour (which is the only other
+// way to make net.DialTimeout return a real timeout on a unix
+// socket, and that approach is platform-specific and flaky).
+var dialUnixSocket = func(path string, timeout time.Duration) (net.Conn, error) {
+	return net.DialTimeout("unix", path, timeout)
+}
+
+// probeSocket classifies a candidate socket path:
+//
+//   - (stale=false, err=nil): a daemon is actively accepting
+//     connections on path. prepareSocket surfaces this as
+//     ErrSocketInUse.
+//   - (stale=true, err=nil): the kernel confirmed ECONNREFUSED,
+//     i.e. the socket file exists but nothing is listening.
+//     prepareSocket unlinks the file.
+//   - (stale=false, err=non-nil): any other dial outcome:
+//     timeout, permission denied, resource exhaustion, or an
+//     unrecognised transport error. prepareSocket must not remove
+//     the file in this case; the underlying error is returned so
+//     the operator can act on it.
+//
+// A short dial timeout avoids hanging on a listener that has
+// accepted its queue but stopped processing; the caller's
+// definition of "stale" is "not accepting a connection inside the
+// probe budget".
+func probeSocket(path string, timeout time.Duration) (stale bool, err error) {
 	if timeout <= 0 {
 		timeout = defaultSocketProbeTimeout
 	}
-	conn, err := net.DialTimeout("unix", path, timeout)
-	if err != nil {
-		return false
+	conn, derr := dialUnixSocket(path, timeout)
+	if derr == nil {
+		_ = conn.Close()
+		return false, nil
 	}
-	_ = conn.Close()
-	return true
+	if errors.Is(derr, syscall.ECONNREFUSED) {
+		return true, nil
+	}
+	return false, derr
 }
 
 // requireSocketParent verifies the parent directory of path exists
