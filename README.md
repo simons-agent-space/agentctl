@@ -129,8 +129,9 @@ go build -o bin/gitbridge   ./cmd/gitbridge
 go build -o bin/agentctld   ./cmd/agentctld
 ```
 
-Both resulting binaries are self-contained: no CGo, no shared
-libraries.
+Both resulting binaries depend only on the Go standard library; the
+repository has no third-party Go dependencies. Neither binary
+embeds any host-specific paths, group names, or secrets.
 
 - For installation of `gitbridge` on the broker host, see
   [`docs/INSTALL.md`](docs/INSTALL.md).

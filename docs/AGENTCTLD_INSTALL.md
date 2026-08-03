@@ -48,8 +48,15 @@ cd agentctl
 go build -o bin/agentctld ./cmd/agentctld
 ```
 
-The resulting binary is self-contained: no CGo, no shared libraries,
-no embedded paths.
+The resulting binary depends only on the Go standard library; the
+repository has no third-party Go dependencies. The binary does
+not embed any host-specific paths, group names, or secrets.
+
+A standard `go build` does **not** guarantee a cgo-free or
+statically linked binary; this codebase imports no cgo packages,
+so a `CGO_ENABLED=0 go build` does produce a fully static
+binary, and that is the recommended build for portable
+deployment.
 
 ## User and group setup
 
@@ -88,17 +95,56 @@ socket is chowned to after bind. The value must be a group that
 the `agentctld` user is in; otherwise the chown(2) call fails with
 `EPERM` and the daemon exits non-zero.
 
-Two common choices:
+#### Recommended default
 
-- **agentctld** (the primary group). All callers must be in the
-  `agentctld` group. Simplest, narrowest blast radius. Recommended
-  for setups where only one client (e.g. an OpenClaw sandbox)
-  connects.
-- **A dedicated client group**, e.g. `agentctl-clients`. The
-  `agentctld` user must be in this group too
-  (`usermod --append --groups agentctl-clients agentctld`), and
-  every client user must be in this group. Use this when several
-  clients connect from different primary groups.
+`AGENTCTLD_SOCKET_GROUP=agentctld` with `RuntimeDirectoryMode=0750`.
+Every authorised client (e.g. the OpenClaw sandbox user) is added
+to the `agentctld` group:
+
+```
+usermod --append --groups agentctld <client-user>
+```
+
+The socket is owned by `agentctld:agentctld` with mode `0660`, and
+the parent directory `/run/agentctld/` is owned by
+`agentctld:agentctld` with mode `0750`. The socket group and the
+directory group are the same, so every authorised client can
+traverse the directory and connect to the socket. This is the
+narrowest blast radius and the configuration the unit ships with.
+
+#### Separate-client-group alternative
+
+If the operator wants the client group to be different from the
+daemon's primary group (e.g. `agentctl-clients` containing the
+OpenClaw sandbox but not the daemon's other duties), the socket
+is chowned to `agentctl-clients` but systemd does **not** change
+the parent directory's group ownership. Adding the `agentctld`
+user to a supplementary group does not change the parent
+directory's group either. The operator must choose one of these
+working configurations:
+
+1. **Widen the parent directory to world-traversable.** Set
+   `RuntimeDirectoryMode=0755` in the unit. The socket itself
+   remains `0660` with group `agentctl-clients`, so an attacker
+   who somehow traverses the directory still cannot connect
+   without being in `agentctl-clients`. Every client user is
+   added to the `agentctl-clients` group:
+   ```
+   groupadd agentctl-clients
+   usermod --append --groups agentctl-clients agentctld
+   usermod --append --groups agentctl-clients <client-user>
+   ```
+
+2. **Override the parent directory via `tmpfiles.d(5)`.** Drop a
+   snippet that assigns the directory's group and mode at boot:
+   ```
+   # /etc/tmpfiles.d/agentctld.conf
+   d /run/agentctld 0750 agentctld agentctl-clients - -
+   ```
+   `RuntimeDirectory=agentctld` creates the directory; the
+   `tmpfiles.d` fragment reassigns group ownership to
+   `agentctl-clients` while keeping mode `0750` so only
+   `agentctld` and `agentctl-clients` members can traverse.
 
 The socket is always created with mode `0660` (configurable via
 `AGENTCTLD_SOCKET_MODE`); the group ownership is what gates
@@ -322,7 +368,7 @@ AGENTCTLD_STATE_BASE_DOMAIN=apps.example.com
 # the container. Survives every normal operation (deploy,
 # rollback, container recreation); only an explicit operator
 # action deletes it.
-AGENTCTLD_DATA_ROOT=/var/lib/agentctl/data
+AGENTCTLD_DATA_ROOT=/var/lib/agentctld/data
 ```
 
 ### Variable reference
@@ -668,7 +714,6 @@ matters.
 ```
 curl --unix-socket /run/agentctld/socket \
     -X POST -H 'Content-Type: application/json' \
-    -H 'Content-Type: application/json' \
     --data '{"health_path":"/healthz"}' \
     http://localhost/v1/apps/price-tracker/rollback
 ```

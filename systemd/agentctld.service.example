@@ -75,19 +75,42 @@ TimeoutStopSec=40m
 
 # RuntimeDirectory owns the Unix socket's parent directory. The
 # daemon binds AGENTCTLD_SOCKET_PATH inside it; the daemon resolves
-# AGENTCTLD_SOCKET_GROUP and chowns the socket file (not the
-# directory) to that group after creation.
+# AGENTCTLD_SOCKET_GROUP and chowns the socket FILE (not this
+# directory) to that group after creation. systemd owns this
+# directory's ownership and mode: User:Group = agentctld:agentctld,
+# Mode=0750.
 #
-# Mode 0750 limits traversal to the agentctld user/group. Operators
-# who want to expose the socket to clients in a different group
-# (e.g. a "agentctl-clients" group containing the OpenClaw
-# sandbox) have two options:
+# The recommended default is AGENTCTLD_SOCKET_GROUP=agentctld and
+# RuntimeDirectoryMode=0750. Every authorised client (e.g. the
+# OpenClaw sandbox user) is added to the agentctld group, so the
+# socket's group ownership and the directory's group ownership
+# are the same and the directory remains mode 0750. This is the
+# narrowest blast radius.
 #
-#   1. Add the client group to SupplementaryGroups above and keep
-#      RuntimeDirectoryMode=0750.
-#   2. Widen RuntimeDirectoryMode=0755 (world-traversable); the
-#      socket's mode 0660 + group ownership still gates actual
-#      access. This is the standard pattern for socket services.
+# A separate client group (e.g. "agentctl-clients") requires the
+# daemon to chown the socket to that group, but systemd does NOT
+# change this directory's group ownership in response. The
+# agentctld user being added to a supplementary group does not
+# change the directory's group either. The operator must choose
+# one of these working configurations:
+#
+#   1. Widen RuntimeDirectoryMode=0755 (world-traversable but not
+#      world-readable of the directory contents; the socket file
+#      itself remains mode 0660 with the dedicated group as its
+#      group, so actual access is still gated by socket
+#      permissions). This is the standard pattern for socket
+#      services that span multiple groups.
+#
+#   2. Set the parent directory's group and mode explicitly via
+#      a tmpfiles.d(5) fragment that runs at boot and assigns
+#      group=agentctl-clients and mode=0750. RuntimeDirectory
+#      owns the directory's existence; the tmpfiles.d entry
+#      overrides its ownership.
+#
+# In both alternatives the socket itself stays mode 0660 with
+# group=agentctl-clients, so an attacker who somehow traverses
+# the parent directory still cannot connect to the socket
+# without being in agentctl-clients.
 RuntimeDirectory=agentctld
 RuntimeDirectoryMode=0750
 
@@ -103,11 +126,11 @@ LogsDirectoryMode=0750
 # are created by the daemon on first use; the operator does not
 # need to pre-create them.
 #
-#   /var/lib/agentctl/state/    AGENTCTLD_STATE_DIR
-#   /var/lib/agentctl/data/     AGENTCTLD_DATA_ROOT
-#   /var/lib/agentctl/sources/  AGENTCTLD_SOURCE_REPOSITORY_ROOT
-#                              AGENTCTLD_RUNTIME_REPOSITORY_ROOT
-#   /var/lib/agentctl/caddy/    AGENTCTLD_CADDY_CONFIG_DIR
+#   /var/lib/agentctld/state/    AGENTCTLD_STATE_DIR
+#   /var/lib/agentctld/data/     AGENTCTLD_DATA_ROOT
+#   /var/lib/agentctld/sources/  AGENTCTLD_SOURCE_REPOSITORY_ROOT
+#                               AGENTCTLD_RUNTIME_REPOSITORY_ROOT
+#   /var/lib/agentctld/caddy/    AGENTCTLD_CADDY_CONFIG_DIR
 StateDirectory=agentctld
 StateDirectoryMode=0750
 
@@ -163,12 +186,24 @@ SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 AmbientCapabilities=
 
-# agentctld itself is small. The deploy pipeline spawns git, docker,
-# and caddy as short-lived children whose resource usage is bounded
-# by their own commands, not by this unit's cgroup. 512M is generous
-# for the daemon process itself and provides defense-in-depth
-# against runaway child accounting.
-MemoryMax=512M
+# MemoryMax applies to the entire systemd service cgroup: the
+# agentctld daemon AND every short-lived child process it spawns
+# (git, the docker CLI, the caddy CLI). It is NOT bounded to the
+# Go daemon alone. The docker CLI in particular streams the
+# build context to dockerd over /var/run/docker.sock, so a large
+# build context can hold significant memory in the CLI process
+# while the upload is in progress.
+#
+# The default is unset: the cgroup inherits the system default
+# (typically unlimited on systemd hosts that do not impose a
+# unit-level MemoryMax). Operators who want a hard cap can set
+# one with `systemctl edit agentctld`, but the value must be
+# large enough to accommodate the largest expected build context
+# plus the working set of the daemon and its other children.
+# Setting MemoryMax=512M (or any other modest value) on a host
+# that builds large repositories will cause the cgroup to be
+# OOM-killed mid-build, which is destructive for an in-flight
+# deployment.
 
 [Install]
 WantedBy=multi-user.target
