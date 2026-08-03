@@ -424,6 +424,23 @@ func requireSocketParent(path string) error {
 // removed before bind. The socket is chmod'd after listen. On
 // return the socket is closed and removed.
 //
+// On ctx cancellation, ListenAndServe marks the server as
+// draining (so new mutating requests get 503) and calls
+// http.Server.Shutdown to close the listener and wait for
+// in-flight handlers to return. The shutdown wait is NOT
+// bounded by an internal timeout: deploy and rollback may run
+// for the configured OperationTimeout (30 minutes by default),
+// and a hardcoded shutdown deadline shorter than that would
+// abandon an in-flight deployment halfway through and let the
+// process exit before the deploy finished writing its
+// response. The hard stop is the responsibility of the
+// process supervisor (systemd TimeoutStopSec=, runit,
+// supervisord, ...): the daemon must not second-guess the
+// operator's chosen stop signal. The deploy/rollback handlers
+// run on a background context bounded by OperationTimeout, so
+// the handler will eventually return and server.Shutdown will
+// make progress even without an internal deadline.
+//
 // The pre-bind sequence is:
 //
 //  1. requireSocketParent: refuse to start if the configured
@@ -495,10 +512,24 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		// Graceful shutdown: cancel the listener and wait for
+		// in-flight handlers to return. We deliberately do NOT
+		// bound this wait with an internal timeout: deploy and
+		// rollback run on a background context with the
+		// configured OperationTimeout budget, so they may run
+		// for up to that long. A hardcoded shutdown deadline
+		// shorter than OperationTimeout would abandon an
+		// in-flight deployment halfway through and let the
+		// process exit before the deploy finished writing its
+		// response. The hard stop is the responsibility of the
+		// process supervisor (systemd TimeoutStopSec=, runit,
+		// supervisord, ...): the daemon must not second-guess
+		// the operator's chosen stop signal. The deploy's own
+		// OperationTimeout context ensures the handler will
+		// eventually return, so server.Shutdown will make
+		// progress even without an internal deadline.
 		s.Shutdown()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
+		if err := server.Shutdown(context.Background()); err != nil {
 			return fmt.Errorf("shutdown: %w", err)
 		}
 		return ctx.Err()

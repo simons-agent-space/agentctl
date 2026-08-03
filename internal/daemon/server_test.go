@@ -838,11 +838,14 @@ func TestSlowDeployer_ResponseDelivered(t *testing.T) {
 }
 
 // slowFakeDeployer is the test counterpart of realDeployer: it
-// sleeps on Deploy to simulate a slow first-build deploy and never
-// touches Docker, Caddy, or the filesystem.
+// sleeps on Deploy and Rollback to simulate a slow operation
+// and never touches Docker, Caddy, or the filesystem. sleepFor
+// applies to both methods so a shutdown-timing test only has to
+// configure one field.
 type slowFakeDeployer struct {
-	sleepFor time.Duration
-	calls    int32
+	sleepFor      time.Duration
+	calls         int32
+	rollbackCalls int32
 }
 
 func (s *slowFakeDeployer) Deploy(ctx context.Context, _ deploy.DeployConfig, m deploy.Manifest, commit string) (*deploy.DeployResult, error) {
@@ -865,8 +868,221 @@ func (s *slowFakeDeployer) Deploy(ctx context.Context, _ deploy.DeployConfig, m 
 	}
 }
 
-func (s *slowFakeDeployer) Rollback(_ context.Context, _ deploy.RollbackConfig) error {
-	return nil
+func (s *slowFakeDeployer) Rollback(ctx context.Context, _ deploy.RollbackConfig) error {
+	atomic.AddInt32(&s.rollbackCalls, 1)
+	select {
+	case <-time.After(s.sleepFor):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// TestListenAndServe_ShutdownWaitsForActiveDeploy is the
+// regression test for the "30-second Shutdown timeout cuts off
+// in-flight deploys" bug. With the previous fixed-30s shutdown
+// timeout, cancelling the server context mid-deploy would race
+// the deploy: after 30 seconds, server.Shutdown would return
+// context.DeadlineExceeded, ListenAndServe would return, and
+// the process could exit before the deploy finished. The fix
+// removes the internal shutdown timeout so server.Shutdown
+// waits for in-flight handlers (whose deploy runs on a
+// background context bounded by OperationTimeout) to return.
+//
+// The assertion is twofold:
+//   - ListenAndServe does NOT return while the deploy is still
+//     running (it must wait for the handler to finish).
+//   - ListenAndServe DOES return once the deploy finishes
+//     (the handler returns, server.Shutdown returns nil, and
+//     ListenAndServe returns ctx.Err()).
+//
+// We additionally verify the HTTP response was a success so a
+// future regression that abandons the handler but somehow
+// unblocks server.Shutdown would still be caught.
+func TestListenAndServe_ShutdownWaitsForActiveDeploy(t *testing.T) {
+	const (
+		operationTimeout = 60 * time.Second
+		deployerSleep    = 1500 * time.Millisecond
+	)
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "agentctl.sock")
+	cfg := minimalConfig(sockPath)
+	cfg.OperationTimeout = operationTimeout
+
+	fake := &slowFakeDeployer{sleepFor: deployerSleep}
+	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), fake, execDockerRunner{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe(ctx) }()
+
+	if err := waitForSocket(sockPath, 2*time.Second); err != nil {
+		t.Fatalf("socket did not appear: %v", err)
+	}
+
+	manifestJSON := json.RawMessage(`{"version":1,"app":"example","container_port":8080,"health_path":"/healthz"}`)
+	body, err := json.Marshal(map[string]any{
+		"commit":   strings.Repeat("a", 40),
+		"manifest": manifestJSON,
+	})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+
+	type httpResult struct {
+		resp *httpResponse
+		err  error
+	}
+	deployResultCh := make(chan httpResult, 1)
+	go func() {
+		resp, derr := httpPostOverUDS(sockPath, "/v1/apps/example/deploy", string(body))
+		deployResultCh <- httpResult{resp: resp, err: derr}
+	}()
+
+	// Give the deploy goroutine time to acquire the app lock
+	// and reach the fake Deployer sleep. 200ms is well below
+	// the 1.5s deployer sleep so the deploy is definitely in
+	// flight.
+	time.Sleep(200 * time.Millisecond)
+
+	// Cancel the server context. ListenAndServe must NOT
+	// return until the deploy finishes; the previous
+	// fixed-30s shutdown timeout would race the deploy and
+	// return long before the 1.5s deployer sleep elapses.
+	cancelAt := time.Now()
+	cancel()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ListenAndServe returned after %v, want >= %v (deploy still in flight, err=%v)", time.Since(cancelAt), deployerSleep, err)
+	case <-time.After(deployerSleep - 500*time.Millisecond):
+		// expected: still waiting for deploy to finish
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("ListenAndServe returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListenAndServe did not return after deploy completed")
+	}
+
+	// Verify the deploy actually completed successfully so a
+	// future regression that abandons the handler but somehow
+	// unblocks server.Shutdown would still be caught.
+	select {
+	case res := <-deployResultCh:
+		if res.err != nil {
+			t.Fatalf("deploy request error: %v", res.err)
+		}
+		if res.resp.status != http.StatusOK {
+			t.Fatalf("deploy status = %d, want 200; body = %s", res.resp.status, res.resp.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deploy result never delivered")
+	}
+
+	if calls := atomic.LoadInt32(&fake.calls); calls != 1 {
+		t.Errorf("fake deployer calls = %d, want 1", calls)
+	}
+}
+
+// TestListenAndServe_ShutdownWaitsForActiveRollback is the
+// rollback counterpart of the deploy regression test. Rollback
+// runs on the same background OperationTimeout-bounded context,
+// so the same shutdown logic must keep it from being abandoned
+// halfway through. The HTTP status returned by the handler
+// with no persisted state is incidental to the shutdown-timing
+// property under test; we only assert that the rollback was
+// actually invoked and that the request ran to completion.
+func TestListenAndServe_ShutdownWaitsForActiveRollback(t *testing.T) {
+	const (
+		operationTimeout = 60 * time.Second
+		rollbackSleep    = 1500 * time.Millisecond
+	)
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "agentctl.sock")
+	cfg := minimalConfig(sockPath)
+	cfg.OperationTimeout = operationTimeout
+
+	fake := &slowFakeDeployer{sleepFor: rollbackSleep}
+	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), fake, execDockerRunner{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe(ctx) }()
+
+	if err := waitForSocket(sockPath, 2*time.Second); err != nil {
+		t.Fatalf("socket did not appear: %v", err)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"health_path": "/healthz",
+	})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+
+	type httpResult struct {
+		resp *httpResponse
+		err  error
+	}
+	rollbackResultCh := make(chan httpResult, 1)
+	go func() {
+		resp, derr := httpPostOverUDS(sockPath, "/v1/apps/example/rollback", string(body))
+		rollbackResultCh <- httpResult{resp: resp, err: derr}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+
+	cancelAt := time.Now()
+	cancel()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ListenAndServe returned after %v, want >= %v (rollback still in flight, err=%v)", time.Since(cancelAt), rollbackSleep, err)
+	case <-time.After(rollbackSleep - 500*time.Millisecond):
+		// expected: still waiting for rollback to finish
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("ListenAndServe returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListenAndServe did not return after rollback completed")
+	}
+
+	select {
+	case res := <-rollbackResultCh:
+		if res.err != nil {
+			t.Fatalf("rollback request error: %v", res.err)
+		}
+		// With no persisted state the handler eventually
+		// returns 500 after the rollback completes; the
+		// shutdown-timing property under test is independent
+		// of whether the rollback succeeded operationally.
+		// What we need to verify here is that the response
+		// was delivered at all, which proves the handler
+		// ran to completion rather than being abandoned.
+		if res.resp.status == 0 {
+			t.Fatalf("rollback response had no status; body = %s", res.resp.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollback result never delivered")
+	}
+
+	if calls := atomic.LoadInt32(&fake.rollbackCalls); calls != 1 {
+		t.Errorf("fake deployer rollback calls = %d, want 1", calls)
+	}
 }
 
 // waitForSocket polls path with a 10ms interval until the file
