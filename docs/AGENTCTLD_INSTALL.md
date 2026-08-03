@@ -75,18 +75,28 @@ This creates:
   interactive login.
 - A primary group `agentctld` of the same name.
 
-The user must also be in the `docker` group so the daemon can talk
-to `/var/run/docker.sock`:
+The user must be able to drive Docker, which requires being in the
+`docker` group so the daemon can talk to `/var/run/docker.sock`.
+The unit declares `SupplementaryGroups=docker` so the service
+process starts with `docker` in its supplementary groups; this is
+what systemd actually applies to the running daemon. Persistent
+`/etc/group` membership via `usermod -aG docker agentctld` is
+optional in this configuration — it only matters for interactive
+logins, `ssh`, and `su -` as the `agentctld` user, not for the
+systemd service:
 
 ```
-usermod --append --groups docker agentctld
+usermod --append --groups docker agentctld   # optional
 ```
 
-The systemd unit declares this as `SupplementaryGroups=docker` so
-the relationship is documented next to the unit, but systemd does
-not maintain group membership. The `usermod` invocation above is
-required either way; the unit directive is for human readers, not
-a substitute for the actual `usermod`.
+For the separate-client-group layout (see
+[Separate-client-group alternative](#separate-client-group-alternative)),
+the unit needs `SupplementaryGroups=docker agentctl-clients` so
+the running daemon can both drive Docker and chown the socket to
+`agentctl-clients`. `RuntimeDirectory` ownership follows
+`User=` / `Group=` (the daemon's primary group), **not**
+supplementary groups; that is why the separate-client-group layout
+also requires `RuntimeDirectoryMode=0711`.
 
 ### Socket group
 
@@ -116,39 +126,49 @@ narrowest blast radius and the configuration the unit ships with.
 
 If the operator wants the client group to be different from the
 daemon's primary group (e.g. `agentctl-clients` containing the
-OpenClaw sandbox but not the daemon's other duties), the socket
-is chowned to `agentctl-clients` but systemd does **not** change
-the parent directory's group ownership. Adding the `agentctld`
-user to a supplementary group does not change the parent
-directory's group either. A `tmpfiles.d(5)` fragment is **not**
-a working override: `RuntimeDirectory=agentctld` reasserts the
-configured `User`, `Group`, and `RuntimeDirectoryMode` on every
-service start, and the runtime directory is removed when the
-service stops. The operator must use a directory mode that
-permits traversal without the directory's group being
-`agentctl-clients`.
+OpenClaw sandbox but not the daemon's other duties), four
+settings must change together: the unit must add the client
+group to `SupplementaryGroups`, the runtime directory mode must
+be widened to `0711`, and the socket's group and mode must be
+explicit. A `tmpfiles.d(5)` fragment is **not** a working
+override: `RuntimeDirectory=agentctld` reasserts the configured
+`User`, `Group`, and `RuntimeDirectoryMode` on every service
+start, and the runtime directory is removed when the service
+stops.
 
-The simplest working configuration:
+The canonical configuration:
 
 ```
 groupadd agentctl-clients
-usermod --append --groups agentctl-clients agentctld
 usermod --append --groups agentctl-clients <client-user>
 ```
 
-And in the unit (a `systemctl edit agentctld` override is the
+In the unit override (`systemctl edit agentctld` is the
 cleanest place to set this):
 
 ```
+SupplementaryGroups=docker agentctl-clients
 RuntimeDirectoryMode=0711
 ```
 
-Mode `0711` permits any local user to traverse the directory
-(the `x` bit is set for "other") but does not permit them to
-list its contents (the `r` bit is not set for "other"). The
-socket file itself stays `0660` with group `agentctl-clients`,
-so a local user who is not in `agentctl-clients` cannot connect
-to the socket — they can only pass through the directory.
+And in `/etc/agentctld/agentctld.env`:
+
+```
+AGENTCTLD_SOCKET_GROUP=agentctl-clients
+AGENTCTLD_SOCKET_MODE=0660
+```
+
+The first unit line puts the daemon in the target group so the
+post-bind `chown(2)` call succeeds. `RuntimeDirectory` ownership
+follows `User=` / `Group=` (the daemon's primary group), not
+supplementary groups, so the directory stays `agentctld:agentctld`
+even after the daemon joins `agentctl-clients`. Mode `0711`
+permits any local user to traverse the directory (the `x` bit is
+set for "other") but does not permit them to list its contents
+(the `r` bit is not set for "other"). The socket file stays `0660`
+with group `agentctl-clients`, so a local user who is not in
+`agentctl-clients` cannot connect to the socket — they can only
+pass through the directory.
 
 Do **not** use `RuntimeDirectoryMode=0755`: that mode sets the
 `r` bit for "other", which permits world directory listing and
@@ -498,22 +518,46 @@ weakening its functionality.
 | `LockPersonality=yes` | Lock execution domain | Go runtime needs none |
 | `MemoryDenyWriteExecute=yes` | No W^X memory mappings | Daemon and its children need no JIT |
 | `SystemCallArchitectures=native` | Only native syscall ABI | No compat-mode processes |
-| `SystemCallFilter=@system-service ~@privileged @resources` | Restrict syscalls | Daemon only needs basic process/network/filesystem syscalls |
+| `SystemCallFilter=@system-service` (allow) | Allow base syscall set | All syscalls needed by the daemon and its children (git, docker CLI, caddy CLI) start from `@system-service`. |
+| `SystemCallFilter=~@privileged @resources` (deny) | Drop privileged and resource-management syscalls | Removes mount, unshare, pivot_root, kexec_load, chown family, etc. from the allowlist. |
+| `SystemCallFilter=@chown` (re-allow narrowly) | Re-add chown family | Restores `chown(2)`/`fchown(2)`/`fchownat(2)` solely for the daemon's post-bind socket group change. See *chown re-add* below. |
 | `SystemCallErrorNumber=EPERM` | Failed syscall returns EPERM | Daemon code handles EPERM cleanly (probeSocket classifies ECONNREFUSED specifically) |
 | `CapabilityBoundingSet=` | No capabilities | Daemon needs none; Docker daemon runs under its own unit with its own caps |
 | `AmbientCapabilities=` | No inheritable capabilities | Daemon inherits none |
-| `MemoryMax=512M` | Memory ceiling | Defense-in-depth; child processes are bounded by their own commands |
+| `MemoryMax` (unset by default) | No memory ceiling on the service cgroup | `MemoryMax` applies to the **entire** service cgroup — `agentctld` plus every short-lived child (`git`, the docker CLI, the caddy CLI). The unit deliberately sets no `MemoryMax` so a large build context (held briefly in the docker CLI during `docker build`) cannot OOM-kill the cgroup mid-deploy. Operators who add a cap via `systemctl edit agentctld` must size it for the largest expected build context plus the daemon's working set, not just the daemon. |
 
-The `SystemCallFilter=@system-service ~@privileged @resources`
-directive is safe because `agentctld` never executes a container
-or namespace operation itself. The Docker CLI is a thin client
+The `SystemCallFilter` chain (allow `@system-service`, then deny
+`@privileged @resources`, then re-allow `@chown`) is the
+deliberate three-line policy. The Docker CLI is a thin client
 that talks to `/var/run/docker.sock` over HTTP; the actual
 container creation, image building, and namespace setup happen
 inside `dockerd`, which runs under its own systemd unit with its
-own privileges. The same is true for `git` (regular process doing
-regular filesystem + network work) and `caddy validate`/`caddy
-reload` (regular process doing regular filesystem + admin API
-work).
+own privileges. The same is true for `git` (regular process
+doing regular filesystem + network work) and `caddy validate` /
+`caddy reload` (regular process doing regular filesystem + admin
+API work).
+
+### chown re-add
+
+The deny rule removes `@chown` from the allowlist because
+`@privileged` includes `@chown`. The daemon calls
+`os.Chown(s.cfg.SocketPath, -1, gid)` after binding the socket,
+whenever `AGENTCTLD_SOCKET_GROUP` is non-empty (the documented
+example sets it). Without a re-add, the syscall would return
+`EPERM` and the daemon would exit before serving any request.
+The third line `SystemCallFilter=@chown` restores the `chown(2)`
+family narrowly.
+
+The re-add covers only the **seccomp** filter. `chown(2)` is
+allowed by the kernel; whether it succeeds is a separate
+permission check (POSIX DAC over the file plus group-membership
+rules for the new gid). The daemon creates the socket, so it
+owns it; changing the owning group to one of the daemon's
+**supplementary groups** does not require `CAP_CHOWN` or any
+other capability. The `SupplementaryGroups=docker
+agentctl-clients` line in the unit (see [User and group
+setup](#user-and-group-setup)) ensures the daemon is in the
+target group before `os.Chown` runs.
 
 If the Docker daemon itself is hardened such that it rejects
 agentctld's requests, that is a Docker-side policy decision, not a

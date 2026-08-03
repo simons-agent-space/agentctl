@@ -91,28 +91,33 @@ TimeoutStopSec=40m
 # daemon to chown the socket to that group, but systemd does NOT
 # change this directory's group ownership in response. The
 # agentctld user being added to a supplementary group does not
-# change the directory's group either. The operator must choose
-# one of these working configurations:
+# change the directory's group either; adding the client group to
+# the unit's SupplementaryGroups above also does not change it.
+# RuntimeDirectory ownership always follows User=/Group= (the
+# daemon's primary group), not supplementary groups.
 #
-#   1. Widen RuntimeDirectoryMode=0711 (world-traversable but not
-#      world-listable: the directory's contents are not visible
-#      to a user who is not agentctld or in agentctl-clients).
-#      The socket file itself stays mode 0660 with group
-#      agentctl-clients, so an attacker who can traverse the
-#      directory still cannot connect to the socket without
-#      being in agentctl-clients. This is the standard pattern
-#      for socket services that span multiple groups.
+# The canonical working configuration is to widen the directory
+# mode to 0711 (world-traversable but not world-listable): the
+# directory's contents are not visible to a user who is not
+# agentctld or in agentctl-clients, but anyone with the x bit
+# can pass through it to reach a known socket path. The socket
+# file itself stays mode 0660 with group agentctl-clients, so an
+# attacker who can traverse the directory still cannot connect
+# to the socket without being in agentctl-clients. This is the
+# standard pattern for socket services that span multiple groups.
 #
-#   2. Add the client group to SupplementaryGroups above and
-#      widen RuntimeDirectoryMode=0750 to whatever mode lets the
-#      clients traverse. This is effectively option 1 with the
-#      directory's group still set to agentctld; clients in
-#      agentctl-clients can only connect after traversing.
+# Operators using a separate client group must therefore set, in
+# the unit override and the env file:
 #
-# In all configurations the socket itself stays mode 0660 with
-# group=agentctl-clients, so an attacker who can somehow
-# traverse the parent directory still cannot connect to the
-# socket without being in agentctl-clients.
+#   SupplementaryGroups=docker agentctl-clients
+#   RuntimeDirectoryMode=0711
+#   AGENTCTLD_SOCKET_GROUP=agentctl-clients
+#   AGENTCTLD_SOCKET_MODE=0660
+#
+# The first line puts the daemon in the target group so the
+# post-bind chown(2) call succeeds; the second line keeps the
+# directory traversable for clients without exposing its contents;
+# the third and fourth lines configure the socket itself.
 RuntimeDirectory=agentctld
 RuntimeDirectoryMode=0750
 
