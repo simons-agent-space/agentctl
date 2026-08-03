@@ -20,10 +20,18 @@
 //   - The socket is created with mode 0660; the group is taken from
 //     AGENTCTLD_SOCKET_GROUP and resolved to a numeric GID at startup.
 //     An unresolvable group is a fatal configuration error.
-//   - A pre-existing socket file at AGENTCTLD_SOCKET_PATH is removed
-//     before bind; a pre-existing non-socket file at that path is a
-//     fatal startup error so the daemon never silently overwrites
-//     unrelated files. The listen path must be absolute.
+//   - A pre-existing socket file at AGENTCTLD_SOCKET_PATH is probed
+//     before bind: if a daemon is actively listening the daemon
+//     refuses to start with an "already running" error; otherwise the
+//     stale socket file is unlinked. A pre-existing non-socket file
+//     at that path is a fatal startup error so the daemon never
+//     silently overwrites unrelated files. The listen path must be
+//     absolute.
+//   - The parent directory of AGENTCTLD_SOCKET_PATH must already
+//     exist. The daemon does not create it. The process supervisor
+//     (systemd RuntimeDirectory=, runit, supervisord, ...) owns that
+//     directory's ownership and permissions, and silently creating
+//     it inside the daemon would mask supervisor misconfiguration.
 //   - SIGINT and SIGTERM begin graceful shutdown. In-flight handlers
 //     run to completion on their own background context; new
 //     requests are rejected with 503.
@@ -33,6 +41,8 @@
 //	AGENTCTLD_SOCKET_PATH          absolute path of the UDS listener (required)
 //	AGENTCTLD_SOCKET_GROUP         group name or numeric GID for the socket (optional)
 //	AGENTCTLD_SOCKET_MODE          socket mode in octal (optional, default 0660; e.g. 0660, 0o660)
+//	AGENTCTLD_OPERATION_TIMEOUT    per-operation wall-clock budget (optional, default 30m). Drives both the deploy/rollback context timeout and the HTTP WriteTimeout, which is set to this value plus AGENTCTLD_WRITE_TIMEOUT_MARGIN.
+//	AGENTCTLD_WRITE_TIMEOUT_MARGIN extra headroom added to the operation timeout to derive the HTTP WriteTimeout (optional, default 5m). Set to 0 to disable the headroom.
 //	AGENTCTLD_MAX_REQUEST_BYTES    max request body in bytes (optional, default 65536)
 //	AGENTCTLD_AUDIT_LOG            path for audit logs (default stderr)
 //
@@ -190,6 +200,26 @@ func loadConfig() (*daemon.Config, error) {
 		}
 		cfg.Runtime.HealthTimeout = d
 	}
+	if v := os.Getenv("AGENTCTLD_OPERATION_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("AGENTCTLD_OPERATION_TIMEOUT: %w", err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("AGENTCTLD_OPERATION_TIMEOUT must be positive")
+		}
+		cfg.OperationTimeout = d
+	}
+	if v := os.Getenv("AGENTCTLD_WRITE_TIMEOUT_MARGIN"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("AGENTCTLD_WRITE_TIMEOUT_MARGIN: %w", err)
+		}
+		if d < 0 {
+			return nil, fmt.Errorf("AGENTCTLD_WRITE_TIMEOUT_MARGIN must not be negative")
+		}
+		cfg.WriteTimeoutMargin = d
+	}
 	if cfg.Caddy.CaddyBinary == "" {
 		cfg.Caddy.CaddyBinary = "caddy"
 	}
@@ -222,6 +252,9 @@ func loadConfig() (*daemon.Config, error) {
 	}
 	if cfg.Runtime.HealthTimeout <= 0 {
 		return nil, fmt.Errorf("AGENTCTLD_RUNTIME_HEALTH_TIMEOUT must be positive")
+	}
+	if cfg.OperationTimeout < 0 {
+		return nil, fmt.Errorf("AGENTCTLD_OPERATION_TIMEOUT must not be negative")
 	}
 	return cfg, nil
 }

@@ -44,19 +44,27 @@ const defaultSocketMode os.FileMode = 0o660
 const defaultMaxRequestBytes int64 = 1 << 16
 
 // default HTTP server timeouts. ReadHeaderTimeout is short so a
-// stalled peer cannot tie up the socket; ReadTimeout and
-// WriteTimeout are long enough for a deploy (which can take
-// minutes) to write its response after the deploy goroutine
-// completes.
+// stalled peer cannot tie up the socket; ReadTimeout is long
+// enough to amortise a large request body. WriteTimeout must be at
+// least as long as the longest operation the daemon runs (see
+// OperationTimeout below) so a 30-minute deploy that ends in a
+// small JSON response is not cut off mid-write. We derive
+// WriteTimeout from OperationTimeout + WriteTimeoutMargin so it
+// automatically tracks whatever operation budget the operator
+// configures.
 const (
-	defaultReadHeaderTimeout = 5 * time.Second
-	defaultReadTimeout       = 60 * time.Second
-	defaultWriteTimeout      = 60 * time.Second
-	defaultIdleTimeout       = 120 * time.Second
+	defaultReadHeaderTimeout  = 5 * time.Second
+	defaultReadTimeout        = 60 * time.Second
+	defaultWriteTimeout       = 0
+	defaultIdleTimeout        = 120 * time.Second
+	defaultOperationTimeout   = 30 * time.Minute
+	defaultWriteTimeoutMargin = 5 * time.Minute
+	defaultSocketProbeTimeout = 500 * time.Millisecond
 )
 
 // Config is the daemon's trusted host-side configuration. All
-// fields except SocketPath, SocketGroup, and MaxRequestBytes are
+// fields except SocketPath, SocketGroup, MaxRequestBytes,
+// OperationTimeout, SocketProbeTimeout, and WriteTimeoutMargin are
 // forwarders into the deploy package's config types. The daemon
 // does not mutate these structs after construction.
 type Config struct {
@@ -75,6 +83,20 @@ type Config struct {
 	// MaxRequestBytes caps the request body. Zero means
 	// defaultMaxRequestBytes.
 	MaxRequestBytes int64
+	// OperationTimeout caps the wall-clock duration of a deploy or
+	// rollback handler. Defaults to defaultOperationTimeout (30
+	// minutes) when zero. The HTTP WriteTimeout is derived from this
+	// value so an operation that completes inside its budget can
+	// always write its response.
+	OperationTimeout time.Duration
+	// SocketProbeTimeout is the dial timeout used when probing
+	// a pre-existing socket file at startup. Zero means
+	// defaultSocketProbeTimeout.
+	SocketProbeTimeout time.Duration
+	// WriteTimeoutMargin is added to OperationTimeout when
+	// computing the HTTP server's WriteTimeout. Zero means
+	// defaultWriteTimeoutMargin.
+	WriteTimeoutMargin time.Duration
 	// Source is the trusted source-resolution configuration.
 	Source deploy.SourceConfig
 	// Runtime is the trusted runtime configuration.
@@ -124,6 +146,49 @@ func (c *Config) MaxRequestBytesOrDefault() int64 {
 		return c.MaxRequestBytes
 	}
 	return defaultMaxRequestBytes
+}
+
+// OperationTimeoutOrDefault returns the effective operation
+// timeout. The default is large enough for a slow first-time build
+// of an app image because the daemon's HTTP server derives its
+// WriteTimeout from this value: a 30-minute deploy followed by a
+// small JSON response must reach the client.
+func (c *Config) OperationTimeoutOrDefault() time.Duration {
+	if c.OperationTimeout > 0 {
+		return c.OperationTimeout
+	}
+	return defaultOperationTimeout
+}
+
+// SocketProbeTimeoutOrDefault returns the dial timeout used when
+// probing a pre-existing socket file at startup.
+func (c *Config) SocketProbeTimeoutOrDefault() time.Duration {
+	if c.SocketProbeTimeout > 0 {
+		return c.SocketProbeTimeout
+	}
+	return defaultSocketProbeTimeout
+}
+
+// WriteTimeoutMarginOrDefault returns the margin added to the
+// operation timeout when computing the HTTP server's WriteTimeout.
+func (c *Config) WriteTimeoutMarginOrDefault() time.Duration {
+	if c.WriteTimeoutMargin > 0 {
+		return c.WriteTimeoutMargin
+	}
+	return defaultWriteTimeoutMargin
+}
+
+// WriteTimeout returns the HTTP WriteTimeout derived from the
+// operation timeout and its margin. Returns 0 (no timeout) when
+// the operation timeout is 0; otherwise returns operation + margin
+// so a deploy that runs up to its budget can still write its
+// response.
+func (c *Config) WriteTimeout() time.Duration {
+	op := c.OperationTimeoutOrDefault()
+	if op <= 0 {
+		return 0
+	}
+	return op + c.WriteTimeoutMarginOrDefault()
 }
 
 // dockerRunner abstracts `docker inspect` so tests can substitute
@@ -224,13 +289,28 @@ func (s *Server) IsShuttingDown() bool {
 	return s.shuttingDown.Load()
 }
 
-// removeStaleSocket deletes a leftover socket file at the
-// configured path. A leftover socket from a previous crashed
-// daemon is safe to remove; refusing to do so would block
-// startup on a never-listening path. We refuse to remove a
-// non-socket file at that path because that signals operator
-// misconfiguration rather than a stale socket.
-func removeStaleSocket(path string) error {
+// prepareSocket handles the pre-bind path at the configured socket
+// location. It is the inverse of the previous "removeStaleSocket":
+//
+//   - If the path does not exist, it does nothing.
+//   - If the path is occupied by a regular file (or anything that is
+//     not a Unix socket), it refuses to touch it; that signals
+//     operator misconfiguration rather than a stale socket.
+//   - If the path is occupied by a socket, it probes whether a
+//     daemon is actively listening. A successful probe means
+//     "another agentctld is running here, refuse to start" and is
+//     returned as ErrSocketInUse so the entrypoint exits non-zero
+//     with a clear message. A failed probe (connection refused)
+//     means the socket file is stale and is safe to unlink.
+//
+// The probe-then-unlink order is the difference between this
+// implementation and a naive "always Remove" helper: removing a
+// socket file out from under a running daemon disconnects its
+// clients without warning and races bind attempts, while here we
+// only remove the file when nothing is bound to it. The remaining
+// race between probe and Listen is unavoidable and surfaces as a
+// bind error if another process grabs the path in the gap.
+func prepareSocket(path string, probeTimeout time.Duration) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -241,8 +321,48 @@ func removeStaleSocket(path string) error {
 	if info.Mode()&os.ModeSocket == 0 {
 		return fmt.Errorf("refusing to remove non-socket file at %s", path)
 	}
+	if probeSocket(path, probeTimeout) {
+		return fmt.Errorf("%w: %s", ErrSocketInUse, path)
+	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove stale socket: %w", err)
+	}
+	return nil
+}
+
+// probeSocket returns true when a daemon is actively accepting
+// connections on path. A short dial timeout avoids hanging on a
+// listener that has accepted its queue but stopped processing; the
+// caller's definition of "stale" is "not accepting a connection
+// inside the probe budget".
+func probeSocket(path string, timeout time.Duration) bool {
+	if timeout <= 0 {
+		timeout = defaultSocketProbeTimeout
+	}
+	conn, err := net.DialTimeout("unix", path, timeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// requireSocketParent verifies the parent directory of path exists
+// and is a directory. We do not create it: the process supervisor
+// (systemd RuntimeDirectory=, runit, OpenRC, ...) owns that
+// directory's ownership and permissions, and the daemon must never
+// silently override them.
+func requireSocketParent(path string) error {
+	parent := filepath.Dir(path)
+	info, err := os.Stat(parent)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %s", ErrSocketParentMissing, parent)
+		}
+		return fmt.Errorf("stat socket parent %s: %w", parent, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%w: %s is not a directory", ErrSocketParentMissing, parent)
 	}
 	return nil
 }
@@ -251,8 +371,26 @@ func removeStaleSocket(path string) error {
 // cancelled or a non-recoverable error occurs. Stale sockets are
 // removed before bind. The socket is chmod'd after listen. On
 // return the socket is closed and removed.
+//
+// The pre-bind sequence is:
+//
+//  1. requireSocketParent: refuse to start if the configured
+//     socket's parent directory is missing or is not a directory.
+//     The daemon does not create it; the process supervisor owns
+//     that directory. There is no operator override: the contract
+//     is fixed because creating the parent inside the daemon
+//     would mask supervisor misconfiguration.
+//  2. prepareSocket: probe a pre-existing socket, fail when a
+//     daemon is actively listening, otherwise unlink it.
+//
+// The HTTP server's WriteTimeout is derived from
+// cfg.OperationTimeout + cfg.WriteTimeoutMargin so an operation
+// that completes inside its budget can always write its response.
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	if err := removeStaleSocket(s.cfg.SocketPath); err != nil {
+	if err := requireSocketParent(s.cfg.SocketPath); err != nil {
+		return err
+	}
+	if err := prepareSocket(s.cfg.SocketPath, s.cfg.SocketProbeTimeoutOrDefault()); err != nil {
 		return err
 	}
 	listener, err := net.Listen("unix", s.cfg.SocketPath)
@@ -283,7 +421,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		Handler:           mux,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 		ReadTimeout:       defaultReadTimeout,
-		WriteTimeout:      defaultWriteTimeout,
+		WriteTimeout:      s.cfg.WriteTimeout(),
 		IdleTimeout:       defaultIdleTimeout,
 		MaxHeaderBytes:    1 << 16,
 	}
@@ -525,10 +663,17 @@ func (s *Server) handleInspect(w http.ResponseWriter, r *http.Request) {
 	if resp.Valid {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
-		if _, serr := deploy.CheckoutSource(ctx, s.cfg.Source, s.cfg.Source.AllowedOrg, req.App, req.Commit); serr != nil {
+		// VerifyCommit is the side-effect-free counterpart of
+		// CheckoutSource: it validates the commit against the
+		// trusted mirror without creating a worktree, so the
+		// handler does not have to schedule a CleanupCheckout
+		// pass. ensureMirror still creates the bare mirror on
+		// first use; that mirror is shared with deploys and
+		// therefore not a per-inspect side effect.
+		if verr := deploy.VerifyCommit(ctx, s.cfg.Source, s.cfg.Source.AllowedOrg, req.App, req.Commit); verr != nil {
 			resp.SourceReachable = false
 			resp.Valid = false
-			resp.Errors = append(resp.Errors, fmt.Sprintf("source: %v", serr))
+			resp.Errors = append(resp.Errors, fmt.Sprintf("source: %v", verr))
 		} else {
 			resp.SourceReachable = true
 		}
@@ -604,8 +749,10 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request, app string
 	// deployment mid-pipeline. Graceful shutdown cooperates by
 	// calling Shutdown on the server which cancels new requests
 	// and waits for in-flight handlers to drain via the
-	// http.Server.Shutdown path.
-	deployCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	// http.Server.Shutdown path. The timeout is tied to the
+	// configured OperationTimeout (which also drives the HTTP
+	// server's WriteTimeout).
+	deployCtx, cancel := context.WithTimeout(context.Background(), s.cfg.OperationTimeoutOrDefault())
 	defer cancel()
 
 	res, derr := s.deployer.Deploy(deployCtx, deployCfg, *manifest, req.Commit)
@@ -695,7 +842,7 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request, app stri
 		HealthPath: req.HealthPath,
 	}
 
-	rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), s.cfg.OperationTimeoutOrDefault())
 	defer cancel()
 	if rerr := s.deployer.Rollback(rollbackCtx, rollbackCfg); rerr != nil {
 		s.log.Error("rollback-failed", map[string]any{

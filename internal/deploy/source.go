@@ -194,6 +194,34 @@ func validateCommit(ctx context.Context, mirrorPath, commit string) error {
 	return nil
 }
 
+// VerifyCommit validates that commit exists in the trusted mirror
+// and is reachable from refs/remotes/origin/main, without creating a
+// worktree. It is the side-effect-free counterpart of CheckoutSource:
+//
+//   - No worktree is added under cfg.RepositoryRoot, so callers do
+//     not have to schedule a CleanupCheckout pass.
+//   - On first use, ensureMirror still creates the bare mirror and
+//     populates refs/remotes/origin/main; that is unavoidable because
+//     validateCommit needs a local mirror with a current
+//     refs/remotes/origin/main to test reachability against. It is,
+//     however, the same mirror creation that any first-use deploy
+//     would do, so VerifyCommit does not introduce a new persistent
+//     side effect beyond the shared bare mirror.
+//
+// Use VerifyCommit for inspect / preflight calls. Use CheckoutSource
+// when the caller actually needs a working tree (deploy build steps,
+// rollback inspection, etc.).
+func VerifyCommit(ctx context.Context, cfg SourceConfig, organisation, repository, commit string) error {
+	if err := validateSourceInputs(cfg, organisation, repository, commit); err != nil {
+		return err
+	}
+	mirrorPath := filepath.Join(cfg.RepositoryRoot, repository+".git")
+	if err := ensureMirror(ctx, mirrorPath, cfg); err != nil {
+		return err
+	}
+	return validateCommit(ctx, mirrorPath, commit)
+}
+
 func createDetachedCheckout(ctx context.Context, mirrorPath, checkoutPath, commit string) error {
 	if _, err := os.Stat(checkoutPath); err == nil {
 		return fmt.Errorf("%w: %s", ErrCheckoutExists, checkoutPath)

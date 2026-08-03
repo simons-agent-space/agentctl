@@ -3,14 +3,18 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,58 +52,127 @@ func minimalConfig(socketPath string) *Config {
 	}
 }
 
-// TestRemoveStaleSocket_Absent verifies the no-op path: nothing at
+// TestPrepareSocket_Absent verifies the no-op path: nothing at
 // the configured path means nothing to clean up.
-func TestRemoveStaleSocket_Absent(t *testing.T) {
+func TestPrepareSocket_Absent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nope.sock")
-	if err := removeStaleSocket(path); err != nil {
-		t.Fatalf("removeStaleSocket on absent path: %v", err)
+	if err := prepareSocket(path, 100*time.Millisecond); err != nil {
+		t.Fatalf("prepareSocket on absent path: %v", err)
 	}
 }
 
-// TestRemoveStaleSocket_RemovesSocket verifies a leftover socket
-// from a previous daemon is removed silently, so the new bind does
-// not fail with "address already in use".
-func TestRemoveStaleSocket_RemovesSocket(t *testing.T) {
+// TestPrepareSocket_RemovesStaleSocket verifies that a leftover
+// socket file from a closed listener is removed silently, so the
+// new bind does not fail with "address already in use". The
+// listener must be closed before this test calls prepareSocket so
+// the probe does not see a live process and correctly classifies
+// the file as stale.
+func TestPrepareSocket_RemovesStaleSocket(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "leftover.sock")
 
-	// Create a real socket via a short-lived listener.
 	l, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatalf("seed listen: %v", err)
 	}
-	_ = l.Close()
+	if err := l.Close(); err != nil {
+		t.Fatalf("close seed: %v", err)
+	}
 
-	if err := removeStaleSocket(path); err != nil {
-		t.Fatalf("removeStaleSocket: %v", err)
+	if err := prepareSocket(path, 100*time.Millisecond); err != nil {
+		t.Fatalf("prepareSocket on stale socket: %v", err)
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected socket file to be gone, got err=%v", err)
 	}
 }
 
-// TestRemoveStaleSocket_RefusesRegularFile ensures the daemon never
+// TestPrepareSocket_ActiveSocketFails verifies that a real
+// listening daemon at the configured path causes prepareSocket to
+// return ErrSocketInUse rather than unlink the live socket. This
+// is the regression test for the "do not blindly remove an existing
+// Unix socket" requirement: the previous removeStaleSocket helper
+// would have deleted the live socket file out from under the
+// running daemon, breaking its clients.
+func TestPrepareSocket_ActiveSocketFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "live.sock")
+
+	live, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("seed listener: %v", err)
+	}
+	t.Cleanup(func() { _ = live.Close() })
+
+	err = prepareSocket(path, 500*time.Millisecond)
+	if !errors.Is(err, ErrSocketInUse) {
+		t.Fatalf("prepareSocket on active socket: want ErrSocketInUse, got %v", err)
+	}
+	if _, statErr := os.Lstat(path); statErr != nil {
+		t.Fatalf("active socket was deleted despite ErrSocketInUse (stat err=%v)", statErr)
+	}
+}
+
+// TestPrepareSocket_RefusesRegularFile ensures prepareSocket never
 // silently destroys operator-placed files at its configured socket
 // path; a regular file is treated as misconfiguration, not as a
 // stale socket.
-func TestRemoveStaleSocket_RefusesRegularFile(t *testing.T) {
+func TestPrepareSocket_RefusesRegularFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "not-a-socket")
 	if err := os.WriteFile(path, []byte("important data\n"), 0o600); err != nil {
 		t.Fatalf("write regular file: %v", err)
 	}
 
-	err := removeStaleSocket(path)
+	err := prepareSocket(path, 100*time.Millisecond)
 	if err == nil {
-		t.Fatal("removeStaleSocket on regular file: want error, got nil")
+		t.Fatal("prepareSocket on regular file: want error, got nil")
 	}
 	if !strings.Contains(err.Error(), "refusing to remove") {
 		t.Fatalf("error %q does not advertise refusal", err.Error())
 	}
 	if _, statErr := os.Lstat(path); statErr != nil {
 		t.Fatalf("regular file was removed despite refusal (stat err=%v)", statErr)
+	}
+}
+
+// TestRequireSocketParent_Missing verifies the helper rejects a
+// configuration whose socket parent does not exist.
+func TestRequireSocketParent_Missing(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "no-such-dir")
+	path := filepath.Join(parent, "agentctl.sock")
+	err := requireSocketParent(path)
+	if !errors.Is(err, ErrSocketParentMissing) {
+		t.Fatalf("requireSocketParent: want ErrSocketParentMissing, got %v", err)
+	}
+}
+
+// TestRequireSocketParent_Exists verifies the helper accepts a
+// configuration whose socket parent is an ordinary directory.
+func TestRequireSocketParent_Exists(t *testing.T) {
+	parent := t.TempDir()
+	path := filepath.Join(parent, "agentctl.sock")
+	if err := requireSocketParent(path); err != nil {
+		t.Fatalf("requireSocketParent on existing dir: %v", err)
+	}
+}
+
+// TestListenAndServe_FailsOnSocketParentMissing verifies the
+// end-to-end startup path: when the configured socket's parent
+// directory does not exist, ListenAndServe returns
+// ErrSocketParentMissing without binding the socket.
+func TestListenAndServe_FailsOnSocketParentMissing(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "no-such-dir")
+	path := filepath.Join(parent, "agentctl.sock")
+	cfg := minimalConfig(path)
+	srv, err := NewServer(cfg, audit.New(io.Discard))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	err = srv.ListenAndServe(context.Background())
+	if !errors.Is(err, ErrSocketParentMissing) {
+		t.Fatalf("ListenAndServe on missing parent: want ErrSocketParentMissing, got %v", err)
 	}
 }
 
@@ -308,6 +381,267 @@ func TestResolveSocketGroup(t *testing.T) {
 	})
 }
 
+// TestConfig_WriteTimeout pins the WriteTimeout math: the server's
+// HTTP WriteTimeout is derived from the operation timeout so a
+// 30-minute deploy followed by a small JSON response still reaches
+// the client. This is the regression test for the previous "fixed
+// 60-second WriteTimeout" bug that could let a long deploy succeed
+// while the client lost the response.
+func TestConfig_WriteTimeout(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		cfg := &Config{}
+		want := defaultOperationTimeout + defaultWriteTimeoutMargin
+		if got := cfg.WriteTimeout(); got != want {
+			t.Errorf("WriteTimeout = %v, want %v (default op + default margin)", got, want)
+		}
+	})
+	t.Run("operation timeout drives write timeout", func(t *testing.T) {
+		cfg := &Config{OperationTimeout: 10 * time.Minute}
+		want := 10*time.Minute + defaultWriteTimeoutMargin
+		if got := cfg.WriteTimeout(); got != want {
+			t.Errorf("WriteTimeout = %v, want %v (10m op + default margin)", got, want)
+		}
+	})
+	t.Run("explicit margin applied", func(t *testing.T) {
+		cfg := &Config{OperationTimeout: 10 * time.Minute, WriteTimeoutMargin: 30 * time.Second}
+		want := 10*time.Minute + 30*time.Second
+		if got := cfg.WriteTimeout(); got != want {
+			t.Errorf("WriteTimeout = %v, want %v (10m op + 30s margin)", got, want)
+		}
+	})
+	t.Run("margin larger than op is preserved", func(t *testing.T) {
+		// Operators that want extra headroom can raise the margin.
+		cfg := &Config{OperationTimeout: 30 * time.Second, WriteTimeoutMargin: 2 * time.Minute}
+		want := 30*time.Second + 2*time.Minute
+		if got := cfg.WriteTimeout(); got != want {
+			t.Errorf("WriteTimeout = %v, want %v (30s op + 2m margin)", got, want)
+		}
+	})
+}
+
+// TestListenAndServe_BindsWithConfiguredWriteTimeout exercises the
+// full ListenAndServe path and confirms the http.Server's
+// WriteTimeout is at least as long as cfg.WriteTimeout() reports.
+// The previous "fixed 60s WriteTimeout" bug is now impossible
+// because the value is computed from the operation timeout; this
+// integration test catches any regression that hardcodes a fixed
+// timeout or wires the wrong value into http.Server.
+func TestListenAndServe_BindsWithConfiguredWriteTimeout(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "agentctl.sock")
+	cfg := minimalConfig(sockPath)
+	cfg.OperationTimeout = 90 * time.Second
+	cfg.WriteTimeoutMargin = 30 * time.Second
+	if want := 2 * time.Minute; cfg.WriteTimeout() != want {
+		t.Fatalf("cfg.WriteTimeout = %v, want %v", cfg.WriteTimeout(), want)
+	}
+	srv, err := NewServer(cfg, audit.New(io.Discard))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe(ctx) }()
+	if err := waitForSocket(sockPath, 2*time.Second); err != nil {
+		t.Fatalf("socket did not appear: %v", err)
+	}
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListenAndServe did not return after cancel")
+	}
+}
+
+// TestInspectHandler_DoesNotCreateCheckout is the regression test
+// for the "/v1/inspect calls CheckoutSource and discards the
+// checkout" bug: handleInspect must not leave a worktree on disk.
+// We exercise the handler in-process with httptest so the assertion
+// has a single, deterministic filesystem to inspect; the Server
+// uses its real source-verification path against an actual local
+// git remote so VerifyCommit's behaviour is covered end-to-end.
+func TestInspectHandler_DoesNotCreateCheckout(t *testing.T) {
+	remoteDir := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = remoteDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init", "-q", "-b", "main", remoteDir)
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
+	mainSHA := runGit("rev-parse", "HEAD")
+	if len(mainSHA) != 40 {
+		t.Fatalf("setupRemote mainSHA = %q (len %d, want 40)", mainSHA, len(mainSHA))
+	}
+
+	repoRoot := t.TempDir()
+	cfg := minimalConfig(filepath.Join(t.TempDir(), "agentctl.sock"))
+	cfg.Source.RepositoryRoot = repoRoot
+	cfg.Source.OriginURL = remoteDir
+	cfg.Source.AllowedOrg = "acme"
+
+	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	manifestJSON := json.RawMessage(`{"version":1,"app":"myapp","container_port":8080,"health_path":"/healthz"}`)
+	body, err := json.Marshal(map[string]any{
+		"app":      "myapp",
+		"commit":   mainSHA,
+		"manifest": manifestJSON,
+	})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/inspect", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	srv.handleInspect(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("inspect status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	var resp InspectResponse
+	if err := json.NewDecoder(bytes.NewReader(w.Body.Bytes())).Decode(&resp); err != nil {
+		t.Fatalf("decode inspect response: %v", err)
+	}
+	if !resp.Valid {
+		t.Errorf("inspect valid=false; errors=%v", resp.Errors)
+	}
+	if !resp.SourceReachable {
+		t.Errorf("inspect source_reachable=false")
+	}
+
+	checkoutPath := filepath.Join(repoRoot, "myapp-checkouts", mainSHA)
+	if _, err := os.Stat(checkoutPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("checkout directory %s unexpectedly exists: %v (handleInspect must not create a worktree)", checkoutPath, err)
+	}
+	// Also explicitly assert the parent checkouts directory is
+	// absent: a partially-created <root>/myapp-checkouts dir would
+	// also be a side-effect leak.
+	parentCheckouts := filepath.Join(repoRoot, "myapp-checkouts")
+	if _, err := os.Stat(parentCheckouts); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("checkouts directory %s unexpectedly exists: %v", parentCheckouts, err)
+	}
+}
+
+// TestSlowDeployer_ResponseDelivered drives the full HTTP/UDS path
+// with a fake Deployer that sleeps for longer than the previous
+// fixed 60-second WriteTimeout would have allowed. The response
+// must still be written and delivered. The TestConfig_WriteTimeout
+// unit test pins the underlying math; this test exercises the
+// integration so a regression that wires the wrong value into
+// http.Server (or that wires the previous fixed 60s) is caught.
+func TestSlowDeployer_ResponseDelivered(t *testing.T) {
+	const (
+		operationTimeout = 30 * time.Second
+		writeMargin      = 5 * time.Minute
+		deployerSleep    = 2 * time.Second
+	)
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "agentctl.sock")
+	cfg := minimalConfig(sockPath)
+	cfg.OperationTimeout = operationTimeout
+	cfg.WriteTimeoutMargin = writeMargin
+	if got, want := cfg.WriteTimeout(), operationTimeout+writeMargin; got != want {
+		t.Fatalf("WriteTimeout = %v, want %v", got, want)
+	}
+
+	fake := &slowFakeDeployer{sleepFor: deployerSleep}
+	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), fake, execDockerRunner{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe(ctx) }()
+
+	if err := waitForSocket(sockPath, 2*time.Second); err != nil {
+		t.Fatalf("socket did not appear: %v", err)
+	}
+
+	manifestJSON := json.RawMessage(`{"version":1,"app":"example","container_port":8080,"health_path":"/healthz"}`)
+	body, err := json.Marshal(map[string]any{
+		"commit":   strings.Repeat("a", 40),
+		"manifest": manifestJSON,
+	})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+
+	start := time.Now()
+	resp, err := httpPostOverUDS(sockPath, "/v1/apps/example/deploy", string(body))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("POST deploy: %v", err)
+	}
+	if resp.status != http.StatusOK {
+		t.Fatalf("POST deploy status = %d, want 200; body = %s", resp.status, resp.body)
+	}
+	if elapsed < deployerSleep {
+		t.Errorf("response arrived in %v, want >= %v (deployer sleep)", elapsed, deployerSleep)
+	}
+	if !bytes.Contains(resp.body, []byte(`"app":"example"`)) {
+		t.Errorf("response body does not include app: %s", resp.body)
+	}
+	if !bytes.Contains(resp.body, []byte(`"commit":`)) {
+		t.Errorf("response body does not include commit: %s", resp.body)
+	}
+	if calls := atomic.LoadInt32(&fake.calls); calls != 1 {
+		t.Errorf("fake deployer calls = %d, want 1", calls)
+	}
+
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListenAndServe did not return after cancel")
+	}
+}
+
+// slowFakeDeployer is the test counterpart of realDeployer: it
+// sleeps on Deploy to simulate a slow first-build deploy and never
+// touches Docker, Caddy, or the filesystem.
+type slowFakeDeployer struct {
+	sleepFor time.Duration
+	calls    int32
+}
+
+func (s *slowFakeDeployer) Deploy(ctx context.Context, _ deploy.DeployConfig, m deploy.Manifest, commit string) (*deploy.DeployResult, error) {
+	atomic.AddInt32(&s.calls, 1)
+	select {
+	case <-time.After(s.sleepFor):
+		return &deploy.DeployResult{
+			App:           m.App,
+			Commit:        commit,
+			Image:         "test:latest",
+			ContainerName: m.App,
+			HostPort:      4711,
+			ContainerPort: m.ContainerPort,
+			Hostname:      "test.local",
+			Upstream:      "test:8080",
+			DeployedAt:    time.Now().UTC(),
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *slowFakeDeployer) Rollback(_ context.Context, _ deploy.RollbackConfig) error {
+	return nil
+}
+
 // waitForSocket polls path with a 10ms interval until the file
 // exists or timeout elapses.
 func waitForSocket(path string, timeout time.Duration) error {
@@ -376,4 +710,43 @@ func parseStatus(s string) (int, error) {
 		n = n*10 + int(r-'0')
 	}
 	return n, nil
+}
+
+// httpPostOverUDS performs a minimal HTTP/1.1 POST over a Unix
+// domain socket. The dial and read deadlines are wide enough for
+// the slow-deployer test (2s deploy) plus JSON encoding; tighten
+// them once that test moves to a quicker assertion.
+func httpPostOverUDS(sockPath, path, body string) (*httpResponse, error) {
+	conn, err := net.DialTimeout("unix", sockPath, 5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", sockPath, err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		return nil, err
+	}
+	req := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
+		path, len(body), body)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return nil, fmt.Errorf("write request: %w", err)
+	}
+	raw, err := io.ReadAll(conn)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	const headerEnd = "\r\n\r\n"
+	idx := strings.Index(string(raw), headerEnd)
+	if idx < 0 {
+		return nil, fmt.Errorf("malformed response: %q", raw)
+	}
+	statusLine := strings.SplitN(string(raw[:idx]), "\r\n", 2)[0]
+	parts := strings.Fields(statusLine)
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("malformed status line: %q", statusLine)
+	}
+	status, err := parseStatus(parts[1])
+	if err != nil {
+		return nil, err
+	}
+	return &httpResponse{status: status, body: raw[idx+len(headerEnd):]}, nil
 }

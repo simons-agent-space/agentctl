@@ -59,4 +59,21 @@ var (
 	// manifest value, not a deployment identity value), so the
 	// caller must supply it on rollback.
 	ErrHealthPathRequired = errors.New("health_path is required for rollback")
+
+	// ErrSocketInUse is returned at startup when a pre-existing
+	// socket file is occupied by a daemon that is actively
+	// accepting connections. The daemon probes the path before
+	// removing anything; a successful probe means "another
+	// daemon is running, refuse to start" rather than "stale
+	// socket, safe to unlink".
+	ErrSocketInUse = errors.New("socket path is held by a running daemon")
+
+	// ErrSocketParentMissing is returned at startup when the
+	// parent directory of the configured socket path does not
+	// exist or is not a directory. The daemon does not create
+	// the parent itself: the process supervisor (systemd
+	// RuntimeDirectory=, an OpenRC script, runit, etc.) is the
+	// authoritative owner of that directory so its ownership and
+	// permissions cannot be silently overridden by the daemon.
+	ErrSocketParentMissing = errors.New("socket parent directory is missing or not a directory")
 )
