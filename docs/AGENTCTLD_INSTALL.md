@@ -120,31 +120,40 @@ OpenClaw sandbox but not the daemon's other duties), the socket
 is chowned to `agentctl-clients` but systemd does **not** change
 the parent directory's group ownership. Adding the `agentctld`
 user to a supplementary group does not change the parent
-directory's group either. The operator must choose one of these
-working configurations:
+directory's group either. A `tmpfiles.d(5)` fragment is **not**
+a working override: `RuntimeDirectory=agentctld` reasserts the
+configured `User`, `Group`, and `RuntimeDirectoryMode` on every
+service start, and the runtime directory is removed when the
+service stops. The operator must use a directory mode that
+permits traversal without the directory's group being
+`agentctl-clients`.
 
-1. **Widen the parent directory to world-traversable.** Set
-   `RuntimeDirectoryMode=0755` in the unit. The socket itself
-   remains `0660` with group `agentctl-clients`, so an attacker
-   who somehow traverses the directory still cannot connect
-   without being in `agentctl-clients`. Every client user is
-   added to the `agentctl-clients` group:
-   ```
-   groupadd agentctl-clients
-   usermod --append --groups agentctl-clients agentctld
-   usermod --append --groups agentctl-clients <client-user>
-   ```
+The simplest working configuration:
 
-2. **Override the parent directory via `tmpfiles.d(5)`.** Drop a
-   snippet that assigns the directory's group and mode at boot:
-   ```
-   # /etc/tmpfiles.d/agentctld.conf
-   d /run/agentctld 0750 agentctld agentctl-clients - -
-   ```
-   `RuntimeDirectory=agentctld` creates the directory; the
-   `tmpfiles.d` fragment reassigns group ownership to
-   `agentctl-clients` while keeping mode `0750` so only
-   `agentctld` and `agentctl-clients` members can traverse.
+```
+groupadd agentctl-clients
+usermod --append --groups agentctl-clients agentctld
+usermod --append --groups agentctl-clients <client-user>
+```
+
+And in the unit (a `systemctl edit agentctld` override is the
+cleanest place to set this):
+
+```
+RuntimeDirectoryMode=0711
+```
+
+Mode `0711` permits any local user to traverse the directory
+(the `x` bit is set for "other") but does not permit them to
+list its contents (the `r` bit is not set for "other"). The
+socket file itself stays `0660` with group `agentctl-clients`,
+so a local user who is not in `agentctl-clients` cannot connect
+to the socket — they can only pass through the directory.
+
+Do **not** use `RuntimeDirectoryMode=0755`: that mode sets the
+`r` bit for "other", which permits world directory listing and
+reveals the existence of the socket. `0711` is the right
+traversable-but-not-listable mode.
 
 The socket is always created with mode `0660` (configurable via
 `AGENTCTLD_SOCKET_MODE`); the group ownership is what gates
