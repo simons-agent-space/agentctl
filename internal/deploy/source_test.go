@@ -390,6 +390,122 @@ func TestCleanupCheckout_RefusesPathsOutsideRoot(t *testing.T) {
 	}
 }
 
+// TestVerifyCommit_ReachableOnMainAccepted verifies the happy path
+// returns no error and creates no worktree on disk.
+func TestVerifyCommit_ReachableOnMainAccepted(t *testing.T) {
+	remote, mainSHA, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
+
+	if err := VerifyCommit(context.Background(), cfg, "myorg", "myrepo", mainSHA); err != nil {
+		t.Fatalf("VerifyCommit: %v", err)
+	}
+}
+
+// TestVerifyCommit_InvalidInputsRejected checks every validation
+// rule the public helper must apply without ever reaching git. None
+// of them touch the filesystem, so we use an origin path that does
+// not exist.
+func TestVerifyCommit_InvalidInputsRejected(t *testing.T) {
+	cfg := newConfig(t, "file:///nonexistent")
+	cases := []struct {
+		name string
+		org  string
+		repo string
+		sha  string
+		want error
+	}{
+		{"empty organisation", "", "myrepo", strings.Repeat("a", 40), ErrInvalidInput},
+		{"org mismatch", "not-myorg", "myrepo", strings.Repeat("a", 40), ErrInvalidInput},
+		{"invalid repo name", "myorg", "MyRepo", strings.Repeat("a", 40), ErrInvalidInput},
+		{"short sha", "myorg", "myrepo", strings.Repeat("a", 39), ErrInvalidInput},
+		{"non-hex sha", "myorg", "myrepo", strings.Repeat("z", 40), ErrInvalidInput},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := VerifyCommit(context.Background(), cfg, tc.org, tc.repo, tc.sha)
+			if !errors.Is(err, tc.want) {
+				t.Errorf("got %v, want errors.Is(_, %v)", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestVerifyCommit_MissingCommitRejected verifies that a well-formed
+// but absent SHA is reported as ErrCommitNotFound, not ErrInvalidInput.
+func TestVerifyCommit_MissingCommitRejected(t *testing.T) {
+	remote, _, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
+	if err := VerifyCommit(context.Background(), cfg, "myorg", "myrepo", strings.Repeat("0", 40)); !errors.Is(err, ErrCommitNotFound) {
+		t.Errorf("got %v, want errors.Is(_, ErrCommitNotFound)", err)
+	}
+}
+
+// TestVerifyCommit_UnreachableRejected verifies that a commit in a
+// non-main branch is reported as ErrUnreachableCommit.
+func TestVerifyCommit_UnreachableRejected(t *testing.T) {
+	remote, _, featureSHA := setupRemote(t)
+	cfg := newConfig(t, remote)
+	if err := VerifyCommit(context.Background(), cfg, "myorg", "myrepo", featureSHA); !errors.Is(err, ErrUnreachableCommit) {
+		t.Errorf("got %v, want errors.Is(_, ErrUnreachableCommit)", err)
+	}
+}
+
+// TestVerifyCommit_NonCommitObjectRejected verifies that a tree/blob
+// SHA passes cat-file check on a real repo, so the function must rely
+// on validateCommit's object-type rule. This guarantees VerifyCommit
+// refuses to treat a tree or tag object as a commit.
+func TestVerifyCommit_NonCommitObjectRejected(t *testing.T) {
+	remote, _, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
+
+	// Materialise the bare mirror via CheckoutSource so the tree SHA
+	// is resolvable there.
+	first, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mustCommit(t, remote))
+	if err != nil {
+		t.Fatalf("setup checkout: %v", err)
+	}
+	defer CleanupCheckout(context.Background(), cfg, *first)
+
+	cleanTree, err := gitTreeSHA(t, first.MirrorPath, mustCommit(t, remote))
+	if err != nil {
+		t.Fatalf("get tree SHA: %v", err)
+	}
+	if err := VerifyCommit(context.Background(), cfg, "myorg", "myrepo", cleanTree); !errors.Is(err, ErrNotCommitObject) {
+		t.Errorf("got %v, want errors.Is(_, ErrNotCommitObject)", err)
+	}
+}
+
+// TestVerifyCommit_DoesNotCreateCheckout asserts the side-effect-free
+// contract: after a successful VerifyCommit there must be no
+// <repo>-checkouts/<commit> directory on disk. This is the
+// regression test for the previous /v1/inspect handler, which
+// called CheckoutSource and then dropped the result without calling
+// CleanupCheckout.
+func TestVerifyCommit_DoesNotCreateCheckout(t *testing.T) {
+	remote, mainSHA, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
+
+	if err := VerifyCommit(context.Background(), cfg, "myorg", "myrepo", mainSHA); err != nil {
+		t.Fatalf("VerifyCommit: %v", err)
+	}
+
+	expected := filepath.Join(cfg.RepositoryRoot, "myrepo-checkouts", mainSHA)
+	if _, err := os.Stat(expected); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("checkout directory %s unexpectedly exists: %v", expected, err)
+	}
+}
+
+// gitTreeSHA returns the tree SHA associated with commit inside repo.
+func gitTreeSHA(t *testing.T, repo, commit string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("git", "-C", repo, "rev-parse", commit+"^{tree}")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 func mustCommit(t *testing.T, remote string) string {
 	t.Helper()
 	cmd := exec.Command("git", "-C", remote, "rev-parse", "HEAD")
