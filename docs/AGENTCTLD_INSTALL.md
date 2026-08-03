@@ -77,9 +77,11 @@ This creates:
 
 The user must be able to drive Docker, which requires being in the
 `docker` group so the daemon can talk to `/var/run/docker.sock`.
-The unit declares `SupplementaryGroups=docker` so the service
-process starts with `docker` in its supplementary groups; this is
-what systemd actually applies to the running daemon. Persistent
+The unit declares `SupplementaryGroups=docker agentctl-clients`
+so the service process starts with both `docker` (to drive the
+docker daemon) and `agentctl-clients` (so the post-bind
+`os.Chown(socket, -1, gid)` to `AGENTCTLD_SOCKET_GROUP=
+agentctl-clients` succeeds) in its supplementary groups. Persistent
 `/etc/group` membership via `usermod -aG docker agentctld` is
 optional in this configuration — it only matters for interactive
 logins, `ssh`, and `su -` as the `agentctld` user, not for the
@@ -89,95 +91,137 @@ systemd service:
 usermod --append --groups docker agentctld   # optional
 ```
 
-For the separate-client-group layout (see
-[Separate-client-group alternative](#separate-client-group-alternative)),
-the unit needs `SupplementaryGroups=docker agentctl-clients` so
-the running daemon can both drive Docker and chown the socket to
-`agentctl-clients`. `RuntimeDirectory` ownership follows
-`User=` / `Group=` (the daemon's primary group), **not**
-supplementary groups; that is why the separate-client-group layout
-also requires `RuntimeDirectoryMode=0711`.
+The `agentctl-clients` group is the dedicated socket-client
+authorisation group (see [Socket group](#socket-group)). The daemon
+is placed in it through `SupplementaryGroups=` **solely** so the
+post-bind `chown(2)` succeeds; the daemon itself does not need
+to access any file as `agentctl-clients`. Authorised clients join
+`agentctl-clients`, not `agentctld`: this keeps the daemon's
+primary group strictly an ownership group for daemon-managed
+directories and prevents socket clients from reading
+`/etc/agentctld/agentctld.env`, audit logs, deployment state,
+source repositories, persistent data, or managed Caddy
+fragments.
+
+`RuntimeDirectory` ownership follows `User=` / `Group=` (the
+daemon's primary group), **not** supplementary groups. The
+dedicated-client-group layout therefore also requires
+`RuntimeDirectoryMode=0711` so any local user can traverse the
+socket parent directory without needing group access to it.
 
 ### Socket group
 
 `AGENTCTLD_SOCKET_GROUP` is the group name or numeric GID that the
 socket is chowned to after bind. The value must be a group that
-the `agentctld` user is in; otherwise the chown(2) call fails with
-`EPERM` and the daemon exits non-zero.
+the `agentctld` user is in; otherwise the `chown(2)` call fails
+with `EPERM` and the daemon exits non-zero. The
+`agentctl-clients` group is created for this purpose and is
+populated with the daemon's UID via `SupplementaryGroups=`; see
+[User and group setup](#user-and-group-setup).
 
-#### Recommended default
+#### Recommended default (production)
 
-`AGENTCTLD_SOCKET_GROUP=agentctld` with `RuntimeDirectoryMode=0750`.
-Every authorised client (e.g. the OpenClaw sandbox user) is added
-to the `agentctld` group:
+`AGENTCTLD_SOCKET_GROUP=agentctl-clients` with
+`AGENTCTLD_SOCKET_MODE=0660` and `RuntimeDirectoryMode=0711`.
+This keeps the daemon's primary group (`agentctld`) strictly an
+ownership group for daemon-managed directories and the dedicated
+client group (`agentctl-clients`) strictly an authorisation
+group for the Unix socket. Because the two groups are disjoint,
+no socket client gets group access to the daemon-managed
+directories.
 
-```
-usermod --append --groups agentctld <client-user>
-```
-
-The socket is owned by `agentctld:agentctld` with mode `0660`, and
-the parent directory `/run/agentctld/` is owned by
-`agentctld:agentctld` with mode `0750`. The socket group and the
-directory group are the same, so every authorised client can
-traverse the directory and connect to the socket. This is the
-narrowest blast radius and the configuration the unit ships with.
-
-#### Separate-client-group alternative
-
-If the operator wants the client group to be different from the
-daemon's primary group (e.g. `agentctl-clients` containing the
-OpenClaw sandbox but not the daemon's other duties), four
-settings must change together: the unit must add the client
-group to `SupplementaryGroups`, the runtime directory mode must
-be widened to `0711`, and the socket's group and mode must be
-explicit. A `tmpfiles.d(5)` fragment is **not** a working
-override: `RuntimeDirectory=agentctld` reasserts the configured
-`User`, `Group`, and `RuntimeDirectoryMode` on every service
-start, and the runtime directory is removed when the service
-stops.
-
-The canonical configuration:
+Create the client group and add every authorised client
+(e.g. the OpenClaw sandbox user) to it:
 
 ```
-groupadd agentctl-clients
+groupadd --system agentctl-clients
 usermod --append --groups agentctl-clients <client-user>
 ```
 
-In the unit override (`systemctl edit agentctld` is the
-cleanest place to set this):
+The OpenClaw client must join `agentctl-clients`, not `agentctld`.
+Joining `agentctld` would give the client group read access to
+`/etc/agentctld/agentctld.env`, audit logs, deployment state,
+source repositories, persistent data, and managed Caddy fragments.
 
-```
-SupplementaryGroups=docker agentctl-clients
-RuntimeDirectoryMode=0711
-```
+The socket is owned by `agentctld:agentctl-clients` with mode
+`0660`, and the parent directory `/run/agentctld/` is owned by
+`agentctld:agentctld` with mode `0711`. The x bit is set for
+"other" (any local user can pass through to reach a known socket
+path); the r bit is not, so a user who is not in `agentctld` or
+`agentctl-clients` cannot list the directory. The socket file
+stays `0660` with group `agentctl-clients`, so a local user who
+is not in `agentctl-clients` cannot connect to the socket — they
+can only pass through the directory.
 
-And in `/etc/agentctld/agentctld.env`:
-
-```
-AGENTCTLD_SOCKET_GROUP=agentctl-clients
-AGENTCTLD_SOCKET_MODE=0660
-```
-
-The first unit line puts the daemon in the target group so the
-post-bind `chown(2)` call succeeds. `RuntimeDirectory` ownership
-follows `User=` / `Group=` (the daemon's primary group), not
-supplementary groups, so the directory stays `agentctld:agentctld`
-even after the daemon joins `agentctl-clients`. Mode `0711`
-permits any local user to traverse the directory (the `x` bit is
-set for "other") but does not permit them to list its contents
-(the `r` bit is not set for "other"). The socket file stays `0660`
-with group `agentctl-clients`, so a local user who is not in
-`agentctl-clients` cannot connect to the socket — they can only
-pass through the directory.
+This is the configuration the unit ships with and what this
+document calls the **recommended default**. The unit declares
+`SupplementaryGroups=docker agentctl-clients` and
+`RuntimeDirectoryMode=0711`; the env file sets
+`AGENTCTLD_SOCKET_GROUP=agentctl-clients` and
+`AGENTCTLD_SOCKET_MODE=0660`.
 
 Do **not** use `RuntimeDirectoryMode=0755`: that mode sets the
 `r` bit for "other", which permits world directory listing and
 reveals the existence of the socket. `0711` is the right
 traversable-but-not-listable mode.
 
+A `tmpfiles.d(5)` fragment is **not** a working override:
+`RuntimeDirectory=agentctld` reasserts the configured `User`,
+`Group`, and `RuntimeDirectoryMode` on every service start, and
+the runtime directory is removed when the service stops.
+
 The socket is always created with mode `0660` (configurable via
 `AGENTCTLD_SOCKET_MODE`); the group ownership is what gates
 access, not the mode.
+
+#### Shared-group alternative (development or explicitly accepted single-role use)
+
+For development or when the operator explicitly accepts the
+broader host-filesystem exposure, the socket can be authorised
+through the daemon's primary group:
+
+```
+# Do NOT use this in production unless the host-filesystem
+# exposure is explicitly accepted.
+AGENTCTLD_SOCKET_GROUP=agentctld
+AGENTCTLD_SOCKET_MODE=0660
+RuntimeDirectoryMode=0750
+```
+
+Every authorised client joins the `agentctld` group:
+
+```
+usermod --append --groups agentctld <client-user>
+```
+
+The socket is owned by `agentctld:agentctld` with mode `0660`,
+and the parent directory `/run/agentctld/` is owned by
+`agentctld:agentctld` with mode `0750`. The socket group and the
+directory group are the same, so every authorised client can
+traverse the directory and connect to the socket.
+
+**Host-filesystem exposure.** This layout has **broader
+host-filesystem exposure** than the recommended default: every
+socket client gains group access to the daemon-managed
+directories, including:
+
+- `/etc/agentctld/agentctld.env` — mode `0640 root:agentctld`,
+  readable by every socket client.
+- `/var/log/agentctld/` — audit log, mode `0750`.
+- `/var/lib/agentctld/state/` — per-app deployment state
+  (`<app>.state.json`), mode `0750`.
+- `/var/lib/agentctld/data/` — per-app persistent data, mode
+  `0750`.
+- `/var/lib/agentctld/sources/` — git bare mirrors and detached
+  checkouts, mode `0750`.
+- `/var/lib/agentctld/caddy/` — managed Caddy fragments, mode
+  `0750`.
+
+A compromised client can read the daemon's environment (including
+any secrets committed there) and the full audit log of every
+deployment. Use this layout only when the operator accepts this
+exposure and client and daemon roles do not need to be separated.
+The recommended default above is correct for production.
 
 ### Docker access and its security implications
 
@@ -224,7 +268,7 @@ path. The operator does not pre-create any of them.
 
 | Purpose | Path | systemd directive | Ownership |
 |---|---|---|---|
-| Socket parent dir | `/run/agentctld/` | `RuntimeDirectory=agentctld` | `agentctld:agentctld` 0750 |
+| Socket parent dir | `/run/agentctld/` | `RuntimeDirectory=agentctld` | `agentctld:agentctld` 0711 |
 | Audit log dir | `/var/log/agentctld/` | `LogsDirectory=agentctld` | `agentctld:agentctld` 0750 |
 | Persistent state | `/var/lib/agentctld/` | `StateDirectory=agentctld` | `agentctld:agentctld` 0750 |
 
@@ -276,7 +320,12 @@ AGENTCTLD_SOCKET_PATH=/run/agentctld/socket
 # The agentctld user must be in this group or the chown call
 # fails with EPERM and the daemon exits non-zero. Empty means
 # "leave the group as the daemon process's primary group".
-AGENTCTLD_SOCKET_GROUP=agentctld
+#
+# Recommended: agentctl-clients (the dedicated client group;
+# see [Socket group](#socket-group)). The daemon reaches this
+# group via SupplementaryGroups=docker agentctl-clients in the
+# unit. Authorised clients join agentctl-clients, not agentctld.
+AGENTCTLD_SOCKET_GROUP=agentctl-clients
 
 # Socket mode in octal (default 0660). Accepts 660, 0660, 0o660.
 # The group ownership is what gates access; mode 0660 keeps the
@@ -405,7 +454,7 @@ AGENTCTLD_DATA_ROOT=/var/lib/agentctld/data
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `AGENTCTLD_SOCKET_PATH` | yes | — | Absolute path of the UDS listener |
-| `AGENTCTLD_SOCKET_GROUP` | no | (primary group) | Group name or GID for socket |
+| `AGENTCTLD_SOCKET_GROUP` | no | `agentctl-clients` (recommended; see [Socket group](#socket-group)) | Group name or GID for socket |
 | `AGENTCTLD_SOCKET_MODE` | no | `0660` | Socket mode in octal |
 | `AGENTCTLD_OPERATION_TIMEOUT` | no | `30m` | Per-operation budget |
 | `AGENTCTLD_WRITE_TIMEOUT_MARGIN` | no | `5m` | Headroom for HTTP WriteTimeout |
@@ -877,7 +926,7 @@ Implications:
 - **World-access to the socket directory** (mode 0755 on the
   parent, mode 0666 on the socket) would expose deployment
   control to every local user. The unit's default mode
-  (`RuntimeDirectoryMode=0750`, `AGENTCTLD_SOCKET_MODE=0660`)
+  (`RuntimeDirectoryMode=0711`, `AGENTCTLD_SOCKET_MODE=0660`)
   prevents this; do not widen without understanding the
   consequences.
 - **The `docker` group membership** of the `agentctld` user is a
