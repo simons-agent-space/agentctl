@@ -34,14 +34,18 @@ Every deployment goes through these twelve steps in order.
    remote after the push, not from the local working tree. A short
    SHA is never acceptable.
 
-6. **Prepare the final immutable deployment request.** Compose the
-   `commit` and `manifest` (the full `deploy.json`). Once composed,
-   this request is frozen — it is the request that will be inspected,
-   shown to the human, and submitted after approval.
+6. **Prepare the final immutable deployment proposal.** Compose the
+   **deployment proposal** — the triple `(app, commit, manifest)`.
+   `commit` is the full 40-character SHA; `manifest` is the full
+   `deploy.json`. Once composed, this proposal is frozen — its
+   values are what will be inspected, shown to the human, and
+   submitted after approval.
 
-7. **Call `POST /v1/inspect` with that exact request.** The daemon
-   validates the manifest, parses the commit, and resolves the commit
-   against the trusted source mirror. It performs no side effects.
+7. **Call `POST /v1/inspect` with the proposal.** The inspect
+   request body carries `app`, `commit`, and `manifest`. The daemon
+   validates the manifest, parses the commit, and resolves the
+   commit against the trusted source mirror. It performs no side
+   effects.
 
 8. **Present a human-readable deployment report** containing:
 
@@ -59,10 +63,13 @@ Every deployment goes through these twelve steps in order.
 
 9. **Stop and wait for explicit human approval.** Do not proceed.
 
-10. **After approval, submit exactly the same inspected request to the
-    appropriate `/deploy` endpoint.** The body submitted after
-    approval must be byte-for-byte identical to the body that was
-    inspected and shown to the human.
+10. **After approval, submit the same deployment proposal to the
+    deploy endpoint.** The deploy endpoint is
+    `/v1/apps/{app}/deploy` — the application name moves into the
+    URL path. The request body carries `commit` and `manifest`. The
+    values submitted after approval must match what was inspected
+    exactly: the same application name in the URL path, the same
+    commit SHA, and the same manifest bytes.
 
 11. **Verify:**
     - agentctld deployment status (`GET /v1/apps/{app}/status`)
@@ -98,15 +105,16 @@ discretionary choices.
   branch or tag such as `main`.** Branches and tags move. The deploy
   must be reproducible from the same SHA tomorrow.
 
-- **The request shown to the human, inspected by agentctld, and
-  submitted after approval MUST be identical.** If the manifest
-  changes, the commit changes, or the request body changes in any
-  way, the previously given approval is invalid.
+- **The deployment proposal shown to the human, inspected by
+  agentctld, and submitted after approval MUST be identical —
+  meaning the same application name, the same commit SHA, and the
+  same manifest bytes.** If any of those three values changes after
+  approval, the previously given approval is invalid.
 
-- **If anything changes after approval, including the commit,
-  manifest, mounts, environment, port, domain, or health check,
-  approval is invalid and must be requested again.** A new
-  `inspect → report → approve` cycle is required.
+- **If anything changes after approval, including the application
+  name, commit, manifest, mounts, environment, port, domain, or
+  health check, approval is invalid and must be requested again.**
+  A new `inspect → report → approve` cycle is required.
 
 - **The agent MUST report failed tests, warnings, or failed health
   checks honestly.** Failures are not omitted, downplayed, or hidden
@@ -225,8 +233,11 @@ EOF
 
 ### Deploy
 
-The body MUST be byte-for-byte identical to the body that was
-inspected.
+The deploy call uses the same application name in the URL path
+(`<app-name>`), the same commit SHA, and the same manifest as the
+inspect call. The request body shape differs from `/v1/inspect`
+because the application name moves into the URL path on the deploy
+endpoint; only `commit` and `manifest` are in the body.
 
 ```sh
 curl --unix-socket <socket-path> \
@@ -283,8 +294,8 @@ approval transport moves from chat-text to a button. The agent's
 behaviour around the approval boundary is unchanged:
 
 - no deploy without an explicit human selection
-- the inspected request is the same request that is submitted after
-  approval
+- the inspected deployment proposal is the same proposal that is
+  submitted after approval
 - any change after approval invalidates the approval and forces a
   new inspection
 
