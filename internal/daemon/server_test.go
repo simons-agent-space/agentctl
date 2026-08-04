@@ -1351,3 +1351,436 @@ func httpPostOverUDS(sockPath, path, body string) (*httpResponse, error) {
 	}
 	return &httpResponse{status: status, body: raw[idx+len(headerEnd):]}, nil
 }
+
+// ---------- handleInspect env_statuses ----------
+
+// minimalConfigWithSecrets returns a minimal config that also has
+// SecretDir set. The secret dir is created by the caller (via
+// t.TempDir or a hand-built dir) and passed in directly.
+func minimalConfigWithSecrets(socketPath, secretDir string) *Config {
+	cfg := minimalConfig(socketPath)
+	cfg.SecretDir = secretDir
+	return cfg
+}
+
+// inspectHandlerEnv builds a server + inspect handler invocation
+// that uses a local git remote and a v3 manifest with the supplied
+// env entries. Returns the response and recorder so tests can
+// inspect body, status, and decoded response.
+func inspectHandlerEnv(t *testing.T, manifestJSON string, env []deploy.EnvEntry) (*httptest.ResponseRecorder, *InspectResponse) {
+	t.Helper()
+
+	remoteDir := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = remoteDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init", "-q", "-b", "main", remoteDir)
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
+	mainSHA := runGit("rev-parse", "HEAD")
+
+	cfg := minimalConfig(filepath.Join(t.TempDir(), "agentctl.sock"))
+	cfg.Source.RepositoryRoot = t.TempDir()
+	cfg.Source.OriginURL = remoteDir
+
+	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"app":      "myapp",
+		"commit":   mainSHA,
+		"manifest": json.RawMessage(manifestJSON),
+	})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/inspect", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleInspect(w, req)
+	var resp InspectResponse
+	if err := json.NewDecoder(bytes.NewReader(w.Body.Bytes())).Decode(&resp); err != nil {
+		t.Fatalf("decode inspect response: %v", err)
+	}
+	return w, &resp
+}
+
+func TestInspectHandler_EnvStatusesConfigured(t *testing.T) {
+	secretDir := t.TempDir()
+	// foo.key configured; bar.key (optional) missing.
+	if err := os.WriteFile(filepath.Join(secretDir, "foo.key"), []byte("foo-secret-value\n"), 0o600); err != nil {
+		t.Fatalf("seed foo: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(secretDir, "foo.key"), 0o600); err != nil {
+		t.Fatalf("chmod foo: %v", err)
+	}
+
+	cfg := minimalConfigWithSecrets(filepath.Join(t.TempDir(), "agentctl.sock"), secretDir)
+	remoteDir := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = remoteDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init", "-q", "-b", "main", remoteDir)
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
+	mainSHA := runGit("rev-parse", "HEAD")
+
+	cfg.Source.RepositoryRoot = t.TempDir()
+	cfg.Source.OriginURL = remoteDir
+
+	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key","required":true},{"name":"BAR","secret_ref":"bar.key"}]}`)
+	body, err := json.Marshal(map[string]any{
+		"app":      "myapp",
+		"commit":   mainSHA,
+		"manifest": manifestJSON,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/inspect", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleInspect(w, req)
+
+	var resp InspectResponse
+	if err := json.NewDecoder(bytes.NewReader(w.Body.Bytes())).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// foo.key is seeded (configured); bar.key is missing (optional).
+	// Valid must be true (no missing required secret) and the only
+	// error (if any) should be about the optional BAR entry, not FOO.
+	t.Logf("resp = %+v", resp)
+	if !resp.Valid {
+		t.Errorf("inspect valid=false despite required secret configured; errors=%v", resp.Errors)
+	}
+	if len(resp.EnvStatuses) != 2 {
+		t.Fatalf("env_statuses length = %d, want 2", len(resp.EnvStatuses))
+	}
+	byName := map[string]EnvStatus{}
+	for _, es := range resp.EnvStatuses {
+		byName[es.Name] = es
+	}
+	if foo, ok := byName["FOO"]; !ok {
+		t.Errorf("env_statuses missing FOO entry")
+	} else {
+		if !foo.Configured {
+			t.Errorf("FOO configured=false, want true")
+		}
+		if !foo.Required {
+			t.Errorf("FOO required=false, want true")
+		}
+		if foo.SecretRef != "foo.key" {
+			t.Errorf("FOO secret_ref=%q, want foo.key", foo.SecretRef)
+		}
+	}
+	if bar, ok := byName["BAR"]; !ok {
+		t.Errorf("env_statuses missing BAR entry")
+	} else {
+		if bar.Configured {
+			t.Errorf("BAR configured=true, want false")
+		}
+		if bar.Required {
+			t.Errorf("BAR required=true, want false")
+		}
+	}
+
+	// SECRET VALUES MUST NEVER APPEAR IN THE RESPONSE BODY.
+	bodyBytes := w.Body.Bytes()
+	if strings.Contains(string(bodyBytes), "bar-secret-value") {
+		t.Errorf("response body contains secret value 'bar-secret-value': %s", bodyBytes)
+	}
+}
+
+func TestInspectHandler_EnvStatusesAllConfigured(t *testing.T) {
+	secretDir := t.TempDir()
+	for _, name := range []string{"foo.key", "bar.key"} {
+		if err := os.WriteFile(filepath.Join(secretDir, name), []byte("value-"+name+"\n"), 0o600); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+		if err := os.Chmod(filepath.Join(secretDir, name), 0o600); err != nil {
+			t.Fatalf("chmod %s: %v", name, err)
+		}
+	}
+
+	cfg := minimalConfigWithSecrets(filepath.Join(t.TempDir(), "agentctl.sock"), secretDir)
+	remoteDir := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = remoteDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init", "-q", "-b", "main", remoteDir)
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
+	mainSHA := runGit("rev-parse", "HEAD")
+
+	cfg.Source.RepositoryRoot = t.TempDir()
+	cfg.Source.OriginURL = remoteDir
+
+	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"},{"name":"BAR","secret_ref":"bar.key"}]}`)
+	body, err := json.Marshal(map[string]any{
+		"app":      "myapp",
+		"commit":   mainSHA,
+		"manifest": manifestJSON,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/inspect", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleInspect(w, req)
+
+	var resp InspectResponse
+	if err := json.NewDecoder(bytes.NewReader(w.Body.Bytes())).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Valid {
+		t.Errorf("inspect valid=false; errors=%v", resp.Errors)
+	}
+	if len(resp.EnvStatuses) != 2 {
+		t.Fatalf("env_statuses length = %d, want 2", len(resp.EnvStatuses))
+	}
+	for _, es := range resp.EnvStatuses {
+		if !es.Configured {
+			t.Errorf("env_statuses[%s] configured=false, want true", es.Name)
+		}
+	}
+
+	// No secret values should appear.
+	bodyBytes := w.Body.Bytes()
+	if strings.Contains(string(bodyBytes), "value-foo.key") {
+		t.Errorf("response body contains secret value: %s", bodyBytes)
+	}
+	if strings.Contains(string(bodyBytes), "value-bar.key") {
+		t.Errorf("response body contains secret value: %s", bodyBytes)
+	}
+}
+
+func TestInspectHandler_NoEnvNoEnvStatuses(t *testing.T) {
+	// V3 manifest without env entries: env_statuses must be empty.
+	secretDir := t.TempDir()
+	cfg := minimalConfigWithSecrets(filepath.Join(t.TempDir(), "agentctl.sock"), secretDir)
+	remoteDir := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = remoteDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init", "-q", "-b", "main", remoteDir)
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
+	mainSHA := runGit("rev-parse", "HEAD")
+
+	cfg.Source.RepositoryRoot = t.TempDir()
+	cfg.Source.OriginURL = remoteDir
+
+	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz"}`)
+	body, err := json.Marshal(map[string]any{
+		"app":      "myapp",
+		"commit":   mainSHA,
+		"manifest": manifestJSON,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/inspect", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleInspect(w, req)
+
+	var resp InspectResponse
+	if err := json.NewDecoder(bytes.NewReader(w.Body.Bytes())).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Valid {
+		t.Errorf("inspect valid=false; errors=%v", resp.Errors)
+	}
+	if len(resp.EnvStatuses) != 0 {
+		t.Errorf("env_statuses = %+v, want empty for v3 manifest without env", resp.EnvStatuses)
+	}
+}
+
+// TestInspectHandler_EnvStatusesRequiredMissingFails inspects a
+// manifest whose required env entry is missing: the inspect
+// response must report configured=false for that entry and
+// valid=false overall. This is the inspect-side counterpart of
+// the deploy-time ErrSecretMissing failure: a caller can
+// pre-flight this and refuse to approve the deploy.
+func TestInspectHandler_EnvStatusesRequiredMissingFails(t *testing.T) {
+	secretDir := t.TempDir()
+	// No secrets at all: every required env entry will be missing.
+	cfg := minimalConfigWithSecrets(filepath.Join(t.TempDir(), "agentctl.sock"), secretDir)
+	remoteDir := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = remoteDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init", "-q", "-b", "main", remoteDir)
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
+	mainSHA := runGit("rev-parse", "HEAD")
+
+	cfg.Source.RepositoryRoot = t.TempDir()
+	cfg.Source.OriginURL = remoteDir
+
+	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key","required":true}]}`)
+	body, err := json.Marshal(map[string]any{
+		"app":      "myapp",
+		"commit":   mainSHA,
+		"manifest": manifestJSON,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/inspect", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleInspect(w, req)
+
+	var resp InspectResponse
+	if err := json.NewDecoder(bytes.NewReader(w.Body.Bytes())).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if resp.Valid {
+		t.Errorf("inspect valid=true despite missing required secret; errors=%v", resp.Errors)
+	}
+	if len(resp.EnvStatuses) != 1 {
+		t.Fatalf("env_statuses length = %d, want 1", len(resp.EnvStatuses))
+	}
+	if resp.EnvStatuses[0].Configured {
+		t.Errorf("FOO configured=true, want false (file missing)")
+	}
+	if !resp.EnvStatuses[0].Required {
+		t.Errorf("FOO required=false, want true")
+	}
+	// The error must mention the missing required secret.
+	found := false
+	for _, e := range resp.Errors {
+		if strings.Contains(e, "FOO") && strings.Contains(e, "foo.key") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("errors do not mention missing required secret FOO/foo.key: %v", resp.Errors)
+	}
+}
+
+// TestInspectHandler_EnvStatusesOptionalMissingPasses is the
+// counterpoint: an optional env entry that is missing does NOT
+// fail the inspect. This is already exercised by
+// TestInspectHandler_EnvStatusesConfigured but with both required
+// + optional together; here we verify the optional-only case.
+func TestInspectHandler_EnvStatusesOptionalMissingPasses(t *testing.T) {
+	secretDir := t.TempDir()
+	cfg := minimalConfigWithSecrets(filepath.Join(t.TempDir(), "agentctl.sock"), secretDir)
+	remoteDir := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = remoteDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init", "-q", "-b", "main", remoteDir)
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
+	mainSHA := runGit("rev-parse", "HEAD")
+
+	cfg.Source.RepositoryRoot = t.TempDir()
+	cfg.Source.OriginURL = remoteDir
+
+	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"}]}`)
+	body, err := json.Marshal(map[string]any{
+		"app":      "myapp",
+		"commit":   mainSHA,
+		"manifest": manifestJSON,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/inspect", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleInspect(w, req)
+
+	var resp InspectResponse
+	if err := json.NewDecoder(bytes.NewReader(w.Body.Bytes())).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if !resp.Valid {
+		t.Errorf("inspect valid=false for missing optional secret; errors=%v", resp.Errors)
+	}
+	if len(resp.EnvStatuses) != 1 {
+		t.Fatalf("env_statuses length = %d, want 1", len(resp.EnvStatuses))
+	}
+	if resp.EnvStatuses[0].Configured {
+		t.Errorf("FOO configured=true, want false")
+	}
+	if resp.EnvStatuses[0].Required {
+		t.Errorf("FOO required=true, want false")
+	}
+}

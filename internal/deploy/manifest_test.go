@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,9 +38,14 @@ func TestLoad_Valid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	want := *validManifest()
-	if *got != want {
-		t.Errorf("got %+v, want %+v", *got, want)
+	want := validManifest()
+	if got.Version != want.Version ||
+		got.App != want.App ||
+		got.ContainerPort != want.ContainerPort ||
+		got.HealthPath != want.HealthPath ||
+		got.Data != nil || want.Data != nil ||
+		len(got.Env) != 0 {
+		t.Errorf("got %+v, want %+v", *got, *want)
 	}
 }
 
@@ -95,7 +101,6 @@ func TestValidate_Rejections(t *testing.T) {
 	}{
 		{"nil manifest", nil, "agentctl", "nil manifest"},
 		{"version 0", func(m *Manifest) { m.Version = 0 }, "agentctl", "unsupported version"},
-		{"version 3", func(m *Manifest) { m.Version = 3 }, "agentctl", "unsupported version"},
 		{"version negative", func(m *Manifest) { m.Version = -1 }, "agentctl", "unsupported version"},
 		{"app starts with digit", func(m *Manifest) { m.App = "1agentctl" }, "agentctl", "app-name format"},
 		{"app starts with hyphen", func(m *Manifest) { m.App = "-agentctl" }, "agentctl", "app-name format"},
@@ -294,5 +299,205 @@ func TestLoad_RejectsUnknownFieldInData(t *testing.T) {
 	path := writeDeploy(t, `{"version":2,"app":"agentctl","container_port":8080,"health_path":"/healthz","data":{"mount":true,"host_path":"/etc"}}`)
 	if _, err := Load(path); err == nil {
 		t.Errorf("expected Load to reject unknown field inside data")
+	}
+}
+
+// ---------- v3 / env / host_source ----------
+
+func TestLoad_Version3WithoutDataOrEnv(t *testing.T) {
+	path := writeDeploy(t, `{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz"}`)
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Version != 3 {
+		t.Errorf("Version = %d, want 3", got.Version)
+	}
+	if got.Data != nil {
+		t.Errorf("Data = %+v, want nil", got.Data)
+	}
+	if len(got.Env) != 0 {
+		t.Errorf("Env = %+v, want []", got.Env)
+	}
+}
+
+func TestLoad_Version3WithEnv(t *testing.T) {
+	path := writeDeploy(t, `{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"}]}`)
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(got.Env) != 1 {
+		t.Fatalf("Env length = %d, want 1", len(got.Env))
+	}
+	e := got.Env[0]
+	if e.Name != "FOO" || e.SecretRef != "foo.key" || e.Required {
+		t.Errorf("Env[0] = %+v, want name=FOO secret_ref=foo.key required=false", e)
+	}
+}
+
+func TestLoad_Version3WithDataAndEnv(t *testing.T) {
+	path := writeDeploy(t, `{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz","data":{"mount":true,"host_source":"/srv/data","container_path":"/srv"},"env":[{"name":"FOO","secret_ref":"foo.key","required":true}]}`)
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Data == nil {
+		t.Fatalf("Data = nil, want non-nil")
+	}
+	if got.Data.HostSource != "/srv/data" {
+		t.Errorf("HostSource = %q, want /srv/data", got.Data.HostSource)
+	}
+	if got.Data.ContainerPath != "/srv" {
+		t.Errorf("ContainerPath = %q, want /srv", got.Data.ContainerPath)
+	}
+	if len(got.Env) != 1 || got.Env[0].SecretRef != "foo.key" || !got.Env[0].Required {
+		t.Errorf("Env = %+v", got.Env)
+	}
+}
+
+func TestLoad_RejectsVersion2WithEnv(t *testing.T) {
+	path := writeDeploy(t, `{"version":2,"app":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"}]}`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatalf("expected error for v2 with env")
+	}
+	if !strings.Contains(err.Error(), "version 3") {
+		t.Errorf("expected error mentioning version 3, got %q", err.Error())
+	}
+}
+
+func TestLoad_EnvEntryRejectsEmptyName(t *testing.T) {
+	path := writeDeploy(t, `{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"","secret_ref":"foo.key"}]}`)
+	if _, err := Load(path); err == nil {
+		t.Errorf("expected error for empty env name")
+	}
+}
+
+func TestLoad_EnvEntryRejectsBadSecretRef(t *testing.T) {
+	cases := []string{
+		"../escape",
+		"with/slash",
+		".dot",
+		"..dotdot",
+		"x",
+		// Uppercase is rejected by secretRefRe.
+		"UPPER",
+		// Empty is rejected.
+		"",
+		// Names longer than 64 chars are rejected.
+		strings.Repeat("a", 65),
+	}
+	for _, ref := range cases {
+		t.Run(ref, func(t *testing.T) {
+			body := fmt.Sprintf(`{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"X","secret_ref":%q}]}`, ref)
+			path := writeDeploy(t, body)
+			if _, err := Load(path); err == nil {
+				t.Errorf("expected error for secret_ref %q", ref)
+			}
+		})
+	}
+}
+
+func TestLoad_EnvEntryAcceptsValidSecretRefs(t *testing.T) {
+	// secretRefRe: ^[a-z0-9_](?:[a-z0-9_.-]{0,62}[a-z0-9_])$
+	// Accepts: lowercase letters, digits, _, ., -; 1-64 chars; no leading dot, no double dot.
+	cases := []string{
+		"ab",
+		"abc",
+		"foo.key",
+		"foo-key",
+		"foo_key",
+		"a.b.c",
+		strings.Repeat("a", 64),
+	}
+	for _, ref := range cases {
+		t.Run(ref, func(t *testing.T) {
+			body := fmt.Sprintf(`{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"X","secret_ref":%q}]}`, ref)
+			path := writeDeploy(t, body)
+			if _, err := Load(path); err != nil {
+				t.Errorf("expected accept %q, got %v", ref, err)
+			}
+		})
+	}
+}
+
+func TestValidate_AcceptsVersion3WithoutEnv(t *testing.T) {
+	m := &Manifest{
+		Version:       3,
+		App:           "agentctl",
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
+	}
+	if err := Validate(m, "agentctl"); err != nil {
+		t.Errorf("version 3 without env should validate: %v", err)
+	}
+}
+
+func TestValidate_AcceptsVersion3WithEnv(t *testing.T) {
+	m := &Manifest{
+		Version:       3,
+		App:           "agentctl",
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
+		Env:           []EnvEntry{{Name: "FOO", SecretRef: "foo.key"}},
+	}
+	if err := Validate(m, "agentctl"); err != nil {
+		t.Errorf("version 3 with env should validate: %v", err)
+	}
+}
+
+func TestValidate_RejectsDuplicateEnvNames(t *testing.T) {
+	m := &Manifest{
+		Version:       3,
+		App:           "agentctl",
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
+		Env: []EnvEntry{
+			{Name: "FOO", SecretRef: "foo.key"},
+			{Name: "FOO", SecretRef: "foo2.key"},
+		},
+	}
+	err := Validate(m, "agentctl")
+	if err == nil {
+		t.Fatalf("expected error for duplicate env name")
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("expected error mentioning duplicate, got %q", err.Error())
+	}
+}
+
+func TestValidate_RejectsV3WithDangerousContainerPath(t *testing.T) {
+	cases := []string{"/", "/proc", "/sys", "/dev", "/run"}
+	for _, p := range cases {
+		t.Run(p, func(t *testing.T) {
+			m := &Manifest{
+				Version:       3,
+				App:           "agentctl",
+				ContainerPort: 8080,
+				HealthPath:    "/healthz",
+				Data:          &ManifestData{Mount: true, HostSource: "/srv/data", ContainerPath: p},
+			}
+			err := Validate(m, "agentctl")
+			if err == nil {
+				t.Errorf("expected error for container_path %q", p)
+			}
+			if !strings.Contains(err.Error(), "container_path") {
+				t.Errorf("expected error mentioning container_path, got %q", err.Error())
+			}
+		})
+	}
+}
+
+func TestValidate_AcceptsV3WithSafeContainerPath(t *testing.T) {
+	m := &Manifest{
+		Version:       3,
+		App:           "agentctl",
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
+		Data:          &ManifestData{Mount: true, HostSource: "/srv/data", ContainerPath: "/srv/app"},
+	}
+	if err := Validate(m, "agentctl"); err != nil {
+		t.Errorf("expected accept /srv/app, got %v", err)
 	}
 }

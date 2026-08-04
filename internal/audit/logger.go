@@ -33,6 +33,16 @@ var sensitiveSubstrings = []string{
 	"bearer",
 	"password",
 	"client_secret",
+	// env_file and env_file_path cover the materialized env-file
+	// path the daemon hands to docker. The path itself is not a
+	// secret (it's a /tmp-ish path in the agentctl worktree), but
+	// redacting it in audit output prevents accidental leakage
+	// of the file's existence alongside other log fields. The
+	// secret VALUES inside the file are never written to audit
+	// output in the first place — they are read by LoadSecret,
+	// written to a 0o600 temp file, and consumed by docker — so
+	// the audit logger never sees them.
+	"env_file",
 }
 
 // Logger emits JSON records with secret fields redacted. It is safe for

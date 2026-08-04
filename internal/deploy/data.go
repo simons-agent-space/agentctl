@@ -8,18 +8,29 @@ import (
 	"strings"
 )
 
-// dataContainerPath is the FIXED in-container path at which the host
-// data directory is mounted. The caller never controls this — the
-// runtime, rollback, and data layers all use this constant. This is
-// what keeps the design narrow: every persistent per-app directory
-// lives at exactly /data inside the container.
+// dataContainerPath is the DEFAULT in-container path at which the
+// host data directory is mounted when the manifest does not set
+// ContainerPath. The runtime, rollback, and data layers all use
+// this constant for legacy mounts. Host-source mounts (v3) may
+// override this per-manifest via ManifestData.ContainerPath after
+// validateContainerPath has cleared it.
 const dataContainerPath = "/data"
+
+// dangerousContainerPaths is the set of in-container targets that
+// the daemon refuses to mount over, OR any descendant of those
+// targets. Mounting any of these (e.g. /proc, /sys, /dev, /run,
+// /proc/sys, /dev/shm, /run/secrets) would hide or corrupt the
+// host's view of those subsystems. The list is exact: a path
+// equal to one of these OR starting with "<prefix>/" is rejected.
+var dangerousContainerPaths = []string{"/", "/proc", "/sys", "/dev", "/run"}
 
 // Sentinel errors returned by the data layer.
 var (
 	ErrInvalidDataConfig = errors.New("invalid data configuration")
 	ErrAppDataNotFound   = errors.New("app data directory not found")
 	ErrAppDataNotEmpty   = errors.New("app data directory not empty")
+	ErrHostSourceDenied  = errors.New("host source denied by daemon allowlist")
+	ErrContainerPathBad  = errors.New("container_path is not allowed")
 	// ErrSymlinkedAppData is returned when any component of the
 	// data layout — DataRoot, the existing <DataRoot>/<app>
 	// parent, or the final data path — is a symlink. The symlink
@@ -30,25 +41,28 @@ var (
 // DataConfig holds the trusted host-side configuration for the
 // per-app data layer. DataRoot is supplied by trusted host
 // configuration, not by the caller. The derived per-app path is
-// <DataRoot>/<app>/data.
-//
-// DataRoot is expected to live outside the repository root and
-// outside any path the deployment process can write into except
-// through this layer. EnsureAppDataDir and RemoveAppDataDir
-// reject symlinks at DataRoot, at the existing <DataRoot>/<app>
-// parent, and at the final data path before any follow-on
-// filesystem call, so a symlinked root or parent cannot redirect
-// creation or deletion outside the trusted layout.
+// <DataRoot>/<app>/data. HostSourceAllowlist is the daemon-side
+// allowlist of EXISTING host directories that a manifest may
+// mount as a read-only data source; it is empty in the legacy
+// config and is only consulted when data.host_source is set.
 type DataConfig struct {
 	// DataRoot is the trusted host directory under which every
 	// per-app data directory is created. The trailing slash is
 	// not significant.
 	DataRoot string
+
+	// HostSourceAllowlist is the daemon-side allowlist of host
+	// paths that may be mounted read-only as data sources. Paths
+	// are matched after filepath.Clean; an exact match is
+	// required (no prefix/glob match). The allowlist is operator-
+	// supplied and must contain every existing host directory that
+	// any manifest is permitted to mount.
+	HostSourceAllowlist []string
 }
 
 // AppData describes the derived identity of one app's data
 // directory. HostPath is the resolved absolute host path;
-// ContainerPath is the fixed in-container mount point; ReadOnly
+// ContainerPath is the in-container mount point; ReadOnly
 // records whether the in-container mount should be read-only.
 // Callers receive this struct from EnsureAppDataDir / AppDataDir
 // so they can pass it to the runtime's docker run args builder
@@ -60,112 +74,291 @@ type AppData struct {
 	ReadOnly      bool
 }
 
-// EnsureAppDataDir ensures <DataRoot>/<app>/data exists, creating
-// the parent <DataRoot>/<app>/ directory and the data directory
-// itself if necessary. The function is idempotent: an existing
-// directory is left untouched (other than a final chown-style
-// permission tightening if the operator requested one — currently
-// none, so a pre-existing dir is left alone).
+// validateContainerPath returns nil iff p is an absolute, cleaned
+// path that is not on the dangerous-container-path deny list AND
+// is not a descendant of any of those paths. The block list is
+// exactly `/`, `/proc`, `/sys`, `/dev`, `/run`; `/proc/sys`,
+// `/dev/shm`, `/run/secrets`, etc. are also rejected because they
+// are descendants of a blocked path. Examples that pass:
+// `/data`, `/data/openclaw-state`, `/srv/data`. Examples that
+// fail: `/`, `/proc`, `/proc/sys`, `/sys/fs/cgroup`, `/dev`,
+// `/dev/shm`, `/run`, `/run/secrets`. The function does not touch
+// the filesystem.
+func validateContainerPath(p string) error {
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("%w: %q is not absolute", ErrContainerPathBad, p)
+	}
+	cleaned := filepath.Clean(p)
+	for _, d := range dangerousContainerPaths {
+		if cleaned == d {
+			return fmt.Errorf("%w: %q is a dangerous in-container target", ErrContainerPathBad, cleaned)
+		}
+		// Descendant check: a path equal to d+"/x" sits under the
+		// blocked prefix. The prefix string already ends in "/"
+		// for all entries (they are single-segment absolute paths),
+		// so a bare prefix check is sufficient.
+		if strings.HasPrefix(cleaned, d+"/") {
+			return fmt.Errorf("%w: %q is a descendant of dangerous in-container target %q",
+				ErrContainerPathBad, cleaned, d)
+		}
+	}
+	return nil
+}
+
+// resolveContainerPath returns the in-container path to use. If the
+// manifest overrides with ContainerPath, that value is validated;
+// otherwise the fixed dataContainerPath is returned. The returned
+// path is cleaned and absolute (the default is both).
+func resolveContainerPath(md *ManifestData) (string, error) {
+	if md == nil || md.ContainerPath == "" {
+		return dataContainerPath, nil
+	}
+	if err := validateContainerPath(md.ContainerPath); err != nil {
+		return "", err
+	}
+	return filepath.Clean(md.ContainerPath), nil
+}
+
+// EnsureAppDataDir derives one app's data directory according to
+// the manifest's data field. Behavior is selected by the
+// manifest:
 //
-// readOnly is recorded on the returned AppData so the runtime
-// can pass it to docker run as the mount's readonly flag. It is
-// not enforced by EnsureAppDataDir itself: the host directory is
-// the same in either case. The host-side permissions are
-// operator-controlled; a read-only container mount can still be
-// written to from the host.
+//   - md == nil or md.Mount == false: no mount requested; returns
+//     (nil, nil).
+//   - md.Mount == true and md.HostSource == "": legacy app-owned
+//     behavior. Ensure <DataRoot>/<app>/data exists, creating it
+//     if necessary. The mount is ReadOnly if md.ReadOnly is set.
+//   - md.Mount == true and md.HostSource != "": host-source mount.
+//     The source path must exist, must be a directory, must not
+//     be a symlink (at any path component), must be absolute, and
+//     must appear (after Clean) in cfg.HostSourceAllowlist. The
+//     daemon does not create or modify the directory. The mount
+//     is ReadOnly regardless of md.ReadOnly — host-source mounts
+//     are required to be read-only.
 //
-// The app name is validated against the existing appNameRe. The
-// resolved host path is verified to live under cfg.DataRoot
-// (defense in depth against a symlinked DataRoot). Symlinks at
-// DataRoot, at an existing <DataRoot>/<app> parent, or at the
-// final data path are rejected with ErrSymlinkedAppData and the
-// symlink targets are left untouched; the checks run BEFORE any
-// Mkdir, MkdirAll, ReadDir, or RemoveAll so a redirected parent
-// cannot escape creation.
+// ContainerPath, when set, overrides the fixed /data. It is
+// validated against the dangerous-target deny list (including
+// descendants) before any filesystem call.
 //
-// EnsureAppDataDir is the call Deploy / Rollback make on every
-// deployment to guarantee the bind-mount target exists before
-// docker run. It is NOT a destructive operation.
-func EnsureAppDataDir(cfg DataConfig, app string, readOnly bool) (*AppData, error) {
-	data, err := AppDataDir(cfg, app, readOnly)
+// The legacy app-owned branch (md.HostSource == "") creates the
+// directory hierarchy one level at a time, never with
+// os.MkdirAll, and re-checks every newly-created directory to
+// guarantee it is a real directory — not a symlink that appeared
+// between the parent-walk pre-check and the mkdir. This is the
+// v1/v2 symlink-safety contract; it must not be weakened by the
+// v3 host-source work added above.
+func EnsureAppDataDir(cfg DataConfig, app string, md *ManifestData) (*AppData, error) {
+	if md == nil || !md.Mount {
+		return nil, nil
+	}
+
+	containerPath, err := resolveContainerPath(md)
 	if err != nil {
 		return nil, err
 	}
 
-	appDir := filepath.Dir(data.HostPath) // <DataRoot>/<app>
+	if md.HostSource != "" {
+		return ensureHostSource(cfg, app, md.HostSource, containerPath)
+	}
 
-	// Reject symlinks at DataRoot and at any existing app
-	// parent BEFORE touching disk. MkdirAll follows symlinked
-	// parents, so the only safe way to guarantee creation
-	// cannot escape is to Lstat every component up front and
-	// create each missing level explicitly with Mkdir.
+	// Legacy app-owned behavior: create the data layout
+	// one level at a time. Each call to ensureTrustedDir walks
+	// the parent chain for symlinks and re-checks the created
+	// directory is a real directory. Using os.MkdirAll here
+	// would be unsafe because it would silently create
+	// intermediate directories without checking them for
+	// symlinks, which would let a redirect at <DataRoot>/<app>
+	// land the data directory inside an attacker-controlled
+	// tree.
+	hostPath := filepath.Join(cfg.DataRoot, app, "data")
+	appDir := filepath.Dir(hostPath)
+
 	if err := noSymlinkAt(cfg.DataRoot, ErrSymlinkedAppData); err != nil {
 		return nil, err
 	}
-	if err := noSymlinkAt(appDir, ErrSymlinkedAppData); err != nil {
+	if err := ensureTrustedDir(appDir); err != nil {
 		return nil, err
 	}
-
-	info, err := os.Lstat(data.HostPath)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		// Create the parent and the final dir with two
-		// separate Mkdir calls — never MkdirAll — so a
-		// symlink that races in between the layout check and
-		// the create cannot redirect creation.
-		if err := os.Mkdir(appDir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("%w: mkdir %s: %v", ErrInvalidDataConfig, appDir, err)
-		}
-		// Re-check the parent after Mkdir in case a symlink
-		// was inserted between the layout check and the
-		// create (TOCTOU). Without this re-check a symlink
-		// installed in the gap would not be caught.
-		if err := noSymlinkAt(appDir, ErrSymlinkedAppData); err != nil {
-			return nil, err
-		}
-		if err := os.Mkdir(data.HostPath, 0o755); err != nil {
-			return nil, fmt.Errorf("%w: mkdir %s: %v", ErrInvalidDataConfig, data.HostPath, err)
-		}
-		return data, nil
-	case err != nil:
-		return nil, fmt.Errorf("%w: stat %s: %v", ErrInvalidDataConfig, data.HostPath, err)
-	case info.Mode()&os.ModeSymlink != 0:
-		return nil, fmt.Errorf("%w: %s", ErrSymlinkedAppData, data.HostPath)
-	case !info.IsDir():
-		return nil, fmt.Errorf("%w: %s exists but is not a directory", ErrInvalidDataConfig, data.HostPath)
-	}
-
-	// Existing directory: nothing to do. EnsureAppDataDir is
-	// idempotent by construction; we deliberately do not chmod
-	// or otherwise mutate a pre-existing data directory the
-	// operator may have set up.
-	return data, nil
-}
-
-// AppDataDir derives the host path for app's data directory and
-// validates that the resolved path lives under cfg.DataRoot. It
-// does NOT touch disk. Returns ErrInvalidDataConfig if cfg.DataRoot
-// is empty, the app name fails the appNameRe check, or the
-// resolved path escapes cfg.DataRoot. readOnly is recorded on
-// the returned AppData.
-func AppDataDir(cfg DataConfig, app string, readOnly bool) (*AppData, error) {
-	if cfg.DataRoot == "" {
-		return nil, fmt.Errorf("%w: DataRoot is required", ErrInvalidDataConfig)
-	}
-	if !appNameRe.MatchString(app) {
-		return nil, fmt.Errorf("%w: app %q does not match app-name format", ErrInvalidDataConfig, app)
-	}
-
-	hostPath, err := deriveAppDataPath(cfg.DataRoot, app)
-	if err != nil {
+	if err := ensureTrustedDir(hostPath); err != nil {
 		return nil, err
 	}
 
 	return &AppData{
 		App:           app,
 		HostPath:      hostPath,
+		ContainerPath: containerPath,
+		ReadOnly:      md.ReadOnly,
+	}, nil
+}
+
+// ensureTrustedDir creates dir (with mode 0755) if it does not
+// exist, after confirming no parent component is a symlink. If
+// dir already exists, verifies it is a real directory. The
+// post-create Lstat guards against a TOCTOU race where a symlink
+// appears between the pre-check and the mkdir. Used by
+// EnsureAppDataDir for the v1/v2 app-owned branch.
+func ensureTrustedDir(dir string) error {
+	if err := noSymlinkAt(dir, ErrSymlinkedAppData); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			return fmt.Errorf("%w: mkdir %s: %v", ErrInvalidDataConfig, dir, err)
+		}
+		info, err = os.Lstat(dir)
+		if err != nil {
+			return fmt.Errorf("%w: post-mkdir stat %s: %v", ErrInvalidDataConfig, dir, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s became a symlink after mkdir", ErrSymlinkedAppData, dir)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%w: %s is not a directory after mkdir", ErrInvalidDataConfig, dir)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: stat %s: %v", ErrInvalidDataConfig, dir, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s", ErrSymlinkedAppData, dir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%w: %s exists but is not a directory", ErrInvalidDataConfig, dir)
+	}
+	return nil
+}
+
+// ensureHostSource validates an existing host directory against
+// the daemon-side allowlist and returns the AppData describing it.
+// The directory is NOT modified; the caller is responsible for
+// any cleanup needed on the caller side.
+//
+// Symlink rejection is strict: every path component from the root
+// down to (and including) the source path itself must be a real
+// directory. A symlink anywhere in that chain is refused with
+// ErrSymlinkedAppData.
+func ensureHostSource(cfg DataConfig, app, source, containerPath string) (*AppData, error) {
+	if !filepath.IsAbs(source) {
+		return nil, fmt.Errorf("%w: host_source %q is not absolute", ErrInvalidDataConfig, source)
+	}
+	cleaned := filepath.Clean(source)
+
+	// Allowlist: exact match only, against the cleaned path. The
+	// allowlist is operator-supplied and not derived from the
+	// manifest, so a manifest cannot grant itself access.
+	if !pathInAllowlist(cleaned, cfg.HostSourceAllowlist) {
+		return nil, fmt.Errorf("%w: %s is not in the daemon allowlist", ErrHostSourceDenied, cleaned)
+	}
+
+	// Resolve symlinks in every component so a redirected
+	// component cannot point the mount at an unexpected path.
+	if err := noSymlinkAt(cleaned, ErrSymlinkedAppData); err != nil {
+		return nil, err
+	}
+
+	info, err := os.Stat(cleaned)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: host_source %s does not exist", ErrInvalidDataConfig, cleaned)
+		}
+		return nil, fmt.Errorf("%w: stat %s: %v", ErrInvalidDataConfig, cleaned, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("%w: host_source %s is not a directory", ErrInvalidDataConfig, cleaned)
+	}
+
+	// Host-source mounts are always read-only — the daemon
+	// ignores (and overrides) md.ReadOnly for these mounts. This
+	// is a hard invariant of the host-source contract.
+	return &AppData{
+		App:           app,
+		HostPath:      cleaned,
+		ContainerPath: containerPath,
+		ReadOnly:      true,
+	}, nil
+}
+
+// pathInList reports whether cleaned is an exact match for any
+// element of list (after filepath.Clean on each element). Used
+// for the host-source allowlist check.
+func pathInAllowlist(cleaned string, list []string) bool {
+	for _, p := range list {
+		if filepath.Clean(p) == cleaned {
+			return true
+		}
+	}
+	return false
+}
+
+// noSymlinkAt returns ErrSymlinkedAppData if path (or any parent
+// directory leading to it) is a symlink. errFor is the sentinel
+// returned on detection. Used both by the legacy app-owned
+// branch and by ensureHostSource.
+//
+// The check walks up the directory chain from path to /. A
+// symlink at any component fails the check. The component where
+// the symlink was detected is reported in the error.
+func noSymlinkAt(path string, errFor error) error {
+	cleaned := filepath.Clean(path)
+	cur := cleaned
+	for {
+		info, err := os.Lstat(cur)
+		if err != nil {
+			return nil // missing parents are handled by the caller
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s", errFor, cur)
+		}
+		if cur == "/" || cur == "." {
+			return nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return nil
+		}
+		cur = parent
+	}
+}
+
+// AppDataDir returns the derived AppData for an EXISTING app-owned
+// data directory without creating it. Used by RemoveAppDataDir.
+// Host-source paths cannot be reported by AppDataDir (there is no
+// app-owned directory to describe); the function returns
+// ErrAppDataNotFound in that case.
+//
+// Config and app-name validation runs BEFORE the filesystem check
+// so an operator who passes a bad config or app name gets
+// ErrInvalidDataConfig (the same sentinel RemoveAppDataDir returns)
+// instead of a confusing ErrAppDataNotFound that points at a path
+// that was never going to be examined.
+func AppDataDir(cfg DataConfig, app string) (*AppData, error) {
+	if cfg.DataRoot == "" {
+		return nil, fmt.Errorf("%w: DataRoot is required", ErrInvalidDataConfig)
+	}
+	if !appNameRe.MatchString(app) {
+		return nil, fmt.Errorf("%w: app %q does not match app-name format", ErrInvalidDataConfig, app)
+	}
+	hostPath := filepath.Join(cfg.DataRoot, app, "data")
+	info, err := os.Lstat(hostPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrAppDataNotFound
+		}
+		return nil, fmt.Errorf("%w: stat %s: %v", ErrInvalidDataConfig, hostPath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%w: %s", ErrSymlinkedAppData, hostPath)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("%w: %s is not a directory", ErrInvalidDataConfig, hostPath)
+	}
+	return &AppData{
+		App:           app,
+		HostPath:      hostPath,
 		ContainerPath: dataContainerPath,
-		ReadOnly:      readOnly,
+		ReadOnly:      false, // not meaningful for AppDataDir; see EnsureAppDataDir
 	}, nil
 }
 
@@ -196,93 +389,26 @@ func AppDataDir(cfg DataConfig, app string, readOnly bool) (*AppData, error) {
 // path is derived from the trusted DataRoot and the validated app
 // name.
 func RemoveAppDataDir(cfg DataConfig, app string, force bool) error {
-	data, err := AppDataDir(cfg, app, false)
+	data, err := AppDataDir(cfg, app)
 	if err != nil {
 		return err
 	}
-
-	appDir := filepath.Dir(data.HostPath) // <DataRoot>/<app>
-
-	// Reject symlinks at DataRoot and the app parent BEFORE
-	// any ReadDir or RemoveAll runs. A symlinked parent would
-	// otherwise redirect deletion (or its readdir contents
-	// check) through the symlink target.
-	if err := noSymlinkAt(cfg.DataRoot, ErrSymlinkedAppData); err != nil {
+	if !strings.HasPrefix(data.HostPath, filepath.Clean(cfg.DataRoot)+string(os.PathSeparator)) &&
+		data.HostPath != filepath.Clean(cfg.DataRoot) {
+		return fmt.Errorf("%w: %s escapes DataRoot", ErrInvalidDataConfig, data.HostPath)
+	}
+	if err := noSymlinkAt(data.HostPath, ErrSymlinkedAppData); err != nil {
 		return err
 	}
-	if err := noSymlinkAt(appDir, ErrSymlinkedAppData); err != nil {
-		return err
-	}
-
-	info, err := os.Lstat(data.HostPath)
+	entries, err := os.ReadDir(data.HostPath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%w: %s", ErrAppDataNotFound, data.HostPath)
-		}
-		return fmt.Errorf("%w: stat %s: %v", ErrInvalidDataConfig, data.HostPath, err)
+		return fmt.Errorf("%w: readdir %s: %v", ErrInvalidDataConfig, data.HostPath, err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%w: %s", ErrSymlinkedAppData, data.HostPath)
+	if len(entries) > 0 && !force {
+		return ErrAppDataNotEmpty
 	}
-	if !info.IsDir() {
-		return fmt.Errorf("%w: %s exists but is not a directory", ErrInvalidDataConfig, data.HostPath)
-	}
-
-	if !force {
-		entries, err := os.ReadDir(data.HostPath)
-		if err != nil {
-			return fmt.Errorf("%w: readdir %s: %v", ErrInvalidDataConfig, data.HostPath, err)
-		}
-		if len(entries) > 0 {
-			return fmt.Errorf("%w: %s contains %d entries; pass force=true to remove recursively", ErrAppDataNotEmpty, data.HostPath, len(entries))
-		}
-	}
-
 	if err := os.RemoveAll(data.HostPath); err != nil {
 		return fmt.Errorf("%w: remove %s: %v", ErrInvalidDataConfig, data.HostPath, err)
 	}
 	return nil
-}
-
-// noSymlinkAt Lstats path and reports whether it is a symlink.
-// The returned sentinel is the one passed in (typically
-// ErrSymlinkedAppData) so callers get the layer-appropriate error
-// type for free. Missing paths return nil so callers can layer
-// the missing-path semantics on top.
-func noSymlinkAt(path string, symlinkErr error) error {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("%w: stat %s: %v", ErrInvalidDataConfig, path, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%w: %s", symlinkErr, path)
-	}
-	return nil
-}
-
-// deriveAppDataPath returns the absolute host path for app's data
-// directory and verifies the resolved path is contained in
-// dataRoot (defense in depth against a symlinked root that points
-// outside the trusted host layout).
-func deriveAppDataPath(dataRoot, app string) (string, error) {
-	path := filepath.Join(dataRoot, app, "data")
-	absRoot, err := filepath.Abs(dataRoot)
-	if err != nil {
-		return "", fmt.Errorf("%w: abs root: %v", ErrInvalidDataConfig, err)
-	}
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("%w: abs path: %v", ErrInvalidDataConfig, err)
-	}
-	rel, err := filepath.Rel(absRoot, absPath)
-	if err != nil {
-		return "", fmt.Errorf("%w: rel: %v", ErrInvalidDataConfig, err)
-	}
-	if rel == ".." || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("%w: path traversal detected", ErrInvalidDataConfig)
-	}
-	return absPath, nil
 }

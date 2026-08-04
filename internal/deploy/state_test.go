@@ -544,7 +544,7 @@ func TestSaveDeployment_PersistsMountDataAndReadOnly(t *testing.T) {
 	cfg := validStateConfig(t)
 	dep := validDeployment("myapp", strings.Repeat("a", 40), 49152, 8080)
 	dep.MountData = true
-	dep.DataReadOnly = true
+	dep.MountReadOnly = true
 
 	if err := SaveDeployment(cfg, dep); err != nil {
 		t.Fatalf("SaveDeployment: %v", err)
@@ -557,7 +557,7 @@ func TestSaveDeployment_PersistsMountDataAndReadOnly(t *testing.T) {
 	if state.Current == nil {
 		t.Fatalf("current is nil")
 	}
-	if !state.Current.MountData || !state.Current.DataReadOnly {
+	if !state.Current.MountData || !state.Current.MountReadOnly {
 		t.Errorf("current mount fields not preserved: %+v", state.Current)
 	}
 
@@ -569,15 +569,15 @@ func TestSaveDeployment_PersistsMountDataAndReadOnly(t *testing.T) {
 	if !strings.Contains(string(data), `"mount_data": true`) {
 		t.Errorf("expected mount_data:true in JSON, got: %s", data)
 	}
-	if !strings.Contains(string(data), `"data_read_only": true`) {
-		t.Errorf("expected data_read_only:true in JSON, got: %s", data)
+	if !strings.Contains(string(data), `"mount_read_only": true`) {
+		t.Errorf("expected mount_read_only:true in JSON, got: %s", data)
 	}
 }
 
 func TestLoadDeploymentState_BackwardCompatibleWithoutDataFields(t *testing.T) {
 	// A state file written by an older agentctl that did not know
 	// about the data mount fields must still load with MountData=false
-	// and DataReadOnly=false (the natural zero values). The version
+	// and MountReadOnly=false (the natural zero values). The version
 	// number is unchanged; the new fields are optional on read.
 	cfg := validStateConfig(t)
 	legacy := `{
@@ -605,7 +605,7 @@ func TestLoadDeploymentState_BackwardCompatibleWithoutDataFields(t *testing.T) {
 	if state.Current == nil {
 		t.Fatalf("current is nil")
 	}
-	if state.Current.MountData || state.Current.DataReadOnly {
+	if state.Current.MountData || state.Current.MountReadOnly {
 		t.Errorf("legacy state should have mount fields false, got %+v", state.Current)
 	}
 }

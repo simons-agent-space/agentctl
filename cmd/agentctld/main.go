@@ -74,6 +74,27 @@
 // Data layer:
 //
 //	AGENTCTLD_DATA_ROOT             persistent-data root (required)
+//	AGENTCTLD_HOST_SOURCE_ALLOWLIST comma-separated allowlist of host
+//	                                directories that may be mounted
+//	                                read-only via data.host_source
+//	                                (required when any v3 manifest
+//	                                uses data.host_source)
+//
+// Secret layer:
+//
+//	AGENTCTLD_SECRET_DIR            per-app secret directory; required
+//	                                when any v3 manifest declares env
+//	                                entries
+//
+// Runtime dir (env-file staging):
+//
+//	AGENTCTLD_RUNTIME_DIR           daemon-owned directory in which the
+//	                                per-deploy env file is materialized
+//	                                before being handed to
+//	                                docker --env-file. Required when
+//	                                any v3 manifest declares env
+//	                                entries; defaults to
+//	                                <StateDir>/runtime/ when unset.
 package main
 
 import (
@@ -82,6 +103,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -161,8 +183,11 @@ func loadConfig() (*daemon.Config, error) {
 			BaseDomain: os.Getenv("AGENTCTLD_STATE_BASE_DOMAIN"),
 		},
 		Data: deploy.DataConfig{
-			DataRoot: os.Getenv("AGENTCTLD_DATA_ROOT"),
+			DataRoot:            os.Getenv("AGENTCTLD_DATA_ROOT"),
+			HostSourceAllowlist: splitCSV(os.Getenv("AGENTCTLD_HOST_SOURCE_ALLOWLIST")),
 		},
+		SecretDir:  os.Getenv("AGENTCTLD_SECRET_DIR"),
+		RuntimeDir: os.Getenv("AGENTCTLD_RUNTIME_DIR"),
 	}
 
 	if v := os.Getenv("AGENTCTLD_SOCKET_MODE"); v != "" {
@@ -259,6 +284,32 @@ func loadConfig() (*daemon.Config, error) {
 	if cfg.Runtime.HealthTimeout <= 0 {
 		return nil, fmt.Errorf("AGENTCTLD_RUNTIME_HEALTH_TIMEOUT must be positive")
 	}
+	// Validate the secret directory once at startup so the
+	// operator sees a clear error before the daemon ever tries
+	// to materialize an env file. An empty SecretDir is allowed
+	// (no v3 deploys opt into env yet); a non-empty value must
+	// point at an existing directory.
+	if err := deploy.ValidateSecretDir(cfg.SecretDir); err != nil {
+		return nil, fmt.Errorf("AGENTCTLD_SECRET_DIR: %w", err)
+	}
+	// Default RuntimeDir to <StateDir>/runtime/ when the env var
+	// is unset. The runtime dir is the staging location for the
+	// per-deploy env file consumed by docker --env-file; it is
+	// owned by the daemon and lives outside any per-deploy
+	// source worktree. deploy.EnsureRuntimeDir validates the
+	// path (no symlinks at the runtime dir or any parent
+	// component, real directory, trusted owner, mode 0700-or-
+	// stricter) and safe-creates it on missing — only the leaf,
+	// never MkdirAll. The parent must already exist; otherwise
+	// the call fails with ErrRuntimeDirMissing. A missing or
+	// unsafe runtime dir fails loudly at startup, not in the
+	// middle of a deploy.
+	if cfg.RuntimeDir == "" {
+		cfg.RuntimeDir = filepath.Join(cfg.State.StateDir, "runtime")
+	}
+	if err := deploy.EnsureRuntimeDir(cfg.RuntimeDir); err != nil {
+		return nil, fmt.Errorf("AGENTCTLD_RUNTIME_DIR: %w", err)
+	}
 	if cfg.OperationTimeout < 0 {
 		return nil, fmt.Errorf("AGENTCTLD_OPERATION_TIMEOUT must not be negative")
 	}
@@ -295,6 +346,26 @@ func parseOctalMode(s string) (os.FileMode, error) {
 		return 0, fmt.Errorf("expected an octal mode (e.g. 0660 or 0o660): %w", err)
 	}
 	return os.FileMode(n), nil
+}
+
+// splitCSV returns the trimmed non-empty elements of a
+// comma-separated value, or nil when the input is empty. Each
+// element is cleaned with filepath.Clean so callers comparing
+// against os-derived paths can rely on the canonical form.
+func splitCSV(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 func openLogWriter(path string) (writer *os.File, closer func() error, err error) {

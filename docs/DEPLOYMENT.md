@@ -939,3 +939,74 @@ Sentinel errors:
 - HTTP handlers, Telegram approval, and systemd integration are
   intentionally out of scope; this layer is the daemon's
   building block.
+
+## Per-app env-backed secrets
+
+Version-3 manifests may opt into env-backed secrets. The feature is
+deliberately narrow: a single env entry per secret, one file per
+secret in the daemon's secret directory, no caller-supplied paths,
+no multi-line values.
+
+### Goals
+
+- The host path to the secret directory is derived from a **trusted
+  root** (host configuration) and the **validated app name**; the
+  deployment manifest never specifies a host path.
+- The host path is `/etc/agentctl/secrets/<app>` (or whatever the
+  operator sets via `AGENTCTLD_SECRET_DIR`); the secret directory
+  itself is `ValidateSecretDir`-checked at daemon startup (no
+  symlinks, mode 0700-or-stricter, owned by root or the daemon's
+  uid).
+- Each `secret_ref` is a file inside the secret directory. The
+  filename is validated against `secretRefRe`
+  (`^[a-z0-9_](?:[a-z0-9_.-]{0,62}[a-z0-9_])$`). Files must be
+  regular (symlink-rejected), mode 0600-or-stricter, owned by
+  root or the daemon's uid.
+- Values are **strictly single-line**. After trimming one trailing
+  newline, any embedded `\n` or `\r` is rejected with
+  `ErrSecretMultiline` (Docker `--env-file` cannot safely represent
+  arbitrary multi-line values with the current `KEY=value` writer).
+  The error names the secret_ref but never the value. PEM-encoded
+  keys, certificates, and any other multi-line secrets are **not**
+  supported as env values; pass them through a different injection
+  path (a mounted file is the usual pattern).
+- Secret VALUES are only ever written to a per-deploy temp env
+  file with mode 0600, mounted via `docker run --env-file <path>`,
+  and the temp file is `os.Remove`d the moment the container is
+  created. They never appear in `--env`, in `ps`, in shell argv, in
+  the daemon's audit log, in deployment state, in the persisted
+  manifest, in inspect output, or in error messages.
+- The runtime directory that briefly contains the temp env file
+  (`Config.RuntimeDir`) is treated as security-equivalent to the
+  secret directory: `validateRuntimeDir` enforces mode
+  0700-or-stricter, no symlinks at any parent component, trusted
+  owner (root or the daemon's uid), and safe-creates a missing
+  directory with `os.Mkdir` (never `MkdirAll`, so the daemon
+  cannot materialise an arbitrary root tree).
+
+### Schema (v3)
+
+```
+type EnvEntry struct {
+    Name      string  // matches env-var-name regex
+    SecretRef string  // matches secretRefRe
+    Required  bool    // false by default
+}
+```
+
+### Inspect projection
+
+`InspectResponse.EnvStatuses []EnvStatus` reports, per entry:
+`{name, secret_ref, required, configured}`. Never the value.
+
+### Deployment semantics
+
+- `Required=false` + secret file missing: silently skipped
+  (no entry written, no error).
+- `Required=true` + secret file missing: `ErrSecretMissing`
+  surfaces at inspect and at deploy; Docker is not started.
+- Secret file present but fails any loader check (symlink,
+  permissions, owner, multi-line value): always rejected with the
+  matching sentinel, regardless of `Required`. A present-but-broken
+  secret is a configuration bug, not a missing file.
+

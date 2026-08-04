@@ -188,7 +188,7 @@ func TestValidateRuntimeConfig_RejectsBadPortRanges(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.mod(&cfg)
-			_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), newFakeRunner())
+			_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), newFakeRunner(), "")
 			if !errors.Is(err, ErrInvalidRuntimeConfig) {
 				t.Errorf("expected ErrInvalidRuntimeConfig, got %v", err)
 			}
@@ -204,7 +204,7 @@ func TestStartCandidate_MissingDockerfileRejected(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	cfg := RuntimeConfig{PortRangeStart: 49152, PortRangeEnd: 49200, HealthTimeout: time.Second, RepositoryRoot: root}
-	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), newFakeRunner())
+	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), newFakeRunner(), "")
 	if !errors.Is(err, ErrDockerfileMissing) {
 		t.Errorf("expected ErrDockerfileMissing, got %v", err)
 	}
@@ -225,7 +225,7 @@ func TestStartCandidate_SymlinkedDockerfileRejected(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 	cfg := RuntimeConfig{PortRangeStart: 49152, PortRangeEnd: 49200, HealthTimeout: time.Second, RepositoryRoot: root}
-	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), newFakeRunner())
+	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), newFakeRunner(), "")
 	if !errors.Is(err, ErrDockerfileSymlink) {
 		t.Errorf("expected ErrDockerfileSymlink, got %v", err)
 	}
@@ -292,7 +292,7 @@ func TestStartCandidate_DockerBuildUsesExactCheckout(t *testing.T) {
 		fakeResponseEntry{match: match("docker", "build", "--pull", "--tag", image, checkout), resp: fakeResponse{out: ""}},
 		fakeResponseEntry{match: matchAny("docker"), resp: fakeResponse{out: ""}},
 	)
-	if _, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner); err != nil {
+	if _, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner, ""); err != nil {
 		t.Fatalf("startCandidate: %v", err)
 	}
 
@@ -318,7 +318,7 @@ func TestStartCandidate_BuildFailurePreventsContainerStart(t *testing.T) {
 			resp:  fakeResponse{out: "build error output", err: errors.New("exit 1")},
 		},
 	)
-	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner)
+	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner, "")
 	if !errors.Is(err, ErrImageBuildFailed) {
 		t.Errorf("expected ErrImageBuildFailed, got %v", err)
 	}
@@ -340,7 +340,7 @@ func TestStartCandidate_RequiredDockerRestrictionsPresent(t *testing.T) {
 	withFixedPort(t, srvPort)
 
 	runner := newFakeRunner(fakeResponseEntry{match: matchAny("docker"), resp: fakeResponse{out: ""}})
-	if _, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner); err != nil {
+	if _, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner, ""); err != nil {
 		t.Fatalf("startCandidate: %v", err)
 	}
 
@@ -412,7 +412,7 @@ func TestStartCandidate_PortBindingFailureTriesNextPort(t *testing.T) {
 		},
 		fakeResponseEntry{match: matchAny("docker"), resp: fakeResponse{out: ""}},
 	)
-	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner)
+	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner, "")
 	// The health check is expected to fail because the HTTP server is
 	// on the first port, not the retry port. What matters for this
 	// test is that the retry happened: attempt must be >= 2.
@@ -436,7 +436,7 @@ func TestStartCandidate_ContainerAlreadyRunningRejected(t *testing.T) {
 		},
 		fakeResponseEntry{match: matchAny("docker"), resp: fakeResponse{out: ""}},
 	)
-	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner)
+	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner, "")
 	if !errors.Is(err, ErrContainerRunning) {
 		t.Errorf("expected ErrContainerRunning, got %v", err)
 	}
@@ -520,7 +520,7 @@ func TestStartCandidate_HealthTimeoutRemovesCandidate(t *testing.T) {
 	withFixedPort(t, srvPort)
 
 	runner := newFakeRunner(fakeResponseEntry{match: matchAny("docker"), resp: fakeResponse{out: ""}})
-	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner)
+	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner, "")
 	if !errors.Is(err, ErrHealthCheckFailed) {
 		t.Errorf("expected ErrHealthCheckFailed, got %v", err)
 	}
@@ -549,7 +549,7 @@ func TestRemoveCandidate_DerivesAndValidatesIdentity(t *testing.T) {
 	withFixedPort(t, srvPort)
 
 	runner := newFakeRunner(fakeResponseEntry{match: matchAny("docker"), resp: fakeResponse{out: ""}})
-	first, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner)
+	first, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner, "")
 	if err != nil {
 		t.Fatalf("startCandidate: %v", err)
 	}
@@ -676,7 +676,7 @@ func TestStartCandidate_PortBindingFailureCleansContainerName(t *testing.T) {
 		fakeResponseEntry{match: matchAny("docker"), resp: fakeResponse{out: ""}},
 	)
 
-	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner)
+	_, err := startCandidate(context.Background(), cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner, "")
 	if err != nil && !errors.Is(err, ErrHealthCheckFailed) {
 		t.Fatalf("unexpected startCandidate error: %v", err)
 	}
@@ -739,7 +739,7 @@ func TestStartCandidate_HealthCancellationStillCleansUp(t *testing.T) {
 		cancel()
 	}()
 
-	_, err := startCandidate(ctx, cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner)
+	_, err := startCandidate(ctx, cfg, DataConfig{}, runtimeManifest(), runtimeSource(checkout), runner, "")
 	if !errors.Is(err, ErrHealthCheckFailed) {
 		t.Errorf("expected ErrHealthCheckFailed, got %v", err)
 	}
