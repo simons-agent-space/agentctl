@@ -8,9 +8,12 @@ It applies to every agent — sandboxed, local, or otherwise — that
 interacts with the deployment pipeline.
 
 The contract is **`inspect → approve → deploy`**: the agent inspects
-the proposal, a human approves the same exact proposal, and the agent
-submits the same exact request. Skipping or reordering any step is a
-violation of this procedure.
+the proposal, a human approves the same approved deployment proposal,
+and the agent submits that same approved deployment proposal — the
+application name, the commit SHA, and the manifest. (Inspect and
+deploy use different HTTP request shapes; what must be identical is
+the deployment proposal itself.) Skipping or reordering any step is
+a violation of this procedure.
 
 ## The mandatory workflow
 
@@ -112,9 +115,9 @@ discretionary choices.
   approval, the previously given approval is invalid.
 
 - **If anything changes after approval, including the application
-  name, commit, manifest, mounts, environment, port, domain, or
-  health check, approval is invalid and must be requested again.**
-  A new `inspect → report → approve` cycle is required.
+  name, commit, manifest, mounts, port, domain, or health check,
+  approval is invalid and must be requested again.** A new
+  `inspect → report → approve` cycle is required.
 
 - **The agent MUST report failed tests, warnings, or failed health
   checks honestly.** Failures are not omitted, downplayed, or hidden
@@ -130,11 +133,12 @@ discretionary choices.
   resources. The agent does not touch other apps' state, Caddy
   fragments, source mirrors, or persistent data.
 
-- **On deployment failure, the agent must stop, gather diagnostics,
-  and report them. It must not improvise destructive host changes.**
-  No `docker rm`, no manual Caddy reload, no `rm -rf` on the data
-  directory, no rollback by hand. The agent reads `status`, reads
-  `state`, reads the audit log, and reports.
+- **On deployment failure, the agent must stop, gather diagnostics
+  available through its permitted interfaces, and report them. It
+  must not improvise destructive host changes.** No `docker rm`,
+  no manual Caddy reload, no `rm -rf` on the data directory, no
+  rollback by hand. The agent reads `status`, reads `state`, and
+  reports.
 
 - **Rollback also requires explicit human approval unless the human
   explicitly approved an automatic rollback as part of that exact
