@@ -129,6 +129,24 @@ type Config struct {
 	State deploy.StateConfig
 	// Data is the trusted persistent-data configuration.
 	Data deploy.DataConfig
+	// SecretDir is the trusted host directory that holds per-app
+	// secret files (named <secret_ref>). Optional; required when
+	// any deployed manifest declares env entries. The daemon
+	// refuses to start if a manifest opts into env but
+	// SecretDir is unset.
+	SecretDir string
+	// RuntimeDir is the trusted daemon-owned directory in which
+	// the per-deploy env file (consumed by docker --env-file) is
+	// materialized. The daemon pre-creates RuntimeDir at startup
+	// with mode 0700 if it does not yet exist; the env-file
+	// lifecycle is bounded to the duration of a single deploy
+	// call. The directory is intentionally outside any per-deploy
+	// source worktree, so the env file is unaffected by worktree
+	// cleanup, not on a shared mount that may be reaped by
+	// another process, and not alongside source code that might
+	// be copied or backed up before the deploy finishes.
+	// Defaults to <StateDir>/runtime/ when the env var is unset.
+	RuntimeDir string
 }
 
 // Validate checks that Config is well-formed before listen.
@@ -792,6 +810,30 @@ func (s *Server) handleInspect(w http.ResponseWriter, r *http.Request) {
 		resp.Errors = append(resp.Errors, fmt.Sprintf("load state: %v", err))
 	}
 
+	// EnvStatuses: only populated for v3 manifests with env
+	// entries. The loader never returns the secret value; only
+	// the boolean "configured" flag. A missing required secret
+	// fails the inspect by appending an error and setting
+	// Valid=false; an optional missing secret is reported as
+	// configured=false but does not fail the inspect.
+	if len(manifest.Env) > 0 {
+		for _, e := range manifest.Env {
+			configured := deploy.IsSecretConfigured(s.cfg.SecretDir, e.SecretRef)
+			resp.EnvStatuses = append(resp.EnvStatuses, EnvStatus{
+				Name:       e.Name,
+				SecretRef:  e.SecretRef,
+				Required:   e.Required,
+				Configured: configured,
+			})
+			if !configured && e.Required {
+				resp.Valid = false
+				resp.Errors = append(resp.Errors,
+					fmt.Sprintf("env[%s]: required secret_ref %q is not configured",
+						e.Name, e.SecretRef))
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -844,11 +886,13 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request, app string
 	}
 
 	deployCfg := deploy.DeployConfig{
-		Source:  s.cfg.Source,
-		Runtime: s.cfg.Runtime,
-		Caddy:   s.cfg.Caddy,
-		State:   s.cfg.State,
-		Data:    s.cfg.Data,
+		Source:     s.cfg.Source,
+		Runtime:    s.cfg.Runtime,
+		Caddy:      s.cfg.Caddy,
+		State:      s.cfg.State,
+		Data:       s.cfg.Data,
+		SecretDir:  s.cfg.SecretDir,
+		RuntimeDir: s.cfg.RuntimeDir,
 	}
 	// Use a fresh background context for the deploy itself so a
 	// cancelled HTTP request cannot interrupt an in-flight
@@ -1138,6 +1182,14 @@ func parseStrictManifest(raw json.RawMessage) (*deploy.Manifest, error) {
 	}
 	if m.Version == 1 && m.Data != nil {
 		return nil, fmt.Errorf("data field is not allowed in version 1 manifests (bump to version 2)")
+	}
+	if len(m.Env) > 0 {
+		if m.Version == 1 {
+			return nil, fmt.Errorf("env field is not allowed in version 1 manifests (bump to version 3)")
+		}
+		if m.Version == 2 {
+			return nil, fmt.Errorf("env field requires manifest version 3 (current version is 2)")
+		}
 	}
 	return &m, nil
 }

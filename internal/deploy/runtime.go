@@ -85,11 +85,11 @@ func (dockerRunner) Run(ctx context.Context, name string, args ...string) (strin
 // present. The data root comes from cfg (trusted host configuration),
 // never from the manifest; the in-container target is the fixed
 // constant dataContainerPath.
-func StartCandidate(ctx context.Context, cfg RuntimeConfig, data DataConfig, manifest Manifest, source SourceResult) (*CandidateResult, error) {
-	return startCandidate(ctx, cfg, data, manifest, source, dockerRunner{})
+func StartCandidate(ctx context.Context, cfg RuntimeConfig, data DataConfig, manifest Manifest, source SourceResult, envFile string) (*CandidateResult, error) {
+	return startCandidate(ctx, cfg, data, manifest, source, dockerRunner{}, envFile)
 }
 
-func startCandidate(ctx context.Context, cfg RuntimeConfig, data DataConfig, manifest Manifest, source SourceResult, runner commandRunner) (*CandidateResult, error) {
+func startCandidate(ctx context.Context, cfg RuntimeConfig, data DataConfig, manifest Manifest, source SourceResult, runner commandRunner, envFile string) (*CandidateResult, error) {
 	if err := validateRuntimeInputs(cfg, manifest, source); err != nil {
 		return nil, err
 	}
@@ -114,13 +114,13 @@ func startCandidate(ctx context.Context, cfg RuntimeConfig, data DataConfig, man
 	var appData *AppData
 	if manifest.Data != nil && manifest.Data.Mount {
 		var err error
-		appData, err = EnsureAppDataDir(data, manifest.App, manifest.Data.ReadOnly)
+		appData, err = EnsureAppDataDir(data, manifest.App, manifest.Data)
 		if err != nil {
 			return nil, fmt.Errorf("ensure app data dir: %w", err)
 		}
 	}
 
-	return startWithPortRetry(ctx, cfg, runner, containerName, image, manifest.ContainerPort, manifest.HealthPath, manifest.App, source.Commit, appData)
+	return startWithPortRetry(ctx, cfg, runner, containerName, image, manifest.ContainerPort, manifest.HealthPath, manifest.App, source.Commit, appData, envFile)
 }
 
 // RemoveCandidate stops and removes the candidate container identified
@@ -278,13 +278,13 @@ func defaultAllocatePort(start, end int) (int, error) {
 	return 0, fmt.Errorf("%w: %d..%d", ErrNoAvailablePort, start, end)
 }
 
-func startWithPortRetry(ctx context.Context, cfg RuntimeConfig, runner commandRunner, containerName, image string, containerPort int, healthPath, app, commit string, appData *AppData) (*CandidateResult, error) {
+func startWithPortRetry(ctx context.Context, cfg RuntimeConfig, runner commandRunner, containerName, image string, containerPort int, healthPath, app, commit string, appData *AppData, envFile string) (*CandidateResult, error) {
 	port, err := allocatePortFunc(cfg.PortRangeStart, cfg.PortRangeEnd)
 	if err != nil {
 		return nil, err
 	}
 	for {
-		startErr := startContainer(ctx, runner, containerName, image, port, containerPort, appData)
+		startErr := startContainer(ctx, runner, containerName, image, port, containerPort, appData, envFile)
 		if startErr != nil {
 			if isPortInUse(startErr) {
 				// A port-binding failure can leave a stopped container with
@@ -341,8 +341,8 @@ func nextAvailablePort(start, end, after int) (int, error) {
 	return after + 1, nil
 }
 
-func startContainer(ctx context.Context, runner commandRunner, containerName, image string, hostPort, containerPort int, appData *AppData) error {
-	args := buildDockerRunArgs(containerName, image, hostPort, containerPort, appData)
+func startContainer(ctx context.Context, runner commandRunner, containerName, image string, hostPort, containerPort int, appData *AppData, envFile string) error {
+	args := buildDockerRunArgs(containerName, image, hostPort, containerPort, appData, envFile)
 	out, err := runner.Run(ctx, "docker", args...)
 	if err != nil {
 		return fmt.Errorf("%w: %s", ErrContainerStartFailed, truncateForError(out))
@@ -359,7 +359,7 @@ func startContainer(ctx context.Context, runner commandRunner, containerName, im
 // When appData is non-nil the call adds a bind mount of
 // appData.HostPath at the fixed in-container target /data with
 // the read-only flag carried on appData.
-func buildDockerRunArgs(containerName, image string, hostPort, containerPort int, appData *AppData) []string {
+func buildDockerRunArgs(containerName, image string, hostPort, containerPort int, appData *AppData, envFile string) []string {
 	args := []string{
 		"run",
 		"--detach",
@@ -374,6 +374,15 @@ func buildDockerRunArgs(containerName, image string, hostPort, containerPort int
 	}
 	if appData != nil {
 		args = append(args, "--mount", buildDataMountArg(appData))
+	}
+	// envFile is a path produced by MaterializeEnvFile. When
+	// non-empty, it is passed to docker as --env-file instead of
+	// any --env flags; the caller (deploy / rollback) is
+	// responsible for deleting the file after docker run returns.
+	// An empty envFile means the deployment has no env entries
+	// and the container is started without env injection.
+	if envFile != "" {
+		args = append(args, "--env-file", envFile)
 	}
 	args = append(args, image)
 	return args
