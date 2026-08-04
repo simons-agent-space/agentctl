@@ -32,8 +32,18 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -t) TIMEOUT="$2"; shift 2 ;;
-    -s) SOCKET="$2"; shift 2 ;;
+    -t)
+      if [[ $# -lt 2 ]]; then
+        echo "missing value for -t" >&2
+        exit 2
+      fi
+      TIMEOUT="$2"; shift 2 ;;
+    -s)
+      if [[ $# -lt 2 ]]; then
+        echo "missing value for -s" >&2
+        exit 2
+      fi
+      SOCKET="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -54,7 +64,7 @@ while (( SECONDS < DEADLINE )); do
        http://localhost/healthz >/dev/null 2>&1; then
     exit 0
   fi
-  sleep "$(awk -v ms=$INTERVAL_MS 'BEGIN { printf "%.3f", ms / 1000 }')"
+  sleep "$(( INTERVAL_MS / 1000 )).$(( (INTERVAL_MS % 1000) / 100 ))"
   INTERVAL_MS=$(( INTERVAL_MS * 2 ))
   (( INTERVAL_MS > MAX_INTERVAL_MS )) && INTERVAL_MS=$MAX_INTERVAL_MS
 done

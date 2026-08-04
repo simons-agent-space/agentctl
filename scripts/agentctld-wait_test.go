@@ -107,3 +107,29 @@ func TestAgentctldWait_BadArgs(t *testing.T) {
 		t.Errorf("expected invalid timeout message in stderr, got: %s", stderr.String())
 	}
 }
+
+// TestAgentctldWait_MissingOptionValue verifies that the wait script
+// exits 2 with a useful error when -t or -s is provided without a
+// value (instead of failing under set -u).
+func TestAgentctldWait_MissingOptionValue(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+
+	for _, arg := range []string{"-t", "-s"} {
+		arg := arg
+		t.Run(arg, func(t *testing.T) {
+			cmd := exec.Command("bash", scriptPath(t), arg)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			err := cmd.Run()
+			if err == nil {
+				t.Fatalf("expected exit 2, got 0\nstdout: %s\nstderr: %s", stdout.String(), stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "missing value") {
+				t.Errorf("expected 'missing value' message in stderr, got: %s", stderr.String())
+			}
+		})
+	}
+}
