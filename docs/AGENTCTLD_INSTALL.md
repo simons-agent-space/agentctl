@@ -702,11 +702,22 @@ response write.
 
 9. **Verify the service:**
 
+   systemd may report `agentctld.service` as active before the
+   daemon's Unix socket is bound. The single curl above races with
+   socket creation and fails on the first attempt. Use the wait
+   helper instead:
+
    ```
    systemctl status agentctld
    systemctl is-active agentctld
-   curl --unix-socket /run/agentctld/socket http://localhost/healthz
+   scripts/agentctld-wait.sh -t 30
    ```
+
+   The helper polls `/healthz` with exponential backoff (100ms → 1s)
+   and exits 0 the first time the endpoint returns 200. On timeout,
+   it prints `systemctl --no-pager --full status agentctld.service`
+   and the last 50 lines of `journalctl -u agentctld.service`, then
+   exits 1.
 
    The `healthz` response body is `{"status":"ok"}` with HTTP 200.
    Any other response indicates a configuration or wiring problem.
