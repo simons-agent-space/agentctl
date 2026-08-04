@@ -171,6 +171,10 @@ of either, in the standard setup.
   manifest format (`deploy.json`), source resolution, candidate
   container, Caddy promotion, deployment state, per-app persistent
   data, rollback orchestration, and the deployment orchestrator.
+- [`docs/AGENT_DEPLOYMENT_WORKFLOW.md`](docs/AGENT_DEPLOYMENT_WORKFLOW.md) —
+  mandatory `inspect → approve → deploy` workflow for any coding
+  agent that prepares or performs an application deployment through
+  `agentctld`.
 
 ## Security
 
