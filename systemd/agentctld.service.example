@@ -1,0 +1,235 @@
+[Unit]
+Description=agentctld - host-side deployment control plane
+Documentation=https://github.com/simons-agent-space/agentctl
+# agentctld talks to the Docker daemon over /var/run/docker.sock and
+# to GitHub over HTTPS for `git fetch origin/main`. docker.service is
+# an ordering dependency (the socket must exist by the time the
+# daemon serves requests) but NOT a requirement dependency: a
+# degraded docker daemon must not take down agentctld, because the
+# daemon still serves health checks, app listings, inspect, and
+# state reads without it. network-online is only a soft ordering
+# dependency so a transient network hiccup does not delay startup
+# indefinitely.
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+
+# Run as a dedicated unprivileged user. Every directory the daemon
+# writes to (sources, state, data, caddy fragments, audit log, socket)
+# is owned by this user so the daemon's own writes are unprivileged.
+# The operator creates the system account with:
+#
+#   useradd --system --no-create-home --shell /usr/sbin/nologin agentctld
+#
+# agentctld is intentionally NOT in /etc/sudoers. If a future
+# operator task needs elevated privileges, it must be modelled as a
+# separate service.
+User=agentctld
+Group=agentctld
+
+# /var/run/docker.sock is owned by root:docker with mode 0660.
+# Adding agentctld to the docker group grants the daemon CLI access
+# to the socket so `docker build`, `docker run`, `docker inspect`,
+# etc. can talk to the docker daemon. The docker daemon itself runs
+# under its own systemd unit (docker.service) with its own
+# privileges; agentctld does NOT need mount/unshare/CAP_SYS_ADMIN
+# because every privileged operation happens inside dockerd, not
+# inside agentctld or its direct children.
+#
+# Security implication: anyone with code execution as agentctld can
+# talk to the Docker daemon. The daemon only invokes Docker with
+# a fixed argv built from validated inputs (see docs/DEPLOYMENT.md),
+# so a UDS-socket-only attacker cannot escalate via Docker
+# arguments. The supplementary group is required for the daemon to
+# function; it does not by itself grant new capabilities.
+#
+# `agentctl-clients` is the dedicated socket-client group. It is
+# listed here solely so the daemon's post-bind `os.Chown(socket, -1,
+# gid)` (when `AGENTCTLD_SOCKET_GROUP=agentctl-clients`) succeeds;
+# the daemon itself does not need to access any file as
+# `agentctl-clients`. Authorised clients join `agentctl-clients`,
+# not `agentctld`; this keeps the daemon's primary group strictly
+# an ownership group for daemon-managed directories and prevents
+# socket clients from reading /etc/agentctld/agentctld.env,
+# audit logs, deployment state, source repositories, persistent
+# data, or managed Caddy fragments. See
+# docs/AGENTCTLD_INSTALL.md#user-and-group-setup for the full
+# layout.
+SupplementaryGroups=docker agentctl-clients
+
+ExecStart=/usr/local/bin/agentctld
+
+# EnvironmentFile is the single configuration surface. The default
+# location is /etc/agentctld/agentctld.env (ConfigurationDirectory).
+# Every AGENTCTLD_* variable documented in cmd/agentctld/main.go is
+# settable here; unknown variables are passed through to the
+# environment and ignored by the daemon. Operators must not commit
+# the populated env file.
+EnvironmentFile=/etc/agentctld/agentctld.env
+
+Restart=on-failure
+RestartSec=5s
+
+# TimeoutStopSec must be strictly greater than the daemon's
+# AGENTCTLD_OPERATION_TIMEOUT + AGENTCTLD_WRITE_TIMEOUT_MARGIN, which
+# together drive the HTTP WriteTimeout. The daemon's deploy and
+# rollback handlers run on a background context bounded by
+# AGENTCTLD_OPERATION_TIMEOUT (default 30m); the response write
+# happens inside the HTTP WriteTimeout (default 30m + 5m = 35m).
+# 40m gives a 5m buffer over the defaults.
+#
+# If AGENTCTLD_OPERATION_TIMEOUT or AGENTCTLD_WRITE_TIMEOUT_MARGIN
+# are raised, raise TimeoutStopSec accordingly so systemd does not
+# SIGKILL an active deployment before graceful shutdown completes.
+# See docs/AGENTCTLD_INSTALL.md#timeouts for the exact relationship.
+TimeoutStopSec=40m
+
+# RuntimeDirectory owns the Unix socket's parent directory. The
+# daemon binds AGENTCTLD_SOCKET_PATH inside it; the daemon resolves
+# AGENTCTLD_SOCKET_GROUP and chowns the socket FILE (not this
+# directory) to that group after creation. systemd owns this
+# directory's ownership and mode: User:Group = agentctld:agentctld
+# (the daemon's primary group, set by User= and Group= above).
+# RuntimeDirectory ownership always follows User=/Group=; adding
+# the daemon to a supplementary group does not change this
+# directory's group.
+#
+# Recommended default (production): AGENTCTLD_SOCKET_GROUP=
+# agentctl-clients, AGENTCTLD_SOCKET_MODE=0660, and
+# RuntimeDirectoryMode=0711. The dedicated client group
+# (`agentctl-clients`) is kept strictly an authorisation group for
+# the Unix socket; the daemon's primary group (`agentctld`) is kept
+# strictly an ownership group for daemon-managed directories
+# (/etc/agentctld, /var/log/agentctld, /var/lib/agentctld). Because
+# these are disjoint, no socket client gets group access to the
+# environment file, audit logs, deployment state, source
+# repositories, persistent data, or managed Caddy fragments.
+#
+# Mode 0711 keeps the directory traversable for clients without
+# exposing its contents: the x bit is set for "other" (any local
+# user can pass through to a known socket path), but the r bit is
+# not, so a user not in agentctld or agentctl-clients cannot list
+# the directory. The socket file itself stays mode 0660 with group
+# agentctl-clients, so an attacker who can traverse the directory
+# still cannot connect to the socket without being in
+# agentctl-clients.
+#
+# Shared-group alternative (development or explicitly accepted
+# single-role use only): AGENTCTLD_SOCKET_GROUP=agentctld with
+# RuntimeDirectoryMode=0750 and authorised clients joining the
+# `agentctld` group. THIS HAS BROADER HOST-FILESYSTEM EXPOSURE:
+# every socket client gains group access to the daemon-managed
+# directories, including:
+#   /etc/agentctld/agentctld.env (mode 0640 root:agentctld)
+#   /var/log/agentctld/  (audit log, mode 0750)
+#   /var/lib/agentctld/  (state, sources, data, caddy fragments,
+#                         mode 0750)
+# Use only when the operator accepts that clients can read
+# daemon-owned host files. Do not use this layout when client and
+# daemon roles need to be separated.
+RuntimeDirectory=agentctld
+RuntimeDirectoryMode=0711
+
+# LogsDirectory owns the audit log directory. Point
+# AGENTCTLD_AUDIT_LOG at /var/log/agentctld/audit.log so the file
+# inherits the LogsDirectory ownership (agentctld:agentctld, 0750).
+LogsDirectory=agentctld
+LogsDirectoryMode=0750
+
+# StateDirectory owns every persistent path the daemon writes to:
+# source repository root, runtime repository root, deployment state,
+# persistent app data, and managed Caddy fragments. Subdirectories
+# are created by the daemon on first use; the operator does not
+# need to pre-create them.
+#
+#   /var/lib/agentctld/state/    AGENTCTLD_STATE_DIR
+#   /var/lib/agentctld/data/     AGENTCTLD_DATA_ROOT
+#   /var/lib/agentctld/sources/  AGENTCTLD_SOURCE_REPOSITORY_ROOT
+#                               AGENTCTLD_RUNTIME_REPOSITORY_ROOT
+#   /var/lib/agentctld/caddy/    AGENTCTLD_CADDY_CONFIG_DIR
+StateDirectory=agentctld
+StateDirectoryMode=0750
+
+# ConfigurationDirectory owns the EnvironmentFile above. Mode 0750
+# is fine because systemd reads the file as root before exec.
+ConfigurationDirectory=agentctld
+ConfigurationDirectoryMode=0750
+
+# Sandbox the daemon hard. Every directive below has been verified
+# against the daemon's actual requirements (see
+# docs/AGENTCTLD_INSTALL.md#hardening).
+#
+# agentctld does NOT need:
+#   - privileged syscalls  (no mount, no unshare; Docker CLI is
+#                            a thin client that talks to dockerd)
+#   - namespaces           (no PID/IPC mount namespace creation;
+#                            agentctld does not spawn containers)
+#   - realtime scheduling  (no SCHED_FIFO/SCHED_RR)
+#   - SUID/SGID            (no setuid/setgid binaries)
+#   - /home, /root, /run/user (no home directory access)
+#   - kernel tunables, modules, control groups
+#   - kernel logs, clock, hostname writes
+#   - raw block/character devices other than /dev/null etc.
+#   - personality changes
+#   - W^X memory           (no JIT; the audit logger does not need it)
+#
+# agentctld DOES need:
+#   - AF_UNIX  (UDS listener)
+#   - AF_INET, AF_INET6  (git fetch over HTTPS, loopback HTTP probes)
+#   - read access to the canonical Caddyfile (typically /etc/caddy/Caddyfile)
+#   - read/write access to /var/run/docker.sock (via docker group)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# The daemon chowns the Unix socket to AGENTCTLD_SOCKET_GROUP after
+# binding. chown(2) lives in systemd's @chown group, which the
+# @privileged deny rule above removes. Re-allow @chown narrowly so
+# the daemon can change the socket's group ownership without
+# regaining the rest of the privileged surface (mount, unshare,
+# pivot_root, ...). @chown covers chown, chown32, fchown, fchown32,
+# and fchownat; the daemon uses chown(2) via os.Chown.
+SystemCallFilter=@chown
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# MemoryMax applies to the entire systemd service cgroup: the
+# agentctld daemon AND every short-lived child process it spawns
+# (git, the docker CLI, the caddy CLI). It is NOT bounded to the
+# Go daemon alone. The docker CLI in particular streams the
+# build context to dockerd over /var/run/docker.sock, so a large
+# build context can hold significant memory in the CLI process
+# while the upload is in progress.
+#
+# The default is unset: the cgroup inherits the system default
+# (typically unlimited on systemd hosts that do not impose a
+# unit-level MemoryMax). Operators who want a hard cap can set
+# one with `systemctl edit agentctld`, but the value must be
+# large enough to accommodate the largest expected build context
+# plus the working set of the daemon and its other children.
+# Setting MemoryMax=512M (or any other modest value) on a host
+# that builds large repositories will cause the cgroup to be
+# OOM-killed mid-build, which is destructive for an in-flight
+# deployment.
+
+[Install]
+WantedBy=multi-user.target
