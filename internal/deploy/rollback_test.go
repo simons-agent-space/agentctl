@@ -921,7 +921,7 @@ func TestRollbackDeployment_CleanupFailureIsReported(t *testing.T) {
 // declares MountData=true, the fresh `docker run` includes the
 // matching --mount flag and the host-side data directory is
 // created. The read-only flag on the mount matches
-// Deployment.DataReadOnly. This is the data-layer counterpart to
+// Deployment.MountReadOnly. This is the data-layer counterpart to
 // TestRollbackDeployment_RestorePrevious_CreatedFromAbsent; the
 // only difference is that the previous deployment opted into the
 // per-app data mount.
@@ -977,7 +977,7 @@ func TestRollbackDeployment_FreshRunAppliesDataMount(t *testing.T) {
 		Upstream:      fmt.Sprintf("127.0.0.1:%d", port),
 		DeployedAt:    time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC),
 		MountData:     true,
-		DataReadOnly:  true,
+		MountReadOnly: true,
 	}
 	current := Deployment{
 		App:           "myapp",

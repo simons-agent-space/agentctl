@@ -184,6 +184,11 @@ func newDeployFixture(t *testing.T) *deployFixture {
 
 	port := parseHTTPPort(healthSrv.URL)
 
+	runtimeDir := t.TempDir()
+	// Runtime dir is hardened to 0700 so EnsureRuntimeDir accepts it.
+	if err := os.Chmod(runtimeDir, 0o700); err != nil {
+		t.Fatalf("chmod runtime dir: %v", err)
+	}
 	cfg := DeployConfig{
 		Source: SourceConfig{
 			AllowedOrg:     "testorg",
@@ -209,6 +214,7 @@ func newDeployFixture(t *testing.T) *deployFixture {
 		Data: DataConfig{
 			DataRoot: dataDir,
 		},
+		RuntimeDir: runtimeDir,
 	}
 
 	docker := newDockerDeployRunner()
@@ -1461,8 +1467,8 @@ func TestDeploy_DataMount_EndToEnd(t *testing.T) {
 	if !state.Current.MountData {
 		t.Errorf("state.Current.MountData = false, want true")
 	}
-	if !state.Current.DataReadOnly {
-		t.Errorf("state.Current.DataReadOnly = false, want true")
+	if !state.Current.MountReadOnly {
+		t.Errorf("state.Current.MountReadOnly = false, want true")
 	}
 }
 
@@ -1526,8 +1532,8 @@ func TestDeploy_DataMount_NoMountByDefault(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadDeploymentState: %v", err)
 			}
-			if state.Current.MountData || state.Current.DataReadOnly {
-				t.Errorf("state.Current mount fields should be false, got MountData=%v DataReadOnly=%v", state.Current.MountData, state.Current.DataReadOnly)
+			if state.Current.MountData || state.Current.MountReadOnly {
+				t.Errorf("state.Current mount fields should be false, got MountData=%v DataReadOnly=%v", state.Current.MountData, state.Current.MountReadOnly)
 			}
 		})
 	}
@@ -1584,5 +1590,452 @@ func TestDeploy_DataMount_PreservedAcrossReplacement(t *testing.T) {
 	}
 	if _, err := os.Stat(userFile); err != nil {
 		t.Errorf("user file removed by replacement deploy: %v", err)
+	}
+}
+
+// TestDeploy_OptionalSecretMissingSkipped is the orchestrator
+// counterpart of TestMaterializeEnvFile_SkipsOptionalMissing:
+// when a manifest declares an optional secret_ref whose file is
+// missing, the deploy must succeed and the env file must NOT
+// contain an entry for the missing optional variable.
+func TestDeploy_OptionalSecretMissingSkipped(t *testing.T) {
+	f := newDeployFixture(t)
+	secretDir := t.TempDir()
+	f.cfg.SecretDir = secretDir
+	writeSecret(t, secretDir, "foo.key", []byte("foo-secret-value\n"), 0o600)
+	// bar.key missing; required=false (default).
+
+	capture := &envFileCapture{}
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	f.docker.onRun(capture.handler(containerName))
+	f.docker.onRm(func(args []string) (string, error) { return "", nil })
+
+	manifest := f.validManifest()
+	manifest.Version = 3
+	manifest.Env = []EnvEntry{
+		{Name: "FOO", SecretRef: "foo.key", Required: true},
+		{Name: "BAR", SecretRef: "bar.key"}, // optional, missing
+	}
+
+	result, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	if result == nil {
+		t.Fatalf("nil result")
+	}
+
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if !capture.existed {
+		t.Fatalf("docker run was called without --env-file (capture: %+v)", capture)
+	}
+	// FOO is present, BAR is omitted (optional + missing).
+	wantContent := "FOO=foo-secret-value\n"
+	if string(capture.content) != wantContent {
+		t.Errorf("env file content = %q, want %q (BAR must be omitted)", capture.content, wantContent)
+	}
+	if strings.Contains(string(capture.content), "BAR=") {
+		t.Errorf("env file unexpectedly contains BAR= line: %s", capture.content)
+	}
+}
+
+// TestDeploy_RequiredSecretMissingFails is the orchestrator
+// counterpart of TestMaterializeEnvFile_FailsBeforeCreateWhenRequiredSecretMissing:
+// a required secret_ref that is missing must fail the deploy with
+// ErrSecretMissing in the chain, and docker run must never be called.
+func TestDeploy_RequiredSecretMissingFails(t *testing.T) {
+	f := newDeployFixture(t)
+	secretDir := t.TempDir()
+	f.cfg.SecretDir = secretDir
+	// Nothing in secretDir: every env entry is missing.
+
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	dockerRunCalled := false
+	f.docker.onRun(func(args []string) (string, error) {
+		dockerRunCalled = true
+		return containerName, nil
+	})
+
+	manifest := f.validManifest()
+	manifest.Version = 3
+	manifest.Env = []EnvEntry{
+		{Name: "FOO", SecretRef: "foo.key", Required: true},
+	}
+
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected error for missing required secret")
+	}
+	if !errors.Is(err, ErrSecretMissing) {
+		t.Errorf("expected ErrSecretMissing in chain, got %v", err)
+	}
+	if dockerRunCalled {
+		t.Errorf("docker run called even though required secret was missing")
+	}
+}
+
+// TestDeploy_InsecureOptionalSecretStillRejected verifies that a
+// present-but-insecure optional secret still fails the deploy:
+// silent skipping is reserved for missing files. A 0644 secret
+// is malformed regardless of the entry's Required flag.
+func TestDeploy_InsecureOptionalSecretStillRejected(t *testing.T) {
+	f := newDeployFixture(t)
+	secretDir := t.TempDir()
+	f.cfg.SecretDir = secretDir
+	// foo.key present but mode 0644: must fail.
+	if err := os.WriteFile(filepath.Join(secretDir, "foo.key"), []byte("foo\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(secretDir, "foo.key"), 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	dockerRunCalled := false
+	f.docker.onRun(func(args []string) (string, error) {
+		dockerRunCalled = true
+		return containerName, nil
+	})
+
+	manifest := f.validManifest()
+	manifest.Version = 3
+	manifest.Env = []EnvEntry{
+		{Name: "FOO", SecretRef: "foo.key"}, // optional
+	}
+
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected error for insecure optional secret")
+	}
+	if !errors.Is(err, ErrSecretPermissions) {
+		t.Errorf("expected ErrSecretPermissions in chain, got %v", err)
+	}
+	if dockerRunCalled {
+		t.Errorf("docker run called even though optional secret was insecure")
+	}
+}
+
+// ---------- env-file materialization ----------
+
+// captureEnvFileRunHandler returns a docker `run` handler that records
+// the path of any --env-file argument, reads the file, captures its
+// permissions and content, and removes the file (matching the
+// orchestrator's "delete after docker run" contract). This lets tests
+// assert that the orchestrator materialized an env file with the
+// correct content and 0o600 perms, then deleted it.
+type envFileCapture struct {
+	mu      sync.Mutex
+	path    string
+	content []byte
+	perms   os.FileMode
+	existed bool
+}
+
+func (c *envFileCapture) handler(containerName string) func(args []string) (string, error) {
+	return func(args []string) (string, error) {
+		for i, a := range args {
+			if a == "--env-file" && i+1 < len(args) {
+				c.mu.Lock()
+				c.path = args[i+1]
+				info, err := os.Lstat(args[i+1])
+				if err == nil {
+					c.existed = true
+					c.perms = info.Mode().Perm()
+					content, rerr := os.ReadFile(args[i+1])
+					if rerr == nil {
+						c.content = content
+					}
+				}
+				c.mu.Unlock()
+			}
+		}
+		return containerName, nil
+	}
+}
+
+func TestDeploy_EnvFileMaterializedAndDeleted(t *testing.T) {
+	f := newDeployFixture(t)
+	secretDir := t.TempDir()
+	f.cfg.SecretDir = secretDir
+	writeSecret(t, secretDir, "foo.key", []byte("foo-secret-value\n"), 0o600)
+	writeSecret(t, secretDir, "bar.key", []byte("bar-secret-value\n"), 0o600)
+
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	capture := &envFileCapture{}
+	f.docker.onRun(capture.handler(containerName))
+	f.docker.onRm(func(args []string) (string, error) { return "", nil })
+
+	manifest := f.validManifest()
+	manifest.Version = 3
+	manifest.Env = []EnvEntry{
+		{Name: "FOO", SecretRef: "foo.key", Required: true},
+		{Name: "BAR", SecretRef: "bar.key"},
+	}
+
+	result, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	if result == nil {
+		t.Fatalf("nil result")
+	}
+
+	// The env file existed during the docker run call and had the
+	// expected content + perms.
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if !capture.existed {
+		t.Fatalf("docker run was called without --env-file (capture: %+v)", capture)
+	}
+	if capture.perms != 0o600 {
+		t.Errorf("env file perms = %#o, want 0o600", capture.perms)
+	}
+	wantContent := "FOO=foo-secret-value\nBAR=bar-secret-value\n"
+	if string(capture.content) != wantContent {
+		t.Errorf("env file content = %q, want %q", capture.content, wantContent)
+	}
+
+	// The env file MUST be deleted after deploy returns.
+	if _, err := os.Stat(capture.path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("env file %s still exists after deploy: %v", capture.path, err)
+	}
+}
+
+func TestDeploy_EnvFileNotDeletedWhenDeployFailsBeforeDocker(t *testing.T) {
+	// When a required secret is missing, the deploy fails BEFORE
+	// docker run; MaterializeEnvFile must not create the file at
+	// all, so there is nothing to delete. The worktree must not
+	// contain any leftover env file.
+	f := newDeployFixture(t)
+	secretDir := t.TempDir()
+	f.cfg.SecretDir = secretDir
+	// foo.key present, bar.key missing.
+	writeSecret(t, secretDir, "foo.key", []byte("foo\n"), 0o600)
+
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	dockerRunCalled := false
+	f.docker.onRun(func(args []string) (string, error) {
+		dockerRunCalled = true
+		return containerName, nil
+	})
+
+	manifest := f.validManifest()
+	manifest.Version = 3
+	manifest.Env = []EnvEntry{
+		{Name: "FOO", SecretRef: "foo.key", Required: true},
+		{Name: "BAR", SecretRef: "bar.key", Required: true},
+	}
+
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected error for missing required secret")
+	}
+	if !errors.Is(err, ErrSecretMissing) {
+		t.Errorf("expected ErrSecretMissing in chain, got %v", err)
+	}
+	if dockerRunCalled {
+		t.Errorf("docker run was called even though required secret was missing")
+	}
+
+	// No env files anywhere in the worktree.
+	worktreeRoot := filepath.Join(f.cfg.Source.RepositoryRoot, f.expectedApp+"-checkouts")
+	_ = worktreeRoot // locate env files explicitly if any
+	for _, call := range f.docker.calls {
+		if len(call) >= 1 && call[0] == "build" {
+			for _, a := range call {
+				if strings.HasSuffix(a, "-env-") || strings.Contains(a, ".agentctld-env-") {
+					t.Errorf("unexpected env-file path in docker call: %s", a)
+				}
+			}
+		}
+	}
+}
+
+func TestDeploy_EnvFileMissingSecretFailsBeforeDocker(t *testing.T) {
+	// Required missing secret -> ErrSecretMissing in error chain,
+	// docker run never called.
+	f := newDeployFixture(t)
+	secretDir := t.TempDir()
+	f.cfg.SecretDir = secretDir
+	// No secrets at all.
+
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	dockerRunCalled := false
+	f.docker.onRun(func(args []string) (string, error) {
+		dockerRunCalled = true
+		return containerName, nil
+	})
+
+	manifest := f.validManifest()
+	manifest.Version = 3
+	manifest.Env = []EnvEntry{
+		{Name: "FOO", SecretRef: "foo.key", Required: true},
+	}
+
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if !errors.Is(err, ErrSecretMissing) {
+		t.Errorf("expected ErrSecretMissing, got %v", err)
+	}
+	if dockerRunCalled {
+		t.Errorf("docker run called even though required secret was missing")
+	}
+}
+
+func TestDeploy_EnvFileDeletedWhenBuildFails(t *testing.T) {
+	// If docker build fails (after the env file has been
+	// materialized), the file must still be cleaned up. The
+	// spec says "deleted immediately after container creation",
+	// but "before any side effect" applies to the missing-secret
+	// path; the build-fails path is a different failure mode and
+	// the file is consumed by the docker run that never
+	// happened, so the file must be removed by the same deferred
+	// cleanup.
+	f := newDeployFixture(t)
+	secretDir := t.TempDir()
+	f.cfg.SecretDir = secretDir
+	writeSecret(t, secretDir, "foo.key", []byte("foo\n"), 0o600)
+
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) {
+		return "build failed", errors.New("build error")
+	})
+	f.docker.onRun(func(args []string) (string, error) {
+		return containerName, nil
+	})
+
+	manifest := f.validManifest()
+	manifest.Version = 3
+	manifest.Env = []EnvEntry{{Name: "FOO", SecretRef: "foo.key", Required: true}}
+
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected build error")
+	}
+	if !errors.Is(err, ErrImageBuildFailed) {
+		t.Errorf("expected ErrImageBuildFailed in chain, got %v", err)
+	}
+
+	// No leftover env files in the worktree. The build context
+	// path is the last argument to docker build.
+	var worktree string
+	for _, call := range f.docker.calls {
+		if len(call) >= 3 && call[0] == "docker" && call[1] == "build" {
+			worktree = call[len(call)-1]
+			break
+		}
+	}
+	if worktree == "" {
+		t.Fatalf("did not record docker build call")
+	}
+	entries, err := os.ReadDir(worktree)
+	if err != nil {
+		t.Fatalf("readdir worktree: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".agentctld-env-") {
+			t.Errorf("leftover env file in worktree: %s", e.Name())
+		}
+	}
+}
+
+func TestDeploy_NoEnvNoEnvFile(t *testing.T) {
+	// Manifest without env entries: docker run must NOT include
+	// --env-file. The orchestrator must not materialize a file.
+	f := newDeployFixture(t)
+	f.cfg.SecretDir = t.TempDir() // set but unused
+
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.dockerAllSuccess(containerName)
+
+	manifest := f.validManifest()
+	manifest.Version = 3
+
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	for _, call := range f.docker.calls {
+		if len(call) >= 2 && call[0] == "docker" && call[1] == "run" {
+			for _, a := range call {
+				if a == "--env-file" {
+					t.Errorf("docker run includes --env-file when manifest has no env entries: %v", call)
+				}
+			}
+		}
+	}
+}
+
+func TestDeploy_SecretDirRequiredWhenEnvPresent(t *testing.T) {
+	// Manifest with env entries + empty SecretDir -> fails before
+	// any side effect.
+	f := newDeployFixture(t)
+	f.cfg.SecretDir = "" // intentionally unset
+
+	containerName := deriveContainerName(f.expectedApp, f.commit)
+	f.docker.onInspect(dockerInspectAbsent(containerName))
+	f.docker.onBuild(func(args []string) (string, error) { return "", nil })
+	dockerRunCalled := false
+	f.docker.onRun(func(args []string) (string, error) {
+		dockerRunCalled = true
+		return containerName, nil
+	})
+
+	manifest := f.validManifest()
+	manifest.Version = 3
+	manifest.Env = []EnvEntry{{Name: "FOO", SecretRef: "foo.key", Required: true}}
+
+	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
+		docker: f.docker,
+		caddy:  f.caddy,
+	})
+	if err == nil {
+		t.Fatalf("expected error when SecretDir is unset with env entries")
+	}
+	if !errors.Is(err, ErrInvalidDeployInput) {
+		t.Errorf("expected ErrInvalidDeployInput in chain, got %v", err)
+	}
+	if dockerRunCalled {
+		t.Errorf("docker run called even though SecretDir was unset")
 	}
 }

@@ -63,7 +63,17 @@ type Deployment struct {
 	Upstream      string    `json:"upstream"`
 	DeployedAt    time.Time `json:"deployed_at"`
 	MountData     bool      `json:"mount_data"`
-	DataReadOnly  bool      `json:"data_read_only,omitempty"`
+	// MountReadOnly, MountHostSource, MountContainerPath are
+	// meaningful only when MountData is true. They preserve the
+	// effective data-mount configuration across rollback so the
+	// previous deployment can re-apply the same mount. HostSource
+	// is the resolved absolute path (after Clean) or "" if the
+	// mount was the legacy app-owned path. ContainerPath is the
+	// resolved absolute in-container target (always "/data" for
+	// legacy mounts; explicit for host-source mounts).
+	MountReadOnly      bool   `json:"mount_read_only,omitempty"`
+	MountHostSource    string `json:"mount_host_source,omitempty"`
+	MountContainerPath string `json:"mount_container_path,omitempty"`
 }
 
 // DeploymentState is the persisted record for a single app. Exactly

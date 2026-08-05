@@ -32,6 +32,15 @@ type InspectRequest struct {
 // and Previous summarize the existing deployment state when the
 // daemon has a state file for App; they are nil when App is not
 // yet managed.
+//
+// EnvStatuses reports whether each declared env entry is
+// configured (i.e. a file matching its secret_ref is present and
+// passes the loader's per-file checks). Only the configured
+// flag is exposed; the actual secret value never leaves the
+// loader. Required env entries that are missing cause the
+// inspect response to set Valid=false and append an entry to
+// Errors, so callers can fail-closed before triggering a
+// deploy.
 type InspectResponse struct {
 	App             string             `json:"app"`
 	Commit          string             `json:"commit"`
@@ -40,7 +49,22 @@ type InspectResponse struct {
 	SourceReachable bool               `json:"source_reachable"`
 	Current         *DeploymentSummary `json:"current,omitempty"`
 	Previous        *DeploymentSummary `json:"previous,omitempty"`
+	EnvStatuses     []EnvStatus        `json:"env_statuses,omitempty"`
 	Errors          []string           `json:"errors,omitempty"`
+}
+
+// EnvStatus is the inspect-side projection of one env entry.
+// It reports only whether the secret is configured; the value
+// is never read, persisted, or surfaced. Required reflects the
+// manifest's required flag verbatim so callers can distinguish
+// "missing required secret (deploy will fail)" from "missing
+// optional secret (deploy will succeed and the env var will be
+// unset)".
+type EnvStatus struct {
+	Name       string `json:"name"`
+	SecretRef  string `json:"secret_ref"`
+	Required   bool   `json:"required"`
+	Configured bool   `json:"configured"`
 }
 
 // DeployRequest triggers a deployment of an approved commit. The
@@ -112,7 +136,7 @@ type DeploymentSummary struct {
 	Upstream      string    `json:"upstream"`
 	DeployedAt    time.Time `json:"deployed_at"`
 	MountData     bool      `json:"mount_data"`
-	DataReadOnly  bool      `json:"data_read_only,omitempty"`
+	MountReadOnly bool      `json:"mount_read_only,omitempty"`
 }
 
 // StateResponse returns the current and previous deployment for a
@@ -175,6 +199,6 @@ func summaryFromDeployment(d *deploy.Deployment) *DeploymentSummary {
 		Upstream:      d.Upstream,
 		DeployedAt:    d.DeployedAt,
 		MountData:     d.MountData,
-		DataReadOnly:  d.DataReadOnly,
+		MountReadOnly: d.MountReadOnly,
 	}
 }

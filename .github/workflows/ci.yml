@@ -29,7 +29,16 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test -race ./...
+        env:
+        # Go's GOTMPDIR uses the directory verbatim and does
+        # NOT create it — the directory must exist before
+        # `go test` runs. The local sandbox also mounts /tmp
+        # as a noexec tmpfs, so GOTMPDIR redirects Go's
+        # build/test temp dir to a writable, exec-capable path.
+        # Matches the local validation command in the PR
+        # description.
+          GOTMPDIR: /tmp/agentctl-test
+        run: mkdir -p "$GOTMPDIR" && go test -race ./...
 
       - name: Install Gitleaks
         env:

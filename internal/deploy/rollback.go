@@ -258,7 +258,13 @@ func ensurePreviousRunningAndHealthy(ctx context.Context, cfg RuntimeConfig, dat
 	case containerStatusAbsent:
 		var appData *AppData
 		if dep.MountData {
-			ad, err := EnsureAppDataDir(data, dep.App, dep.DataReadOnly)
+			md := &ManifestData{
+				Mount:         true,
+				ReadOnly:      dep.MountReadOnly,
+				HostSource:    dep.MountHostSource,
+				ContainerPath: dep.MountContainerPath,
+			}
+			ad, err := EnsureAppDataDir(data, dep.App, md)
 			if err != nil {
 				return nil, previousContainerUntouched, fmt.Errorf("ensure app data dir: %w", err)
 			}
@@ -356,7 +362,7 @@ func restorePreviousContainer(ctx context.Context, runner commandRunner, contain
 // When appData is non-nil the call adds the per-app data bind
 // mount; otherwise the container starts without one.
 func runContainerFromImage(ctx context.Context, runner commandRunner, dep Deployment, appData *AppData) error {
-	args := buildDockerRunArgs(dep.ContainerName, dep.Image, dep.HostPort, dep.ContainerPort, appData)
+	args := buildDockerRunArgs(dep.ContainerName, dep.Image, dep.HostPort, dep.ContainerPort, appData, "")
 	out, err := runner.Run(ctx, "docker", args...)
 	if err != nil {
 		return fmt.Errorf("%w: %s: %v", ErrContainerStartFailed, truncateForError(out), err)

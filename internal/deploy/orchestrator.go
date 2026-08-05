@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -24,6 +25,18 @@ type DeployConfig struct {
 	Caddy   CaddyConfig
 	State   StateConfig
 	Data    DataConfig
+	// SecretDir is the trusted host directory that holds per-app
+	// secret files (named <secret_ref>). Required when any
+	// deployment manifest declares env entries; optional
+	// otherwise. See internal/deploy/secrets.go.
+	SecretDir string
+	// RuntimeDir is the trusted daemon-owned directory in which
+	// the per-deploy env file is materialized before being handed
+	// to docker --env-file. Required whenever a manifest declares
+	// env entries; the daemon's loadConfig pre-creates this
+	// directory at startup with mode 0700. See
+	// internal/deploy/secrets.go (MaterializeEnvFile).
+	RuntimeDir string
 }
 
 // DeployResult is the outcome of a successful deployment.
@@ -254,11 +267,25 @@ func validateDeployConfig(cfg DeployConfig, manifest Manifest) error {
 			message:     fmt.Sprintf("manifest app %q does not match app-name format", manifest.App),
 		}
 	}
-	if manifest.Version != 1 && manifest.Version != 2 {
+	if manifest.Version != 1 && manifest.Version != 2 && manifest.Version != 3 {
 		return &deployError{
 			primary:     ErrDeploymentFailed,
 			secondaries: []error{ErrInvalidDeployInput},
-			message:     fmt.Sprintf("manifest version %d is not supported (only versions 1 and 2)", manifest.Version),
+			message:     fmt.Sprintf("manifest version %d is not supported (only versions 1, 2 and 3)", manifest.Version),
+		}
+	}
+	if len(manifest.Env) > 0 && cfg.SecretDir == "" {
+		return &deployError{
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     "SecretDir is required when the manifest declares env entries",
+		}
+	}
+	if len(manifest.Env) > 0 && cfg.RuntimeDir == "" {
+		return &deployError{
+			primary:     ErrDeploymentFailed,
+			secondaries: []error{ErrInvalidDeployInput},
+			message:     "RuntimeDir is required when the manifest declares env entries",
 		}
 	}
 	if manifest.ContainerPort < 1024 || manifest.ContainerPort > 65535 {
@@ -319,10 +346,62 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 		}
 	}
 
-	// 4. Build and start the candidate container (includes health
+	// res is captured by the env-file cleanup defer (below)
+	// so a successful deploy that hits a cleanup error can
+	// attach the cleanup failure as a warning on the success
+	// result without losing the secret-cleanup signal. It is
+	// assigned to the final result at the success point.
+	var res *DeployResult
+
+	// 4. Materialize the env file in the daemon-owned runtime
+	//    directory so the docker run can pass it as --env-file.
+	//    The runtime directory is preferred over the source
+	//    worktree because the worktree is short-lived (cleaned on
+	//    rollback) and may live on a shared mount, whereas
+	//    RuntimeDir is owned by the daemon and has a known,
+	//    narrow lifecycle. Materialization happens AFTER source
+	//    checkout but BEFORE docker run, so a missing required
+	//    secret fails the deploy before any docker side effect.
+	//
+	//    The env file is removed by a deferred cleanup once the
+	//    candidate container has been created (success or failure),
+	//    per the v3 secret contract: secret values live on disk
+	//    only for the duration of the docker run that consumes
+	//    them.
+	var envFile string
+	if len(manifest.Env) > 0 {
+		envFile, err = MaterializeEnvFile(cfg.RuntimeDir, manifest.Env, cfg.SecretDir)
+		if err != nil {
+			return nil, &deployError{
+				primary:     ErrDeploymentFailed,
+				secondaries: []error{err},
+				message:     fmt.Sprintf("materialize env file: %v", err),
+			}
+		}
+		defer func() {
+			if envFile == "" {
+				return
+			}
+			if rerr := os.Remove(envFile); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+				// Best-effort cleanup; surface as a warning
+				// on the success path so the caller knows the
+				// file may still be on disk. The file is mode
+				// 0600 in a worktree only the agentctld user can
+				// read, so an orphaned file is a minor concern
+				// rather than a secret leak; we still report
+				// it so the operator can investigate.
+				if res != nil {
+					res.Warnings = append(res.Warnings, fmt.Errorf("env file cleanup: %w", rerr))
+				}
+			}
+		}()
+	}
+
+	// 5. Build and start the candidate container (includes health
 	//    check). On health-check failure the candidate container
 	//    is removed (best-effort) before the error is returned.
-	candidate, err := startCandidate(ctx, cfg.Runtime, cfg.Data, manifest, *source, deps.docker)
+	//
+	candidate, err := startCandidate(ctx, cfg.Runtime, cfg.Data, manifest, *source, deps.docker, envFile)
 	if err != nil {
 		return nil, &deployError{
 			primary:     ErrDeploymentFailed,
@@ -409,22 +488,34 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 	//    recovery context so a cancelled caller cannot prevent
 	//    the recovery.
 	mountData := manifest.Data != nil && manifest.Data.Mount
+	// mountHostSource / mountContainerPath are the values
+	// actually used by this deployment. Empty strings are
+	// honest: rollback resolves ContainerPath via the same
+	// default the manifest would have used. We pre-compute
+	// them because Go struct literals need typed expressions;
+	// "mountData && ..." would yield a bool where a string is
+	// required.
+	mountHostSource := ""
+	mountContainerPath := ""
+	if mountData && manifest.Data != nil {
+		mountHostSource = manifest.Data.HostSource
+		mountContainerPath = manifest.Data.ContainerPath
+	}
+
 	dep := Deployment{
-		App:           candidate.App,
-		Commit:        candidate.Commit,
-		Image:         candidate.Image,
-		ContainerName: candidate.ContainerName,
-		HostPort:      candidate.HostPort,
-		ContainerPort: candidate.ContainerPort,
-		Hostname:      candidate.App + "." + cfg.Caddy.BaseDomain,
-		Upstream:      fmt.Sprintf("127.0.0.1:%d", candidate.HostPort),
-		DeployedAt:    time.Now().UTC(),
-		MountData:     mountData,
-		// DataReadOnly is only meaningful when the deployment mounts
-		// the data directory. A manifest that sets read_only=true but
-		// mount=false is a no-op; normalizing to false here keeps the
-		// persisted state consistent with the actual runtime behaviour.
-		DataReadOnly: mountData && manifest.Data.ReadOnly,
+		App:                candidate.App,
+		Commit:             candidate.Commit,
+		Image:              candidate.Image,
+		ContainerName:      candidate.ContainerName,
+		HostPort:           candidate.HostPort,
+		ContainerPort:      candidate.ContainerPort,
+		Hostname:           candidate.App + "." + cfg.Caddy.BaseDomain,
+		Upstream:           fmt.Sprintf("127.0.0.1:%d", candidate.HostPort),
+		DeployedAt:         time.Now().UTC(),
+		MountData:          mountData,
+		MountReadOnly:      mountData && manifest.Data != nil && manifest.Data.ReadOnly,
+		MountHostSource:    mountHostSource,
+		MountContainerPath: mountContainerPath,
 	}
 	saveErr := SaveDeployment(cfg.State, dep)
 	if saveErr != nil {
@@ -495,6 +586,6 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 			result.Warnings = append(result.Warnings, fmt.Errorf("post-deploy cleanup of old container: %w", removeErr))
 		}
 	}
-
+	res = result
 	return result, nil
 }
