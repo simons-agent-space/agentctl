@@ -129,7 +129,6 @@ func setupValidCheckout(t *testing.T) (string, RuntimeConfig) {
 // runtimeSource returns a SourceResult matching the given checkout path.
 func runtimeSource(checkout string) SourceResult {
 	return SourceResult{
-		Organisation: "myorg",
 		Repository:   "myapp",
 		Commit:       strings.Repeat("a", 40),
 		CheckoutPath: checkout,

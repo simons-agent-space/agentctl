@@ -172,12 +172,15 @@ func validateRuntimeInputs(cfg RuntimeConfig, manifest Manifest, source SourceRe
 		return fmt.Errorf("%w: RepositoryRoot is required", ErrInvalidRuntimeConfig)
 	}
 
-	if err := Validate(&manifest, source.Repository); err != nil {
+	if err := Validate(&manifest); err != nil {
 		return fmt.Errorf("%w: manifest: %v", ErrInvalidInputs, err)
 	}
-	if manifest.App != source.Repository {
-		return fmt.Errorf("%w: manifest.App %q != source.Repository %q", ErrInvalidInputs, manifest.App, source.Repository)
-	}
+	// App and Repository are independent fields: app drives the
+	// API path / hostname / state key, repository drives the
+	// source mirror. The legacy v1/v2 invariant (app == repo)
+	// is gone; the runtime no longer reconciles them.
+	_ = manifest.App
+	_ = source.Repository
 	if !shaRe.MatchString(source.Commit) {
 		return fmt.Errorf("%w: source.Commit %q is not a valid SHA", ErrInvalidInputs, source.Commit)
 	}

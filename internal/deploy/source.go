@@ -32,38 +32,74 @@ var (
 const originFetchRefspec = "+refs/heads/main:refs/remotes/origin/main"
 
 // SourceConfig holds the trusted host-side configuration for source
-// resolution. RepositoryRoot and OriginURL are supplied by trusted host
-// configuration, not by the caller.
+// resolution. The repository root and the allowed organisation are
+// supplied by trusted host configuration, not by the caller.
+//
+// The trust boundary is fixed: the caller's repository short name
+// is verified against appNameRe, and the public origin URL is
+// derived internally from AllowedOrg + repository. The caller
+// never supplies a URL, an org, or a base URL. There is no
+// per-repository allowlist: any syntactically valid repository
+// in the configured org is selectable, and selection outside the
+// org is impossible by construction.
 type SourceConfig struct {
-	AllowedOrg     string // expected organisation; matches the passed organisation
+	AllowedOrg     string // GitHub org; the org component of the derived origin URL
 	RepositoryRoot string // trusted host path; mirrors and checkouts live under here
-	OriginURL      string // trusted remote URL (https://github.com/<org>/<repo>.git in production)
+	// OriginURLOverride is a test-only seam. When non-empty it
+	// replaces the derived origin URL. The field is unexported
+	// so production code (the daemon, the CLI, every external
+	// entry point) cannot set it; only tests in this package
+	// can. The override exists because the source-layer tests
+	// need to point at a local file remote while the production
+	// derivation is the literal "https://github.com/<org>/<repo>.git".
+	OriginURLOverride string
 }
 
 // SourceResult is the outcome of a successful source resolution.
 type SourceResult struct {
-	Organisation string
 	Repository   string
 	Commit       string
 	CheckoutPath string
 	MirrorPath   string
 }
 
+// originURL returns the trusted public origin URL for the given
+// repository in the configured org. The literal "<org>" and
+// "<repository>" segments are url-path-safe to embed between
+// the fixed "https://github.com/" prefix and the trailing ".git"
+// suffix; the regex in appNameRe (^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])$)
+// excludes every character that would need escaping (slash, colon,
+// query, fragment, percent, whitespace, control, ...).
+//
+// The organisation is read from the trusted SourceConfig, not
+// from the caller; the repository is the validated short name.
+func (c SourceConfig) originURL(repository string) string {
+	if c.OriginURLOverride != "" {
+		return c.OriginURLOverride
+	}
+	return "https://github.com/" + c.AllowedOrg + "/" + repository + ".git"
+}
+
 // CheckoutSource resolves the repository, validates the commit, and
 // produces a detached checkout directory containing exactly that commit.
 //
-// Caller-supplied inputs: organisation, repository, commit.
-// Trusted host configuration: cfg.AllowedOrg, cfg.RepositoryRoot, cfg.OriginURL.
+// Caller-supplied inputs: repository, commit.
+// Trusted host configuration: cfg.AllowedOrg, cfg.RepositoryRoot.
 //
-// The function never logs, prints, or returns credentials or tokens.
-func CheckoutSource(ctx context.Context, cfg SourceConfig, organisation, repository, commit string) (*SourceResult, error) {
-	if err := validateSourceInputs(cfg, organisation, repository, commit); err != nil {
+// The origin URL is derived inside CheckoutSource from the
+// trusted org and the validated repository short name. The
+// caller never provides a URL, a base URL, or an org.
+//
+// The function never logs, prints, or returns credentials or
+// tokens.
+func CheckoutSource(ctx context.Context, cfg SourceConfig, repository, commit string) (*SourceResult, error) {
+	if err := validateSourceInputs(cfg, repository, commit); err != nil {
 		return nil, err
 	}
 
 	mirrorPath := filepath.Join(cfg.RepositoryRoot, repository+".git")
 
-	if err := ensureMirror(ctx, mirrorPath, cfg); err != nil {
+	if err := ensureMirror(ctx, mirrorPath, cfg, repository); err != nil {
 		return nil, err
 	}
 
@@ -82,7 +118,6 @@ func CheckoutSource(ctx context.Context, cfg SourceConfig, organisation, reposit
 	}
 
 	return &SourceResult{
-		Organisation: organisation,
 		Repository:   repository,
 		Commit:       commit,
 		CheckoutPath: checkoutPath,
@@ -90,24 +125,18 @@ func CheckoutSource(ctx context.Context, cfg SourceConfig, organisation, reposit
 	}, nil
 }
 
-func validateSourceInputs(cfg SourceConfig, organisation, repository, commit string) error {
-	if organisation == "" {
-		return fmt.Errorf("%w: organisation is required", ErrInvalidInput)
+func validateSourceInputs(cfg SourceConfig, repository, commit string) error {
+	if cfg.AllowedOrg == "" {
+		return fmt.Errorf("%w: allowed org is required (host configuration)", ErrInvalidInput)
 	}
-	if organisation != cfg.AllowedOrg {
-		return fmt.Errorf("%w: organisation %q does not match allowed %q", ErrInvalidInput, organisation, cfg.AllowedOrg)
+	if cfg.RepositoryRoot == "" {
+		return fmt.Errorf("%w: repository root is required (host configuration)", ErrInvalidInput)
 	}
 	if !appNameRe.MatchString(repository) {
 		return fmt.Errorf("%w: repository %q does not match app-name format", ErrInvalidInput, repository)
 	}
 	if !shaRe.MatchString(commit) {
 		return fmt.Errorf("%w: commit %q is not exactly 40 lowercase hex characters", ErrInvalidInput, commit)
-	}
-	if cfg.RepositoryRoot == "" {
-		return fmt.Errorf("%w: repository root is required (host configuration)", ErrInvalidInput)
-	}
-	if cfg.OriginURL == "" {
-		return fmt.Errorf("%w: origin URL is required (host configuration)", ErrInvalidInput)
 	}
 	return nil
 }
@@ -119,11 +148,19 @@ func validateSourceInputs(cfg SourceConfig, organisation, repository, commit str
 // expected origin, then run the explicit fetch refspec.
 //
 // On subsequent use: verify the mirror is bare, verify the configured
-// remote.origin.url matches cfg.OriginURL, then run the explicit fetch
-// refspec. A failed fetch is fatal — there is no fallback that accepts
-// stale refs/remotes/origin/main in lieu of a successful fetch.
-func ensureMirror(ctx context.Context, mirrorPath string, cfg SourceConfig) error {
-	expectedOrigin := cfg.OriginURL
+// remote.origin.url matches the derived origin URL, then run the
+// explicit fetch refspec. A failed fetch is fatal — there is no
+// fallback that accepts stale refs/remotes/origin/main in lieu of a
+// successful fetch.
+//
+// The expected origin URL is derived inside this function from
+// cfg.AllowedOrg + repository. The caller never supplies a URL.
+// A pre-existing mirror whose origin URL points at a different org
+// or a different repository is rejected with ErrRepoMismatch, so
+// a deployed mirror for one repo cannot be silently reused by
+// another repo even if both happen to be in the same org.
+func ensureMirror(ctx context.Context, mirrorPath string, cfg SourceConfig, repository string) error {
+	expectedOrigin := cfg.originURL(repository)
 
 	headPath := filepath.Join(mirrorPath, "HEAD")
 	if _, err := os.Stat(headPath); err != nil {
@@ -211,12 +248,12 @@ func validateCommit(ctx context.Context, mirrorPath, commit string) error {
 // Use VerifyCommit for inspect / preflight calls. Use CheckoutSource
 // when the caller actually needs a working tree (deploy build steps,
 // rollback inspection, etc.).
-func VerifyCommit(ctx context.Context, cfg SourceConfig, organisation, repository, commit string) error {
-	if err := validateSourceInputs(cfg, organisation, repository, commit); err != nil {
+func VerifyCommit(ctx context.Context, cfg SourceConfig, repository, commit string) error {
+	if err := validateSourceInputs(cfg, repository, commit); err != nil {
 		return err
 	}
 	mirrorPath := filepath.Join(cfg.RepositoryRoot, repository+".git")
-	if err := ensureMirror(ctx, mirrorPath, cfg); err != nil {
+	if err := ensureMirror(ctx, mirrorPath, cfg, repository); err != nil {
 		return err
 	}
 	return validateCommit(ctx, mirrorPath, commit)

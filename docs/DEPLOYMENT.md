@@ -43,8 +43,11 @@ fields:
 - `app` must match `^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])$`.
 - `container_port` must be in `[1024, 65535]`.
 - `health_path` must start with `/` and must not contain `?` or `#`.
-- The `expectedRepo` argument passed to `Validate` must match the same
-  regex and must equal `m.App`.
+- For version 3 manifests, `repository` is required and must
+  match the same regex as `app`. `app` and `repository` are
+  independent fields: `app` drives the API path / hostname /
+  state key, `repository` drives the source mirror. They are
+  allowed to differ.
 
 ## Scope of version 1
 

@@ -12,8 +12,14 @@ import (
 
 // setupRemote creates a local non-bare Git repository to act as the
 // trusted remote. It contains a `main` branch with one commit and a
-// `feature` branch with one additional commit. Returns the remote path
-// (suitable for cfg.OriginURL), the main SHA, and the feature SHA.
+// `feature` branch with one additional commit. Returns the remote
+// path, the main SHA, and the feature SHA. The remote path is used
+// to seed the mirror's origin URL by overriding the URL derivation
+// for the test (the production test config uses a per-test
+// RepositoryRoot and AllowedOrg; the origin URL is derived from
+// "https://github.com/<org>/<repo>.git", but the tests that need
+// to point at a local file do so by reaching into the in-memory
+// config and adjusting the derivation).
 func setupRemote(t *testing.T) (remotePath, mainSHA, featureSHA string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -47,13 +53,23 @@ func setupRemote(t *testing.T) (remotePath, mainSHA, featureSHA string) {
 	return remotePath, mainSHA, featureSHA
 }
 
-func newConfig(t *testing.T, originURL string) SourceConfig {
+// newConfig returns a SourceConfig that derives the origin URL from
+// the configured org + repository. Tests that need to point the
+// mirror at a local file remote pass the remote path as the
+// optional originURLOverride; the override is the test-only seam
+// in deploy.SourceConfig that lets suite-level tests point the
+// mirror at a local file remote while the production derivation
+// is the real "https://github.com/<org>/<repo>.git".
+func newConfig(t *testing.T, originURLOverride ...string) SourceConfig {
 	t.Helper()
-	return SourceConfig{
+	cfg := SourceConfig{
 		AllowedOrg:     "myorg",
 		RepositoryRoot: t.TempDir(),
-		OriginURL:      originURL,
 	}
+	if len(originURLOverride) > 0 {
+		cfg.OriginURLOverride = originURLOverride[0]
+	}
+	return cfg
 }
 
 // mirrorPath returns the trusted mirror path for the given config and repo.
@@ -61,88 +77,179 @@ func mirrorPath(cfg SourceConfig, repo string) string {
 	return filepath.Join(cfg.RepositoryRoot, repo+".git")
 }
 
+// overrideOriginURL writes config.OriginURL for the duration of a
+// test by directly rewriting the mirror's remote.origin.url after
+// the bare clone is created. This is the test-side channel for
+// pointing the mirror at a local file remote: production code
+// derives the URL from the configured org + repository, so the
+// AllowedOrg in the test config ("myorg") is treated as a stand-in
+// org and the derivation is short-circuited by the override.
+//
+// The override is a test-only mechanism. The point of the
+// production design is that originURL is never caller-supplied; in
+// the tests we fake the derived URL by replacing it on disk after
+// the bare clone.
+func overrideOriginURL(t *testing.T, mirrorPath, url string) {
+	t.Helper()
+	cmd := exec.Command("git", "-C", mirrorPath, "remote", "set-url", "origin", url)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("set-url: %v: %s", err, out)
+	}
+}
+
+// dummyRepoURL returns the file:// URL the local setupRemote
+// fixture produced. Tests that need the mirror to point at the
+// fixture use this constant together with overrideOriginURL.
+const dummyRepoURL = "file://" // combined with the actual remotePath in the test
+
 func TestCheckoutSource_ValidSHA(t *testing.T) {
 	remote, mainSHA, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
 
-	result, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
+	// Point the derived mirror at the local fixture. The
+	// production design derives the URL from the org + repo;
+	// here we replace the bare clone's origin URL after the
+	// clone to use the local file URL.
+	//
+	// The "right" way to test this without overrideOriginURL
+	// would be to run a real local HTTPS server fronting the
+	// remote; for the layer-under-test, the override is
+	// sufficient because production code only ever writes to
+	// remote.origin.url once (during clone) and reads it
+	// thereafter for the mirror validation.
+	//
+	// We achieve the override by configuring the source layer
+	// temporarily: we let CheckoutSource clone from the
+	// derived URL into a bogus mirror, then repoint the mirror
+	// to the real local remote, then call CheckoutSource again.
+	// This is awkward; the cleaner approach is to expose a
+	// test seam in source.go for the URL derivation. Since
+	// adding that seam only for tests is a smell, we instead
+	// hand-craft the mirror by cloning with the right URL
+	// here and re-using the existing ensureMirror path.
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
+	}
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed bare clone: %v: %s", err, out)
+	}
+
+	result, err := CheckoutSource(context.Background(), cfg, "myrepo", mainSHA)
 	if err != nil {
 		t.Fatalf("CheckoutSource: %v", err)
 	}
 	defer CleanupCheckout(context.Background(), cfg, *result)
 
-	if result.Organisation != "myorg" || result.Repository != "myrepo" || result.Commit != mainSHA {
+	if result.Repository != "myrepo" || result.Commit != mainSHA {
 		t.Errorf("unexpected result: %+v", result)
 	}
-	if result.MirrorPath != mirrorPath(cfg, "myrepo") {
-		t.Errorf("MirrorPath = %q, want %q", result.MirrorPath, mirrorPath(cfg, "myrepo"))
+	if result.MirrorPath != mirror {
+		t.Errorf("MirrorPath = %q, want %q", result.MirrorPath, mirror)
 	}
 }
 
 func TestCheckoutSource_ShortSHARejected(t *testing.T) {
-	remote, mainSHA, _ := setupRemote(t)
-	cfg := newConfig(t, remote)
-
-	shortSHA := mainSHA[:39]
-	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", shortSHA); !errors.Is(err, ErrInvalidInput) {
+	cfg := newConfig(t)
+	shortSHA := strings.Repeat("a", 39)
+	if _, err := CheckoutSource(context.Background(), cfg, "myrepo", shortSHA); !errors.Is(err, ErrInvalidInput) {
 		t.Errorf("expected ErrInvalidInput for short SHA, got %v", err)
 	}
 }
 
 func TestCheckoutSource_UppercaseSHARejected(t *testing.T) {
-	remote, mainSHA, _ := setupRemote(t)
-	cfg := newConfig(t, remote)
-
-	upperSHA := strings.ToUpper(mainSHA)
-	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", upperSHA); !errors.Is(err, ErrInvalidInput) {
+	cfg := newConfig(t)
+	upperSHA := strings.Repeat("A", 40)
+	if _, err := CheckoutSource(context.Background(), cfg, "myrepo", upperSHA); !errors.Is(err, ErrInvalidInput) {
 		t.Errorf("expected ErrInvalidInput for uppercase SHA, got %v", err)
 	}
 }
 
 func TestCheckoutSource_NonHexSHARejected(t *testing.T) {
-	remote, _, _ := setupRemote(t)
-	cfg := newConfig(t, remote)
-
+	cfg := newConfig(t)
 	nonHex := strings.Repeat("z", 40)
-	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", nonHex); !errors.Is(err, ErrInvalidInput) {
+	if _, err := CheckoutSource(context.Background(), cfg, "myrepo", nonHex); !errors.Is(err, ErrInvalidInput) {
 		t.Errorf("expected ErrInvalidInput for non-hex SHA, got %v", err)
 	}
 }
 
 func TestCheckoutSource_InvalidRepoNameRejected(t *testing.T) {
-	remote, mainSHA, _ := setupRemote(t)
-	cfg := newConfig(t, remote)
-
-	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "MyRepo", mainSHA); !errors.Is(err, ErrInvalidInput) {
-		t.Errorf("expected ErrInvalidInput for invalid repo name, got %v", err)
+	cfg := newConfig(t)
+	for _, name := range []string{"MyRepo", "myrepo-", "1myrepo", "with/slash", "with:colon", "with?query", "with#frag"} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := CheckoutSource(context.Background(), cfg, name, strings.Repeat("a", 40)); !errors.Is(err, ErrInvalidInput) {
+				t.Errorf("expected ErrInvalidInput for repository %q, got %v", name, err)
+			}
+		})
 	}
 }
 
 func TestCheckoutSource_RepoOriginMismatchRejected(t *testing.T) {
 	remote1, mainSHA, _ := setupRemote(t)
 	remote2, _, _ := setupRemote(t)
+	// The source layer derives the origin URL from the override
+	// (which the test sets to remote1). The mirror is then
+	// re-pointed at remote2 so the derivation no longer matches
+	// the mirror. ensureMirror must reject the mismatch with
+	// ErrRepoMismatch.
 	cfg := newConfig(t, remote1)
 
-	// First checkout creates the mirror pointing at remote1.
-	first, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
-	if err != nil {
-		t.Fatalf("first checkout: %v", err)
+	// Seed a mirror pointing at remote1.
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
 	}
-	defer CleanupCheckout(context.Background(), cfg, *first)
-
-	// Repoint the existing mirror's origin at a different remote.
-	cmd := exec.Command("git", "-C", first.MirrorPath, "remote", "set-url", "origin", remote2)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("set-url: %v: %s", err, out)
+	cloneCmd := exec.Command("git", "clone", "--bare", remote1, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
 	}
 
-	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA); !errors.Is(err, ErrRepoMismatch) {
+	// Repoint the mirror at remote2 — a different URL than the
+	// override. CheckoutSource must reject this with ErrRepoMismatch.
+	overrideOriginURL(t, mirror, remote2)
+
+	if _, err := CheckoutSource(context.Background(), cfg, "myrepo", mainSHA); !errors.Is(err, ErrRepoMismatch) {
 		t.Errorf("expected ErrRepoMismatch, got %v", err)
 	}
 }
 
+// TestCheckoutSource_ExistingMirrorWithCorrectOriginAccepted proves
+// that a pre-existing mirror whose remote.origin.url matches the
+// derived origin URL is accepted. The source layer must verify the
+// match (so a mirror created for one repo cannot be silently reused
+// by another repo) and then proceed with the fetch.
+func TestCheckoutSource_ExistingMirrorWithCorrectOriginAccepted(t *testing.T) {
+	remote, mainSHA, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
+
+	// Seed a mirror pointing at the remote that matches the
+	// derivation. The fixture's newConfig wires the override to
+	// the same remote, so the mirror's URL matches the derived
+	// URL exactly.
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
+	}
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
+
+	result, err := CheckoutSource(context.Background(), cfg, "myrepo", mainSHA)
+	if err != nil {
+		t.Fatalf("CheckoutSource: expected success for matching origin, got %v", err)
+	}
+	if result.Repository != "myrepo" || result.Commit != mainSHA {
+		t.Errorf("unexpected result: %+v", result)
+	}
+	if result.MirrorPath != mirror {
+		t.Errorf("MirrorPath = %q, want %q", result.MirrorPath, mirror)
+	}
+}
+
 func TestCheckoutSource_NonBareMirrorRejected(t *testing.T) {
-	cfg := newConfig(t, "file:///nonexistent")
+	cfg := newConfig(t)
 
 	// Pre-create a non-bare repository at the expected mirror path.
 	mirror := mirrorPath(cfg, "myrepo")
@@ -154,61 +261,97 @@ func TestCheckoutSource_NonBareMirrorRejected(t *testing.T) {
 		t.Fatalf("git init: %v: %s", err, out)
 	}
 
-	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", strings.Repeat("a", 40)); !errors.Is(err, ErrNotBare) {
+	if _, err := CheckoutSource(context.Background(), cfg, "myrepo", strings.Repeat("a", 40)); !errors.Is(err, ErrNotBare) {
 		t.Errorf("expected ErrNotBare, got %v", err)
 	}
 }
 
 func TestCheckoutSource_MissingCommitRejected(t *testing.T) {
-	remote, _, _ := setupRemote(t)
+	remote, mainSHA, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
 
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
+	}
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
+
 	bogusSHA := strings.Repeat("0", 40)
-	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", bogusSHA); !errors.Is(err, ErrCommitNotFound) {
+	if _, err := CheckoutSource(context.Background(), cfg, "myrepo", bogusSHA); !errors.Is(err, ErrCommitNotFound) {
 		t.Errorf("expected ErrCommitNotFound, got %v", err)
 	}
+	_ = mainSHA
 }
 
 func TestCheckoutSource_NonCommitObjectRejected(t *testing.T) {
-	remote, _, _ := setupRemote(t)
+	remote, mainSHA, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
 
-	// Run a first checkout so the bare mirror is created; the tree SHA
-	// is then resolvable in the mirror.
-	first, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mustCommit(t, remote))
-	if err != nil {
-		t.Fatalf("setup checkout: %v", err)
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
 	}
-	defer CleanupCheckout(context.Background(), cfg, *first)
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
 
-	cmd := exec.Command("git", "-C", first.MirrorPath, "rev-parse", "HEAD^{tree}")
+	cmd := exec.Command("git", "-C", mirror, "rev-parse", "HEAD^{tree}")
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("get tree: %v", err)
 	}
 	treeSHA := strings.TrimSpace(string(out))
 
-	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", treeSHA); !errors.Is(err, ErrNotCommitObject) {
+	if _, err := CheckoutSource(context.Background(), cfg, "myrepo", treeSHA); !errors.Is(err, ErrNotCommitObject) {
 		t.Errorf("expected ErrNotCommitObject, got %v", err)
 	}
+	_ = mainSHA
 }
 
 func TestCheckoutSource_CommitOnMainAccepted(t *testing.T) {
 	remote, mainSHA, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
 
-	result, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
-	if err != nil {
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
+	}
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
+
+	if _, err := CheckoutSource(context.Background(), cfg, "myrepo", mainSHA); err != nil {
 		t.Fatalf("CheckoutSource: %v", err)
 	}
-	defer CleanupCheckout(context.Background(), cfg, *result)
 }
 
 func TestCheckoutSource_CommitNotReachableFromMainRejected(t *testing.T) {
-	remote, _, featureSHA := setupRemote(t)
+	remote, _, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
 
-	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", featureSHA); !errors.Is(err, ErrUnreachableCommit) {
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
+	}
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
+
+	// Add a feature branch commit that is not reachable from main.
+	featCmd := exec.Command("git", "-C", mirror, "rev-parse", "refs/heads/feature")
+	fout, err := featCmd.Output()
+	if err != nil {
+		t.Fatalf("get feature SHA: %v", err)
+	}
+	featureSHA := strings.TrimSpace(string(fout))
+
+	if _, err := CheckoutSource(context.Background(), cfg, "myrepo", featureSHA); !errors.Is(err, ErrUnreachableCommit) {
 		t.Errorf("expected ErrUnreachableCommit, got %v", err)
 	}
 }
@@ -217,7 +360,16 @@ func TestCheckoutSource_DetachedCheckoutPointsAtCommit(t *testing.T) {
 	remote, mainSHA, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
 
-	result, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
+	}
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
+
+	result, err := CheckoutSource(context.Background(), cfg, "myrepo", mainSHA)
 	if err != nil {
 		t.Fatalf("CheckoutSource: %v", err)
 	}
@@ -233,14 +385,100 @@ func TestCheckoutSource_DetachedCheckoutPointsAtCommit(t *testing.T) {
 	}
 }
 
-func TestCheckoutSource_OriginURLRequired(t *testing.T) {
+func TestCheckoutSource_AllowedOrgRequired(t *testing.T) {
 	cfg := SourceConfig{
-		AllowedOrg:     "myorg",
+		// AllowedOrg intentionally omitted.
 		RepositoryRoot: t.TempDir(),
-		// OriginURL intentionally omitted.
 	}
-	if _, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", strings.Repeat("a", 40)); !errors.Is(err, ErrInvalidInput) {
-		t.Errorf("expected ErrInvalidInput for missing OriginURL, got %v", err)
+	if _, err := CheckoutSource(context.Background(), cfg, "myrepo", strings.Repeat("a", 40)); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for missing AllowedOrg, got %v", err)
+	}
+}
+
+func TestCheckoutSource_RepositoryRootRequired(t *testing.T) {
+	cfg := SourceConfig{
+		AllowedOrg: "myorg",
+		// RepositoryRoot intentionally omitted.
+	}
+	if _, err := CheckoutSource(context.Background(), cfg, "myrepo", strings.Repeat("a", 40)); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for missing RepositoryRoot, got %v", err)
+	}
+}
+
+func TestOriginURL_DerivedFromOrgAndRepository(t *testing.T) {
+	cfg := SourceConfig{AllowedOrg: "simons-agent-space", RepositoryRoot: t.TempDir()}
+	got := cfg.originURL("cron-dashboard")
+	want := "https://github.com/simons-agent-space/cron-dashboard.git"
+	if got != want {
+		t.Errorf("originURL = %q, want %q", got, want)
+	}
+}
+
+func TestSourceConfig_OriginURLUsesConfiguredOrgOnly(t *testing.T) {
+	// Two configs that differ only in AllowedOrg must produce
+	// different origin URLs for the same repository. This is
+	// the structural proof that the org component is trusted
+	// host configuration and cannot be selected by the caller.
+	a := SourceConfig{AllowedOrg: "alpha-org", RepositoryRoot: t.TempDir()}
+	b := SourceConfig{AllowedOrg: "beta-org", RepositoryRoot: t.TempDir()}
+	ua := a.originURL("same-repo")
+	ub := b.originURL("same-repo")
+	if ua == ub {
+		t.Errorf("originURL must differ between orgs: both = %q", ua)
+	}
+	if ua != "https://github.com/alpha-org/same-repo.git" {
+		t.Errorf("alpha originURL = %q", ua)
+	}
+	if ub != "https://github.com/beta-org/same-repo.git" {
+		t.Errorf("beta originURL = %q", ub)
+	}
+}
+
+func TestCheckoutSource_SeparateRepositoriesUseSeparateMirrors(t *testing.T) {
+	// Two distinct repositories in the same org must produce two
+	// distinct mirrors and two distinct checkout paths. This is
+	// the structural proof that the source layer does not
+	// collapse "app" and "repository" into a single key.
+	remote, mainSHA, _ := setupRemote(t)
+	cfg := newConfig(t, remote)
+
+	// Seed two bare mirrors pointing at the same remote but
+	// under different names. CheckoutSource must then accept
+	// both repos and keep their mirrors/checkouts separate.
+	for _, repo := range []string{"repo-a", "repo-b"} {
+		mirror := mirrorPath(cfg, repo)
+		if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+			t.Fatalf("mkdir mirror parent: %v", err)
+		}
+		cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+		if out, err := cloneCmd.CombinedOutput(); err != nil {
+			t.Fatalf("seed clone %s: %v: %s", repo, err, out)
+		}
+	}
+
+	resA, err := CheckoutSource(context.Background(), cfg, "repo-a", mainSHA)
+	if err != nil {
+		t.Fatalf("CheckoutSource repo-a: %v", err)
+	}
+	defer CleanupCheckout(context.Background(), cfg, *resA)
+
+	resB, err := CheckoutSource(context.Background(), cfg, "repo-b", mainSHA)
+	if err != nil {
+		t.Fatalf("CheckoutSource repo-b: %v", err)
+	}
+	defer CleanupCheckout(context.Background(), cfg, *resB)
+
+	if resA.MirrorPath == resB.MirrorPath {
+		t.Errorf("mirrors must be distinct: both = %q", resA.MirrorPath)
+	}
+	if resA.CheckoutPath == resB.CheckoutPath {
+		t.Errorf("checkouts must be distinct: both = %q", resA.CheckoutPath)
+	}
+	if resA.MirrorPath != mirrorPath(cfg, "repo-a") {
+		t.Errorf("resA.MirrorPath = %q, want %q", resA.MirrorPath, mirrorPath(cfg, "repo-a"))
+	}
+	if resB.MirrorPath != mirrorPath(cfg, "repo-b") {
+		t.Errorf("resB.MirrorPath = %q, want %q", resB.MirrorPath, mirrorPath(cfg, "repo-b"))
 	}
 }
 
@@ -248,7 +486,16 @@ func TestCleanupCheckout_AllowsReuseAfterCleanup(t *testing.T) {
 	remote, mainSHA, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
 
-	first, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
+	}
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
+
+	first, err := CheckoutSource(context.Background(), cfg, "myrepo", mainSHA)
 	if err != nil {
 		t.Fatalf("first checkout: %v", err)
 	}
@@ -259,7 +506,7 @@ func TestCleanupCheckout_AllowsReuseAfterCleanup(t *testing.T) {
 		t.Fatalf("checkout still exists after cleanup")
 	}
 
-	second, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mainSHA)
+	second, err := CheckoutSource(context.Background(), cfg, "myrepo", mainSHA)
 	if err != nil {
 		t.Fatalf("second checkout after cleanup: %v", err)
 	}
@@ -270,7 +517,7 @@ func TestCleanupCheckout_AllowsReuseAfterCleanup(t *testing.T) {
 }
 
 func TestCleanupCheckout_RejectsCheckoutPathEqualToRoot(t *testing.T) {
-	cfg := newConfig(t, "file:///nonexistent")
+	cfg := newConfig(t)
 	commit := strings.Repeat("a", 40)
 
 	// Verify the root is a real directory before the call so we can
@@ -293,7 +540,7 @@ func TestCleanupCheckout_RejectsCheckoutPathEqualToRoot(t *testing.T) {
 }
 
 func TestCleanupCheckout_RejectsDifferentCheckoutPath(t *testing.T) {
-	cfg := newConfig(t, "file:///nonexistent")
+	cfg := newConfig(t)
 	commit := strings.Repeat("a", 40)
 
 	// Pre-create a path inside the root that is not the derived
@@ -317,7 +564,7 @@ func TestCleanupCheckout_RejectsDifferentCheckoutPath(t *testing.T) {
 }
 
 func TestCleanupCheckout_RejectsPathTraversalRepositoryName(t *testing.T) {
-	cfg := newConfig(t, "file:///nonexistent")
+	cfg := newConfig(t)
 	commit := strings.Repeat("a", 40)
 
 	cases := []struct {
@@ -347,7 +594,7 @@ func TestCleanupCheckout_RejectsPathTraversalRepositoryName(t *testing.T) {
 }
 
 func TestCleanupCheckout_RejectsInvalidCommitSHA(t *testing.T) {
-	cfg := newConfig(t, "file:///nonexistent")
+	cfg := newConfig(t)
 
 	cases := []struct {
 		name   string
@@ -376,7 +623,7 @@ func TestCleanupCheckout_RejectsInvalidCommitSHA(t *testing.T) {
 }
 
 func TestCleanupCheckout_RefusesPathsOutsideRoot(t *testing.T) {
-	cfg := newConfig(t, "file:///nonexistent")
+	cfg := newConfig(t)
 	commit := strings.Repeat("a", 40)
 	outside := "/this-path-does-not-exist-and-is-outside-the-temp-root"
 
@@ -396,7 +643,16 @@ func TestVerifyCommit_ReachableOnMainAccepted(t *testing.T) {
 	remote, mainSHA, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
 
-	if err := VerifyCommit(context.Background(), cfg, "myorg", "myrepo", mainSHA); err != nil {
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
+	}
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
+
+	if err := VerifyCommit(context.Background(), cfg, "myrepo", mainSHA); err != nil {
 		t.Fatalf("VerifyCommit: %v", err)
 	}
 }
@@ -406,23 +662,29 @@ func TestVerifyCommit_ReachableOnMainAccepted(t *testing.T) {
 // of them touch the filesystem, so we use an origin path that does
 // not exist.
 func TestVerifyCommit_InvalidInputsRejected(t *testing.T) {
-	cfg := newConfig(t, "file:///nonexistent")
+	cfg := newConfig(t)
 	cases := []struct {
 		name string
-		org  string
 		repo string
 		sha  string
 		want error
 	}{
-		{"empty organisation", "", "myrepo", strings.Repeat("a", 40), ErrInvalidInput},
-		{"org mismatch", "not-myorg", "myrepo", strings.Repeat("a", 40), ErrInvalidInput},
-		{"invalid repo name", "myorg", "MyRepo", strings.Repeat("a", 40), ErrInvalidInput},
-		{"short sha", "myorg", "myrepo", strings.Repeat("a", 39), ErrInvalidInput},
-		{"non-hex sha", "myorg", "myrepo", strings.Repeat("z", 40), ErrInvalidInput},
+		{"invalid repo name", "MyRepo", strings.Repeat("a", 40), ErrInvalidInput},
+		{"short sha", "myrepo", strings.Repeat("a", 39), ErrInvalidInput},
+		{"non-hex sha", "myrepo", strings.Repeat("z", 40), ErrInvalidInput},
+		{"missing allowed org", "myrepo", strings.Repeat("a", 40), ErrInvalidInput},
+		{"missing repository root", "myrepo", strings.Repeat("a", 40), ErrInvalidInput},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := VerifyCommit(context.Background(), cfg, tc.org, tc.repo, tc.sha)
+			cfg := cfg
+			if tc.name == "missing allowed org" {
+				cfg.AllowedOrg = ""
+			}
+			if tc.name == "missing repository root" {
+				cfg.RepositoryRoot = ""
+			}
+			err := VerifyCommit(context.Background(), cfg, tc.repo, tc.sha)
 			if !errors.Is(err, tc.want) {
 				t.Errorf("got %v, want errors.Is(_, %v)", err, tc.want)
 			}
@@ -435,7 +697,17 @@ func TestVerifyCommit_InvalidInputsRejected(t *testing.T) {
 func TestVerifyCommit_MissingCommitRejected(t *testing.T) {
 	remote, _, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
-	if err := VerifyCommit(context.Background(), cfg, "myorg", "myrepo", strings.Repeat("0", 40)); !errors.Is(err, ErrCommitNotFound) {
+
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
+	}
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
+
+	if err := VerifyCommit(context.Background(), cfg, "myrepo", strings.Repeat("0", 40)); !errors.Is(err, ErrCommitNotFound) {
 		t.Errorf("got %v, want errors.Is(_, ErrCommitNotFound)", err)
 	}
 }
@@ -443,9 +715,26 @@ func TestVerifyCommit_MissingCommitRejected(t *testing.T) {
 // TestVerifyCommit_UnreachableRejected verifies that a commit in a
 // non-main branch is reported as ErrUnreachableCommit.
 func TestVerifyCommit_UnreachableRejected(t *testing.T) {
-	remote, _, featureSHA := setupRemote(t)
+	remote, _, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
-	if err := VerifyCommit(context.Background(), cfg, "myorg", "myrepo", featureSHA); !errors.Is(err, ErrUnreachableCommit) {
+
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
+	}
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
+
+	featCmd := exec.Command("git", "-C", mirror, "rev-parse", "refs/heads/feature")
+	fout, err := featCmd.Output()
+	if err != nil {
+		t.Fatalf("get feature SHA: %v", err)
+	}
+	featureSHA := strings.TrimSpace(string(fout))
+
+	if err := VerifyCommit(context.Background(), cfg, "myrepo", featureSHA); !errors.Is(err, ErrUnreachableCommit) {
 		t.Errorf("got %v, want errors.Is(_, ErrUnreachableCommit)", err)
 	}
 }
@@ -458,19 +747,24 @@ func TestVerifyCommit_NonCommitObjectRejected(t *testing.T) {
 	remote, _, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
 
-	// Materialise the bare mirror via CheckoutSource so the tree SHA
-	// is resolvable there.
-	first, err := CheckoutSource(context.Background(), cfg, "myorg", "myrepo", mustCommit(t, remote))
-	if err != nil {
-		t.Fatalf("setup checkout: %v", err)
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
 	}
-	defer CleanupCheckout(context.Background(), cfg, *first)
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
 
-	cleanTree, err := gitTreeSHA(t, first.MirrorPath, mustCommit(t, remote))
+	// Materialise a tree SHA inside the mirror.
+	hitCmd := exec.Command("git", "-C", mirror, "rev-parse", "HEAD^{tree}")
+	hout, err := hitCmd.Output()
 	if err != nil {
 		t.Fatalf("get tree SHA: %v", err)
 	}
-	if err := VerifyCommit(context.Background(), cfg, "myorg", "myrepo", cleanTree); !errors.Is(err, ErrNotCommitObject) {
+	cleanTree := strings.TrimSpace(string(hout))
+
+	if err := VerifyCommit(context.Background(), cfg, "myrepo", cleanTree); !errors.Is(err, ErrNotCommitObject) {
 		t.Errorf("got %v, want errors.Is(_, ErrNotCommitObject)", err)
 	}
 }
@@ -485,7 +779,16 @@ func TestVerifyCommit_DoesNotCreateCheckout(t *testing.T) {
 	remote, mainSHA, _ := setupRemote(t)
 	cfg := newConfig(t, remote)
 
-	if err := VerifyCommit(context.Background(), cfg, "myorg", "myrepo", mainSHA); err != nil {
+	mirror := mirrorPath(cfg, "myrepo")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatalf("mkdir mirror parent: %v", err)
+	}
+	cloneCmd := exec.Command("git", "clone", "--bare", remote, mirror)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed clone: %v: %s", err, out)
+	}
+
+	if err := VerifyCommit(context.Background(), cfg, "myrepo", mainSHA); err != nil {
 		t.Fatalf("VerifyCommit: %v", err)
 	}
 
@@ -493,25 +796,4 @@ func TestVerifyCommit_DoesNotCreateCheckout(t *testing.T) {
 	if _, err := os.Stat(expected); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("checkout directory %s unexpectedly exists: %v", expected, err)
 	}
-}
-
-// gitTreeSHA returns the tree SHA associated with commit inside repo.
-func gitTreeSHA(t *testing.T, repo, commit string) (string, error) {
-	t.Helper()
-	cmd := exec.Command("git", "-C", repo, "rev-parse", commit+"^{tree}")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func mustCommit(t *testing.T, remote string) string {
-	t.Helper()
-	cmd := exec.Command("git", "-C", remote, "rev-parse", "HEAD")
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("rev-parse HEAD: %v", err)
-	}
-	return strings.TrimSpace(string(out))
 }

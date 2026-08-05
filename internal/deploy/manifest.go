@@ -14,11 +14,18 @@ import (
 	"strings"
 )
 
-// appNameRe matches both manifest "app" values and repository short
-// names. A lowercase letter, then 0–30 of [a-z0-9-], then a final
-// lowercase letter or digit. Total length 2–32. The leading and
-// trailing rules prevent values like "demo-" that would produce
-// invalid derived hostnames.
+// appNameRe matches both manifest "app" values and manifest
+// "repository" values. A lowercase letter, then 0–30 of [a-z0-9-],
+// then a final lowercase letter or digit. Total length 2–32. The
+// leading and trailing rules prevent values like "demo-" that would
+// produce invalid derived hostnames.
+//
+// The manifest "app" and "repository" fields share the same regex:
+// both are GitHub-influenced short names that must be safe to embed
+// in URLs, hostnames, and filesystem paths. The manifest contract is
+// the single source of truth for this shape; the daemon's
+// counterpart (internal/daemon/server.go) duplicates the regex so
+// HTTP input validation cannot accidentally drift.
 var appNameRe = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])$`)
 
 // secretRefRe is the allowlist shape for a secret_ref: lowercase
@@ -30,19 +37,41 @@ var secretRefRe = regexp.MustCompile(`^[a-z0-9_](?:[a-z0-9_.-]{0,62}[a-z0-9_])$`
 
 // Manifest is the deploy.json shape.
 //
-//   - Version 1: single HTTP container; no data, no env (legacy).
+//   - Version 1: single HTTP container; no data, no env, no
+//     repository (legacy).
 //   - Version 2: adds an optional "data" field for per-app data
 //     mounts.
-//   - Version 3: adds an optional "env" array for per-app secret
-//     injection.
+//   - Version 3: adds a REQUIRED "repository" field (GitHub repo
+//     short name; the daemon derives the trusted origin URL
+//     internally from the configured org + repository) and an
+//     optional "env" array for per-app secret injection.
+//
+// App and Repository are distinct roles:
+//
+//   - App is the deployment identity: it drives the API path
+//     (/v1/apps/<app>/...), the Caddy hostname prefix
+//     (<app>.<base-domain>), the per-app state key, the per-app
+//     data directory, and the Docker container naming input.
+//   - Repository is the GitHub repo short name used for source
+//     resolution. The full trusted URL is derived internally as
+//     https://github.com/<AGENTCTLD_SOURCE_ALLOWED_ORG>/<repository>.git
+//     so the caller can never select a different org and can
+//     never provide a full URL.
+//
+// App and Repository may differ (e.g. a renamed deployment identity
+// for the same repo, or the same identity across multiple repos in
+// the same org). When they are equal the manifest still declares
+// both fields explicitly; nothing is implied.
 //
 // When Data is non-nil the manifest opts the deployment into a
 // per-app data mount. When Env is non-empty the manifest opts the
 // deployment into per-app secret injection. Neither feature is
-// available on version 1; only "env" requires version 3.
+// available on version 1; only "env" and "repository" require
+// version 3.
 type Manifest struct {
 	Version       int           `json:"version"`
 	App           string        `json:"app"`
+	Repository    string        `json:"repository"`
 	ContainerPort int           `json:"container_port"`
 	HealthPath    string        `json:"health_path"`
 	Data          *ManifestData `json:"data,omitempty"`
@@ -85,12 +114,14 @@ type EnvEntry struct {
 // fields and trailing data after the manifest object are rejected.
 // Version gating:
 //
-//	v1: no data, no env
-//	v2: data allowed, no env
-//	v3: data + env allowed
+//	v1: no data, no env, no repository
+//	v2: data allowed, no env, no repository
+//	v3: repository REQUIRED, data + env allowed
 //
 // Anything outside the v1/v2/v3 set is rejected at parse time so
-// every consumer of Load sees the failure.
+// every consumer of Load sees the failure. A version 3 manifest
+// without a "repository" field is rejected here too — the source
+// layer has no other way to learn which repository to clone.
 func Load(path string) (*Manifest, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -113,12 +144,24 @@ func Load(path string) (*Manifest, error) {
 		if len(m.Env) > 0 {
 			return nil, fmt.Errorf("env field is not allowed in version 1 manifests (bump to version 3)")
 		}
+		if m.Repository != "" {
+			return nil, fmt.Errorf("repository field is not allowed in version 1 manifests (bump to version 3)")
+		}
 	case 2:
 		if len(m.Env) > 0 {
 			return nil, fmt.Errorf("env field requires manifest version 3 (current version is 2)")
 		}
+		if m.Repository != "" {
+			return nil, fmt.Errorf("repository field requires manifest version 3 (current version is 2)")
+		}
 	case 3:
-		// full v3: data + env both allowed
+		if m.Repository == "" {
+			return nil, fmt.Errorf("repository field is required for version 3 manifests")
+		}
+		// Repository shape (regex match, non-emptiness) is
+		// enforced by Validate (which has the surrounding app
+		// context for the error message); an empty repository is
+		// the only parse-time concern.
 	default:
 		return nil, fmt.Errorf("unsupported manifest version %d (only versions 1, 2 and 3 are accepted)", m.Version)
 	}

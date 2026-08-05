@@ -32,7 +32,6 @@ func minimalConfig(socketPath string) *Config {
 		Source: deploy.SourceConfig{
 			AllowedOrg:     "acme",
 			RepositoryRoot: "/srv/agentctl/repos",
-			OriginURL:      "https://github.com/acme/example.git",
 		},
 		Runtime: deploy.RuntimeConfig{
 			PortRangeStart: 40000,
@@ -711,7 +710,7 @@ func TestInspectHandler_DoesNotCreateCheckout(t *testing.T) {
 	repoRoot := t.TempDir()
 	cfg := minimalConfig(filepath.Join(t.TempDir(), "agentctl.sock"))
 	cfg.Source.RepositoryRoot = repoRoot
-	cfg.Source.OriginURL = remoteDir
+	cfg.Source.OriginURLOverride = remoteDir
 	cfg.Source.AllowedOrg = "acme"
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
@@ -1389,7 +1388,7 @@ func inspectHandlerEnv(t *testing.T, manifestJSON string, env []deploy.EnvEntry)
 
 	cfg := minimalConfig(filepath.Join(t.TempDir(), "agentctl.sock"))
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
+	cfg.Source.OriginURLOverride = remoteDir
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
@@ -1443,14 +1442,14 @@ func TestInspectHandler_EnvStatusesConfigured(t *testing.T) {
 	mainSHA := runGit("rev-parse", "HEAD")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
+	cfg.Source.OriginURLOverride = remoteDir
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key","required":true},{"name":"BAR","secret_ref":"bar.key"}]}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key","required":true},{"name":"BAR","secret_ref":"bar.key"}]}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
@@ -1543,14 +1542,14 @@ func TestInspectHandler_EnvStatusesAllConfigured(t *testing.T) {
 	mainSHA := runGit("rev-parse", "HEAD")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
+	cfg.Source.OriginURLOverride = remoteDir
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"},{"name":"BAR","secret_ref":"bar.key"}]}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"},{"name":"BAR","secret_ref":"bar.key"}]}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
@@ -1611,14 +1610,14 @@ func TestInspectHandler_NoEnvNoEnvStatuses(t *testing.T) {
 	mainSHA := runGit("rev-parse", "HEAD")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
+	cfg.Source.OriginURLOverride = remoteDir
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz"}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz"}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
@@ -1671,14 +1670,14 @@ func TestInspectHandler_EnvStatusesRequiredMissingFails(t *testing.T) {
 	mainSHA := runGit("rev-parse", "HEAD")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
+	cfg.Source.OriginURLOverride = remoteDir
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key","required":true}]}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key","required":true}]}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
@@ -1746,14 +1745,14 @@ func TestInspectHandler_EnvStatusesOptionalMissingPasses(t *testing.T) {
 	mainSHA := runGit("rev-parse", "HEAD")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
+	cfg.Source.OriginURLOverride = remoteDir
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"}]}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"}]}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
