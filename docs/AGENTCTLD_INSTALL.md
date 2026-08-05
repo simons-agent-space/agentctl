@@ -1012,7 +1012,7 @@ untrusted workloads.
 
 - **The daemon's own network access is unrestricted beyond
   address-family restrictions.** It will talk to any
-  `github.com` host (or whatever ``AGENTCTLD_SOURCE_ALLOWED_ORG` + manifest.repository (derived per-app)`
+  `github.com` host (or whatever `AGENTCTLD_SOURCE_ALLOWED_ORG` + `manifest.repository` (derived per-app))
   points to), any loopback address, and any reachable host on
   the configured DNS resolvers. Operators behind a proxy must
   configure Git's proxy settings at the system level.

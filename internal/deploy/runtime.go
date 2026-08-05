@@ -178,12 +178,19 @@ func validateRuntimeInputs(cfg RuntimeConfig, manifest Manifest, source SourceRe
 	// App and Repository are independent fields: app drives the
 	// API path / hostname / state key, repository drives the
 	// source mirror. The legacy v1/v2 invariant (app == repo)
-	// is gone; the runtime no longer reconciles them. Source
-	// resolution has already been performed by the orchestrator
-	// before this check runs, so the manifest here is trusted
-	// to declare a Repository that matches the source it was
-	// resolved against (validateDeployConfig enforces the v3
-	// contract).
+	// is gone; the runtime no longer reconciles them. For v3,
+	// however, the manifest's Repository must match the
+	// source.Repository that the source layer actually resolved
+	// against — otherwise a v3 manifest declaring app=X and
+	// repository=Y could be served a checkout built from a
+	// different repository Y' that happens to share the same
+	// commit SHA. validateDeployConfig enforces the static shape
+	// (non-empty Repository matching appNameRe for v3); this
+	// check enforces the dynamic invariant between the resolved
+	// source and the manifest that requested it.
+	if manifest.Version == 3 && manifest.Repository != source.Repository {
+		return fmt.Errorf("%w: manifest.Repository %q does not match source.Repository %q", ErrInvalidInputs, manifest.Repository, source.Repository)
+	}
 	if !shaRe.MatchString(source.Commit) {
 		return fmt.Errorf("%w: source.Commit %q is not a valid SHA", ErrInvalidInputs, source.Commit)
 	}
