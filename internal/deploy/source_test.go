@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -67,7 +68,7 @@ func newConfig(t *testing.T, originURLOverride ...string) SourceConfig {
 		RepositoryRoot: t.TempDir(),
 	}
 	if len(originURLOverride) > 0 {
-		cfg.OriginURLOverride = originURLOverride[0]
+		cfg.originURLOverride = originURLOverride[0]
 	}
 	return cfg
 }
@@ -795,5 +796,35 @@ func TestVerifyCommit_DoesNotCreateCheckout(t *testing.T) {
 	expected := filepath.Join(cfg.RepositoryRoot, "myrepo-checkouts", mainSHA)
 	if _, err := os.Stat(expected); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("checkout directory %s unexpectedly exists: %v", expected, err)
+	}
+}
+
+func TestSourceConfig_NoExportedOriginOrBaseURLField(t *testing.T) {
+	t.Helper()
+	typ := reflect.TypeOf(SourceConfig{})
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		lname := strings.ToLower(f.Name)
+		if strings.Contains(lname, "origin") || strings.Contains(lname, "url") || strings.Contains(lname, "base") {
+			t.Errorf("SourceConfig exposes exported field %q (production must not pick the origin URL); rename or unexport it", f.Name)
+		}
+	}
+}
+
+func TestSourceConfig_WithTestOriginURL(t *testing.T) {
+	t.Helper()
+	cfg := SourceConfig{AllowedOrg: "myorg"}
+	got := cfg.WithTestOriginURL("file:///tmp/fake.git")
+	if got.originURLOverride != "file:///tmp/fake.git" {
+		t.Errorf("WithTestOriginURL did not set the override: %q", got.originURLOverride)
+	}
+	if cfg.originURLOverride != "" {
+		t.Errorf("WithTestOriginURL mutated the receiver; expected a copy: %q", cfg.originURLOverride)
+	}
+	if url := got.originURL("cron-dashboard"); url != "file:///tmp/fake.git" {
+		t.Errorf("WithTestOriginURL result originURL = %q, want %q", url, "file:///tmp/fake.git")
 	}
 }

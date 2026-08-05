@@ -193,12 +193,12 @@ func newDeployFixture(t *testing.T) *deployFixture {
 	if err := os.Chmod(runtimeDir, 0o700); err != nil {
 		t.Fatalf("chmod runtime dir: %v", err)
 	}
-	_ = originURL // referenced below via OriginURLOverride
+	_ = originURL // referenced below via originURLOverride
 	cfg := DeployConfig{
 		Source: SourceConfig{
 			AllowedOrg:     "testorg",
 			RepositoryRoot: repoRoot,
-			// OriginURLOverride is the test-only seam on
+			// originURLOverride is the test-only seam on
 			// SourceConfig that lets the orchestrator tests
 			// point the source layer at a local file remote
 			// while the production derivation is the real
@@ -229,9 +229,9 @@ func newDeployFixture(t *testing.T) *deployFixture {
 	}
 	// Production derives the origin URL from the org + repository;
 	// tests override it to point at the local bare origin created
-	// by setupTestGitRepo. OriginURLOverride is the test-only seam
+	// by setupTestGitRepo. originURLOverride is the test-only seam
 	// on SourceConfig; production code never sets it.
-	cfg.Source.OriginURLOverride = originURL
+	cfg.Source.originURLOverride = originURL
 
 	docker := newDockerDeployRunner()
 	caddy := healthyCaddy(rootConfig)
@@ -259,9 +259,16 @@ func newDeployFixture(t *testing.T) *deployFixture {
 }
 
 func (f *deployFixture) validManifest() Manifest {
+	// validManifest returns a v3 manifest because the first
+	// deployment under agentctld will use v3 (Repository is
+	// required). Tests that need a v1 manifest for legacy
+	// coverage construct it inline. The Repository is wired to
+	// the expected app name so source resolution exercises the
+	// same short name the deploy uses for the API path.
 	return Manifest{
-		Version:       1,
+		Version:       3,
 		App:           f.expectedApp,
+		Repository:    f.expectedApp,
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 	}

@@ -346,17 +346,18 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 	// 3. Prepare trusted source checkout. The source layer
 	//    validates the commit (40 hex chars, reachable from
 	//    origin/main) and produces a detached checkout directory.
-	//    The repository short name comes from the manifest, not
-	//    from the app name; the daemon derives the trusted origin
-	//    URL internally from cfg.Source.AllowedOrg + repository.
-	//    v1/v2 manifests have no Repository field; for those
-	//    the app name is the only available identifier and the
-	//    previous app-equals-repo behaviour is retained as a
-	//    transitional escape hatch.
+	//    The repository short name is taken verbatim from
+	//    manifest.Repository; the daemon derives the trusted
+	//    origin URL internally from cfg.Source.AllowedOrg +
+	//    repository. validateDeployConfig has already enforced
+	//    that a v3 manifest declares a non-empty Repository
+	//    that matches appNameRe, so by this point sourceRepo is
+	//    always set on the supported path. A v1/v2 manifest
+	//    (no Repository field) would reach CheckoutSource with
+	//    an empty repository and be rejected by the source
+	//    layer's regex check; there is no app-equals-repo
+	//    compatibility bridge.
 	sourceRepo := manifest.Repository
-	if sourceRepo == "" {
-		sourceRepo = manifest.App
-	}
 	source, err := CheckoutSource(ctx, cfg.Source, sourceRepo, commit)
 	if err != nil {
 		return nil, &deployError{

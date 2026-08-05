@@ -710,7 +710,7 @@ func TestInspectHandler_DoesNotCreateCheckout(t *testing.T) {
 	repoRoot := t.TempDir()
 	cfg := minimalConfig(filepath.Join(t.TempDir(), "agentctl.sock"))
 	cfg.Source.RepositoryRoot = repoRoot
-	cfg.Source.OriginURLOverride = remoteDir
+	cfg.Source = cfg.Source.WithTestOriginURL(remoteDir)
 	cfg.Source.AllowedOrg = "acme"
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
@@ -718,7 +718,7 @@ func TestInspectHandler_DoesNotCreateCheckout(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":1,"app":"myapp","container_port":8080,"health_path":"/healthz"}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz"}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
@@ -797,7 +797,7 @@ func TestSlowDeployer_ResponseDelivered(t *testing.T) {
 		t.Fatalf("socket did not appear: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":1,"app":"example","container_port":8080,"health_path":"/healthz"}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"example","repository":"example","container_port":8080,"health_path":"/healthz"}`)
 	body, err := json.Marshal(map[string]any{
 		"commit":   strings.Repeat("a", 40),
 		"manifest": manifestJSON,
@@ -1080,7 +1080,7 @@ func TestListenAndServe_ShutdownWaitsForActiveDeploy(t *testing.T) {
 		t.Fatalf("socket did not appear: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":1,"app":"example","container_port":8080,"health_path":"/healthz"}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"example","repository":"example","container_port":8080,"health_path":"/healthz"}`)
 	body, err := json.Marshal(map[string]any{
 		"commit":   strings.Repeat("a", 40),
 		"manifest": manifestJSON,
@@ -1388,7 +1388,7 @@ func inspectHandlerEnv(t *testing.T, manifestJSON string, env []deploy.EnvEntry)
 
 	cfg := minimalConfig(filepath.Join(t.TempDir(), "agentctl.sock"))
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURLOverride = remoteDir
+	cfg.Source = cfg.Source.WithTestOriginURL(remoteDir)
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
@@ -1442,7 +1442,7 @@ func TestInspectHandler_EnvStatusesConfigured(t *testing.T) {
 	mainSHA := runGit("rev-parse", "HEAD")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURLOverride = remoteDir
+	cfg.Source = cfg.Source.WithTestOriginURL(remoteDir)
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
@@ -1542,7 +1542,7 @@ func TestInspectHandler_EnvStatusesAllConfigured(t *testing.T) {
 	mainSHA := runGit("rev-parse", "HEAD")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURLOverride = remoteDir
+	cfg.Source = cfg.Source.WithTestOriginURL(remoteDir)
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
@@ -1610,7 +1610,7 @@ func TestInspectHandler_NoEnvNoEnvStatuses(t *testing.T) {
 	mainSHA := runGit("rev-parse", "HEAD")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURLOverride = remoteDir
+	cfg.Source = cfg.Source.WithTestOriginURL(remoteDir)
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
@@ -1670,7 +1670,7 @@ func TestInspectHandler_EnvStatusesRequiredMissingFails(t *testing.T) {
 	mainSHA := runGit("rev-parse", "HEAD")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURLOverride = remoteDir
+	cfg.Source = cfg.Source.WithTestOriginURL(remoteDir)
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
@@ -1745,7 +1745,7 @@ func TestInspectHandler_EnvStatusesOptionalMissingPasses(t *testing.T) {
 	mainSHA := runGit("rev-parse", "HEAD")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURLOverride = remoteDir
+	cfg.Source = cfg.Source.WithTestOriginURL(remoteDir)
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {

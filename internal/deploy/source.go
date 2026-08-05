@@ -45,14 +45,14 @@ const originFetchRefspec = "+refs/heads/main:refs/remotes/origin/main"
 type SourceConfig struct {
 	AllowedOrg     string // GitHub org; the org component of the derived origin URL
 	RepositoryRoot string // trusted host path; mirrors and checkouts live under here
-	// OriginURLOverride is a test-only seam. When non-empty it
-	// replaces the derived origin URL. The field is unexported
-	// so production code (the daemon, the CLI, every external
-	// entry point) cannot set it; only tests in this package
-	// can. The override exists because the source-layer tests
-	// need to point at a local file remote while the production
-	// derivation is the literal "https://github.com/<org>/<repo>.git".
-	OriginURLOverride string
+	// originURLOverride is a test-only seam. When non-empty it
+	// replaces the derived origin URL. The field is unexported so
+	// production code (the daemon, the CLI, every external entry
+	// point) cannot set it; only tests in this package can read
+	// or write the field directly. External tests (e.g. daemon
+	// HTTP integration tests in another package) must use the
+	// exported WithTestOriginURL helper below to set it.
+	originURLOverride string
 }
 
 // SourceResult is the outcome of a successful source resolution.
@@ -74,8 +74,8 @@ type SourceResult struct {
 // The organisation is read from the trusted SourceConfig, not
 // from the caller; the repository is the validated short name.
 func (c SourceConfig) originURL(repository string) string {
-	if c.OriginURLOverride != "" {
-		return c.OriginURLOverride
+	if c.originURLOverride != "" {
+		return c.originURLOverride
 	}
 	return "https://github.com/" + c.AllowedOrg + "/" + repository + ".git"
 }
@@ -372,4 +372,24 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 
 func normalizeGitURL(u string) string {
 	return strings.TrimSuffix(strings.TrimSpace(u), ".git")
+}
+
+// WithTestOriginURL returns a copy of c with the test-only origin
+// URL override set. It exists so external test packages (the
+// daemon HTTP integration tests, in particular) can point source
+// resolution at a local file remote without poking the unexported
+// originURLOverride field directly. Production callers MUST NOT
+// call this function; the contract is that the origin URL is
+// derived from the trusted SourceConfig, never supplied by the
+// caller. The "Test" suffix in the name is the only signal a
+// reader gets that this is not a production API.
+//
+// A reflection-based test in source_test.go asserts that the
+// SourceConfig type exposes no exported origin-URL or base-URL
+// field; that test fails the build if a future refactor
+// accidentally re-exports originURLOverride (or any other field
+// that would let a production caller pick the origin URL).
+func (c SourceConfig) WithTestOriginURL(url string) SourceConfig {
+	c.originURLOverride = url
+	return c
 }
