@@ -332,10 +332,21 @@ func TestValidateSecretDir_AcceptsOwningUid(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
-	// The test runner owns the dir. With currentUID returning
-	// that same uid (1000), validation passes.
+	// Use the temp dir's actual owner uid so this test passes
+	// regardless of which uid the test runner runs as. CI
+	// runners (GitHub Actions ubuntu-24.04) run tests as
+	// uid 1001; local dev is often uid 1000; other CI images
+	// pick yet other uids. Hardcoding 1000 couples the test
+	// to a specific host layout and breaks on every other
+	// uid — see PR #15 CI failure ("uid 1001 ... only uid 0
+	// or 1000 accepted").
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	ownerUID := uidFromFileInfo(info)
 	orig := currentUID
-	currentUID = func() int { return 1000 }
+	currentUID = func() int { return ownerUID }
 	t.Cleanup(func() { currentUID = orig })
 	if err := ValidateSecretDir(dir); err != nil {
 		t.Errorf("ValidateSecretDir (own-uid trusted): %v, want nil", err)
