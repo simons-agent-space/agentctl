@@ -157,7 +157,7 @@ func (c *Config) Validate() error {
 	if !filepath.IsAbs(c.SocketPath) {
 		return fmt.Errorf("%w: SocketPath %q must be absolute", ErrInvalidRequest, c.SocketPath)
 	}
-	if c.Source.RepositoryRoot == "" || c.Source.OriginURL == "" || c.Source.AllowedOrg == "" {
+	if c.Source.RepositoryRoot == "" || c.Source.AllowedOrg == "" {
 		return fmt.Errorf("%w: Source configuration is incomplete", ErrInvalidRequest)
 	}
 	if c.Runtime.PortRangeStart == 0 || c.Runtime.PortRangeEnd == 0 {
@@ -765,7 +765,7 @@ func (s *Server) handleInspect(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.ManifestVersion = manifest.Version
 
-	if verr := deploy.Validate(manifest, req.App); verr != nil {
+	if verr := deploy.Validate(manifest); verr != nil {
 		resp.Valid = false
 		resp.Errors = append(resp.Errors, verr.Error())
 	}
@@ -794,7 +794,17 @@ func (s *Server) handleInspect(w http.ResponseWriter, r *http.Request) {
 		// pass. ensureMirror still creates the bare mirror on
 		// first use; that mirror is shared with deploys and
 		// therefore not a per-inspect side effect.
-		if verr := deploy.VerifyCommit(ctx, s.cfg.Source, s.cfg.Source.AllowedOrg, req.App, req.Commit); verr != nil {
+		//
+		// The repository short name is taken verbatim from
+		// manifest.Repository. Validate has already enforced that
+		// a v3 manifest declares a non-empty Repository that
+		// matches appNameRe, so on the supported path inspectRepo
+		// is always set. A v1/v2 manifest (no Repository field)
+		// would reach VerifyCommit with an empty repository and
+		// be rejected by the source layer's regex check; there is
+		// no app-equals-repo compatibility bridge.
+		inspectRepo := manifest.Repository
+		if verr := deploy.VerifyCommit(ctx, s.cfg.Source, inspectRepo, req.Commit); verr != nil {
 			resp.SourceReachable = false
 			resp.Valid = false
 			resp.Errors = append(resp.Errors, fmt.Sprintf("source: %v", verr))
@@ -868,7 +878,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request, app string
 		writeError(w, http.StatusBadRequest, "invalid_request", ErrInvalidRequest, "manifest app does not match URL app")
 		return
 	}
-	if verr := deploy.Validate(manifest, app); verr != nil {
+	if verr := deploy.Validate(manifest); verr != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", ErrInvalidRequest, verr.Error())
 		return
 	}

@@ -49,8 +49,14 @@
 // Source layer:
 //
 //	AGENTCTLD_SOURCE_REPOSITORY_ROOT    trusted host path (required)
-//	AGENTCTLD_SOURCE_ORIGIN_URL         trusted remote URL (required)
-//	AGENTCTLD_SOURCE_ALLOWED_ORG        expected GitHub org (required)
+//	AGENTCTLD_SOURCE_ALLOWED_ORG        expected GitHub org (required).
+//	                                The per-app origin URL is
+//	                                derived internally as
+//	                                https://github.com/<org>/<repository>.git
+//	                                where <repository> comes from
+//	                                the manifest. The caller never
+//	                                supplies a URL, a base URL, or
+//	                                an org.
 //
 // Runtime layer:
 //
@@ -167,7 +173,6 @@ func loadConfig() (*daemon.Config, error) {
 		Source: deploy.SourceConfig{
 			AllowedOrg:     os.Getenv("AGENTCTLD_SOURCE_ALLOWED_ORG"),
 			RepositoryRoot: os.Getenv("AGENTCTLD_SOURCE_REPOSITORY_ROOT"),
-			OriginURL:      os.Getenv("AGENTCTLD_SOURCE_ORIGIN_URL"),
 		},
 		Runtime: deploy.RuntimeConfig{
 			RepositoryRoot: os.Getenv("AGENTCTLD_RUNTIME_REPOSITORY_ROOT"),
@@ -263,7 +268,6 @@ func loadConfig() (*daemon.Config, error) {
 	}
 	if err := requireNonEmpty(map[string]string{
 		"AGENTCTLD_SOURCE_REPOSITORY_ROOT":  cfg.Source.RepositoryRoot,
-		"AGENTCTLD_SOURCE_ORIGIN_URL":       cfg.Source.OriginURL,
 		"AGENTCTLD_SOURCE_ALLOWED_ORG":      cfg.Source.AllowedOrg,
 		"AGENTCTLD_RUNTIME_REPOSITORY_ROOT": cfg.Runtime.RepositoryRoot,
 		"AGENTCTLD_CADDY_BASE_DOMAIN":       cfg.Caddy.BaseDomain,

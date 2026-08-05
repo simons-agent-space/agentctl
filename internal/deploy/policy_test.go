@@ -81,6 +81,7 @@ func TestValidate_EnvEntriesAcceptedOnV3(t *testing.T) {
 	m := &Manifest{
 		Version:       3,
 		App:           "agentctl",
+		Repository:    "agentctl",
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 		Env: []EnvEntry{
@@ -88,7 +89,7 @@ func TestValidate_EnvEntriesAcceptedOnV3(t *testing.T) {
 			{Name: "BAR", SecretRef: "bar.key"},
 		},
 	}
-	if err := Validate(m, "agentctl"); err != nil {
+	if err := Validate(m); err != nil {
 		t.Errorf("v3 with env: %v", err)
 	}
 }
@@ -97,6 +98,7 @@ func TestValidate_EnvNameUnique(t *testing.T) {
 	m := &Manifest{
 		Version:       3,
 		App:           "agentctl",
+		Repository:    "agentctl",
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 		Env: []EnvEntry{
@@ -104,7 +106,7 @@ func TestValidate_EnvNameUnique(t *testing.T) {
 			{Name: "FOO", SecretRef: "foo2.key"},
 		},
 	}
-	err := Validate(m, "agentctl")
+	err := Validate(m)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -117,11 +119,12 @@ func TestValidate_V3HostSourceMountAccepted(t *testing.T) {
 	m := &Manifest{
 		Version:       3,
 		App:           "agentctl",
+		Repository:    "agentctl",
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 		Data:          &ManifestData{Mount: true, HostSource: "/srv/data"},
 	}
-	if err := Validate(m, "agentctl"); err != nil {
+	if err := Validate(m); err != nil {
 		t.Errorf("v3 host_source: %v", err)
 	}
 }

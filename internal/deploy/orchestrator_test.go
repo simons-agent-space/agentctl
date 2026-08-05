@@ -41,7 +41,11 @@ var (
 // setupTestGitRepo creates a local bare origin and a working
 // repository with two commits. Each commit contains a Dockerfile.
 // Returns the origin URL (file://) and the two commit SHAs. The
-// origin is usable by SourceConfig.OriginURL.
+// origin is used as the test fixture for source resolution; the
+// orchestrator derives the production origin URL from the
+// configured org + repository, so the fixture is consumed by the
+// source-layer tests directly. The orchestrator tests only need
+// the commits.
 func setupTestGitRepo(t *testing.T) (originURL, commitA, commitB string) {
 	t.Helper()
 
@@ -189,11 +193,18 @@ func newDeployFixture(t *testing.T) *deployFixture {
 	if err := os.Chmod(runtimeDir, 0o700); err != nil {
 		t.Fatalf("chmod runtime dir: %v", err)
 	}
+	_ = originURL // referenced below via originURLOverride
 	cfg := DeployConfig{
 		Source: SourceConfig{
 			AllowedOrg:     "testorg",
 			RepositoryRoot: repoRoot,
-			OriginURL:      originURL,
+			// originURLOverride is the test-only seam on
+			// SourceConfig that lets the orchestrator tests
+			// point the source layer at a local file remote
+			// while the production derivation is the real
+			// "https://github.com/<org>/<repo>.git". The
+			// override is set below after the bare origin is
+			// created.
 		},
 		Runtime: RuntimeConfig{
 			PortRangeStart: port,
@@ -216,6 +227,11 @@ func newDeployFixture(t *testing.T) *deployFixture {
 		},
 		RuntimeDir: runtimeDir,
 	}
+	// Production derives the origin URL from the org + repository;
+	// tests override it to point at the local bare origin created
+	// by setupTestGitRepo. originURLOverride is the test-only seam
+	// on SourceConfig; production code never sets it.
+	cfg.Source.originURLOverride = originURL
 
 	docker := newDockerDeployRunner()
 	caddy := healthyCaddy(rootConfig)
@@ -243,9 +259,16 @@ func newDeployFixture(t *testing.T) *deployFixture {
 }
 
 func (f *deployFixture) validManifest() Manifest {
+	// validManifest returns a v3 manifest because the first
+	// deployment under agentctld will use v3 (Repository is
+	// required). Tests that need a v1 manifest for legacy
+	// coverage construct it inline. The Repository is wired to
+	// the expected app name so source resolution exercises the
+	// same short name the deploy uses for the API path.
 	return Manifest{
-		Version:       1,
+		Version:       3,
 		App:           f.expectedApp,
+		Repository:    f.expectedApp,
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 	}
@@ -1614,6 +1637,7 @@ func TestDeploy_OptionalSecretMissingSkipped(t *testing.T) {
 
 	manifest := f.validManifest()
 	manifest.Version = 3
+	manifest.Repository = "myapp"
 	manifest.Env = []EnvEntry{
 		{Name: "FOO", SecretRef: "foo.key", Required: true},
 		{Name: "BAR", SecretRef: "bar.key"}, // optional, missing
@@ -1666,6 +1690,7 @@ func TestDeploy_RequiredSecretMissingFails(t *testing.T) {
 
 	manifest := f.validManifest()
 	manifest.Version = 3
+	manifest.Repository = "myapp"
 	manifest.Env = []EnvEntry{
 		{Name: "FOO", SecretRef: "foo.key", Required: true},
 	}
@@ -1712,6 +1737,7 @@ func TestDeploy_InsecureOptionalSecretStillRejected(t *testing.T) {
 
 	manifest := f.validManifest()
 	manifest.Version = 3
+	manifest.Repository = "myapp"
 	manifest.Env = []EnvEntry{
 		{Name: "FOO", SecretRef: "foo.key"}, // optional
 	}
@@ -1785,6 +1811,7 @@ func TestDeploy_EnvFileMaterializedAndDeleted(t *testing.T) {
 
 	manifest := f.validManifest()
 	manifest.Version = 3
+	manifest.Repository = "myapp"
 	manifest.Env = []EnvEntry{
 		{Name: "FOO", SecretRef: "foo.key", Required: true},
 		{Name: "BAR", SecretRef: "bar.key"},
@@ -1844,6 +1871,7 @@ func TestDeploy_EnvFileNotDeletedWhenDeployFailsBeforeDocker(t *testing.T) {
 
 	manifest := f.validManifest()
 	manifest.Version = 3
+	manifest.Repository = "myapp"
 	manifest.Env = []EnvEntry{
 		{Name: "FOO", SecretRef: "foo.key", Required: true},
 		{Name: "BAR", SecretRef: "bar.key", Required: true},
@@ -1896,6 +1924,7 @@ func TestDeploy_EnvFileMissingSecretFailsBeforeDocker(t *testing.T) {
 
 	manifest := f.validManifest()
 	manifest.Version = 3
+	manifest.Repository = "myapp"
 	manifest.Env = []EnvEntry{
 		{Name: "FOO", SecretRef: "foo.key", Required: true},
 	}
@@ -1940,6 +1969,7 @@ func TestDeploy_EnvFileDeletedWhenBuildFails(t *testing.T) {
 
 	manifest := f.validManifest()
 	manifest.Version = 3
+	manifest.Repository = "myapp"
 	manifest.Env = []EnvEntry{{Name: "FOO", SecretRef: "foo.key", Required: true}}
 
 	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
@@ -1987,6 +2017,7 @@ func TestDeploy_NoEnvNoEnvFile(t *testing.T) {
 
 	manifest := f.validManifest()
 	manifest.Version = 3
+	manifest.Repository = "myapp"
 
 	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{
 		docker: f.docker,
@@ -2023,6 +2054,7 @@ func TestDeploy_SecretDirRequiredWhenEnvPresent(t *testing.T) {
 
 	manifest := f.validManifest()
 	manifest.Version = 3
+	manifest.Repository = "myapp"
 	manifest.Env = []EnvEntry{{Name: "FOO", SecretRef: "foo.key", Required: true}}
 
 	_, err := deploy(context.Background(), f.cfg, manifest, f.commit, deployDeps{

@@ -9,12 +9,28 @@ import (
 )
 
 // validManifest returns a Manifest that satisfies every Validate rule
-// against the repo "agentctl". Tests clone it and mutate one field to
-// exercise individual rejection paths.
+// for legacy v1 deploys. Tests that exercise v3 clone it and bump
+// the version together with Repository. The old expectedRepo
+// argument to Validate is gone: the manifest is the single source
+// of truth.
 func validManifest() *Manifest {
 	return &Manifest{
 		Version:       1,
 		App:           "agentctl",
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
+	}
+}
+
+// validV3Manifest returns a Manifest that satisfies every Validate
+// rule for v3 deploys: Application and Repository are both set,
+// Repository matches the app-name regex, and the app/repository
+// pair is the canonical v3 example.
+func validV3Manifest() *Manifest {
+	return &Manifest{
+		Version:       3,
+		App:           "myapp",
+		Repository:    "myapp-backend",
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 	}
@@ -87,7 +103,13 @@ func TestLoad_RejectsMissingFile(t *testing.T) {
 // ---------- Validate ----------
 
 func TestValidate_Valid(t *testing.T) {
-	if err := Validate(validManifest(), "agentctl"); err != nil {
+	if err := Validate(validManifest()); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+}
+
+func TestValidate_ValidV3(t *testing.T) {
+	if err := Validate(validV3Manifest()); err != nil {
 		t.Errorf("Validate: %v", err)
 	}
 }
@@ -96,31 +118,32 @@ func TestValidate_Rejections(t *testing.T) {
 	cases := []struct {
 		name    string
 		mut     func(*Manifest) // nil for the nil-manifest case
-		repo    string
 		wantSub string
 	}{
-		{"nil manifest", nil, "agentctl", "nil manifest"},
-		{"version 0", func(m *Manifest) { m.Version = 0 }, "agentctl", "unsupported version"},
-		{"version negative", func(m *Manifest) { m.Version = -1 }, "agentctl", "unsupported version"},
-		{"app starts with digit", func(m *Manifest) { m.App = "1agentctl" }, "agentctl", "app-name format"},
-		{"app starts with hyphen", func(m *Manifest) { m.App = "-agentctl" }, "agentctl", "app-name format"},
-		{"app ends with hyphen", func(m *Manifest) { m.App = "demo-" }, "agentctl", "app-name format"},
-		{"app too long", func(m *Manifest) { m.App = strings.Repeat("a", 33) }, "agentctl", "app-name format"},
-		{"app empty", func(m *Manifest) { m.App = "" }, "agentctl", "app-name format"},
-		{"app uppercase", func(m *Manifest) { m.App = "Agentctl" }, "agentctl", "app-name format"},
-		{"app underscore", func(m *Manifest) { m.App = "agent_ctl" }, "agentctl", "app-name format"},
-		{"app mismatch expectedRepo", func(m *Manifest) { m.App = "otherapp" }, "agentctl", "does not match expected repo"},
-		{"expectedRepo bad format", func(m *Manifest) {}, "BadFormat", "app-name format"},
-		{"expectedRepo empty", func(m *Manifest) {}, "", "app-name format"},
-		{"expectedRepo with slash", func(m *Manifest) {}, "org/repo", "app-name format"},
-		{"container_port 0", func(m *Manifest) { m.ContainerPort = 0 }, "agentctl", "container_port"},
-		{"container_port below 1024", func(m *Manifest) { m.ContainerPort = 1023 }, "agentctl", "container_port"},
-		{"container_port above 65535", func(m *Manifest) { m.ContainerPort = 65536 }, "agentctl", "container_port"},
-		{"container_port negative", func(m *Manifest) { m.ContainerPort = -1 }, "agentctl", "container_port"},
-		{"health_path missing slash", func(m *Manifest) { m.HealthPath = "healthz" }, "agentctl", "must start with /"},
-		{"health_path empty", func(m *Manifest) { m.HealthPath = "" }, "agentctl", "must start with /"},
-		{"health_path query", func(m *Manifest) { m.HealthPath = "/healthz?ok=1" }, "agentctl", "query string or fragment"},
-		{"health_path fragment", func(m *Manifest) { m.HealthPath = "/healthz#x" }, "agentctl", "query string or fragment"},
+		{"nil manifest", nil, "nil manifest"},
+		{"version 0", func(m *Manifest) { m.Version = 0 }, "unsupported version"},
+		{"version negative", func(m *Manifest) { m.Version = -1 }, "unsupported version"},
+		{"app starts with digit", func(m *Manifest) { m.App = "1agentctl" }, "app-name format"},
+		{"app starts with hyphen", func(m *Manifest) { m.App = "-agentctl" }, "app-name format"},
+		{"app ends with hyphen", func(m *Manifest) { m.App = "demo-" }, "app-name format"},
+		{"app too long", func(m *Manifest) { m.App = strings.Repeat("a", 33) }, "app-name format"},
+		{"app empty", func(m *Manifest) { m.App = "" }, "app-name format"},
+		{"app uppercase", func(m *Manifest) { m.App = "Agentctl" }, "app-name format"},
+		{"app underscore", func(m *Manifest) { m.App = "agent_ctl" }, "app-name format"},
+		{"v3 missing repository", func(m *Manifest) { m.Version = 3; m.Repository = "" }, "repository"},
+		{"v3 repository uppercase", func(m *Manifest) { m.Version = 3; m.Repository = "MyRepo" }, "app-name format"},
+		{"v3 repository with slash", func(m *Manifest) { m.Version = 3; m.Repository = "org/repo" }, "app-name format"},
+		{"v3 repository with colon", func(m *Manifest) { m.Version = 3; m.Repository = "my:repo" }, "app-name format"},
+		{"v3 repository starts with hyphen", func(m *Manifest) { m.Version = 3; m.Repository = "-myrepo" }, "app-name format"},
+		{"v3 repository too long", func(m *Manifest) { m.Version = 3; m.Repository = strings.Repeat("a", 33) }, "app-name format"},
+		{"container_port 0", func(m *Manifest) { m.ContainerPort = 0 }, "container_port"},
+		{"container_port below 1024", func(m *Manifest) { m.ContainerPort = 1023 }, "container_port"},
+		{"container_port above 65535", func(m *Manifest) { m.ContainerPort = 65536 }, "container_port"},
+		{"container_port negative", func(m *Manifest) { m.ContainerPort = -1 }, "container_port"},
+		{"health_path missing slash", func(m *Manifest) { m.HealthPath = "healthz" }, "must start with /"},
+		{"health_path empty", func(m *Manifest) { m.HealthPath = "" }, "must start with /"},
+		{"health_path query", func(m *Manifest) { m.HealthPath = "/healthz?ok=1" }, "query string or fragment"},
+		{"health_path fragment", func(m *Manifest) { m.HealthPath = "/healthz#x" }, "query string or fragment"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -134,7 +157,7 @@ func TestValidate_Rejections(t *testing.T) {
 				}
 				m = mm
 			}
-			err := Validate(m, tc.repo)
+			err := Validate(m)
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tc.wantSub)
 			}
@@ -145,6 +168,43 @@ func TestValidate_Rejections(t *testing.T) {
 	}
 }
 
+func TestValidate_V3AppAndRepositoryMayDiffer(t *testing.T) {
+	// app == repository is the legacy v1 case; v3 must permit
+	// different values for App and Repository. The daemon cares
+	// only that each name matches the safe-name regex; the
+	// orchestrator uses Repository for source resolution and
+	// App for hostname / state / container naming.
+	m := &Manifest{
+		Version:       3,
+		App:           "crons",
+		Repository:    "cron-dashboard",
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
+	}
+	if err := Validate(m); err != nil {
+		t.Errorf("v3 manifest with app != repository must validate: %v", err)
+	}
+}
+
+func TestValidate_V3MismatchedAppAndRepositoryAccepted(t *testing.T) {
+	// The previous design rejected manifests whose app did not
+	// match the expected repo. v3 explicitly removes that
+	// constraint: app and repository are independent fields and
+	// are allowed to differ. The daemon uses app for the API
+	// path / hostname / state key, and repository for the
+	// source mirror.
+	m := &Manifest{
+		Version:       3,
+		App:           "production-crons",
+		Repository:    "cron-dashboard",
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
+	}
+	if err := Validate(m); err != nil {
+		t.Errorf("v3 app != repository must validate: %v", err)
+	}
+}
+
 func TestValidate_AcceptsTwoCharName(t *testing.T) {
 	m := &Manifest{
 		Version:       1,
@@ -152,7 +212,7 @@ func TestValidate_AcceptsTwoCharName(t *testing.T) {
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 	}
-	if err := Validate(m, "a1"); err != nil {
+	if err := Validate(m); err != nil {
 		t.Errorf("two-character name a1 should validate: %v", err)
 	}
 }
@@ -169,7 +229,7 @@ func TestValidate_AcceptsThirtyTwoCharName(t *testing.T) {
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 	}
-	if err := Validate(m, name); err != nil {
+	if err := Validate(m); err != nil {
 		t.Errorf("32-character name should validate: %v", err)
 	}
 }
@@ -185,21 +245,35 @@ func TestValidate_RejectsThirtyThreeCharName(t *testing.T) {
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 	}
-	if err := Validate(m, name); err == nil {
+	if err := Validate(m); err == nil {
 		t.Errorf("33-character name should be rejected")
 	}
 }
 
-func TestValidate_AppNameFormatAppliesToExpectedRepo(t *testing.T) {
-	m := validManifest()
-	if err := Validate(m, "Agentctl"); err == nil {
-		t.Errorf("expected error for uppercase expectedRepo")
+func TestValidate_AppNameFormatAppliesToRepository(t *testing.T) {
+	// Both App and Repository must individually match the
+	// safe-name regex on v3. The previous design also required
+	// Validates callers to pass an expectedRepo argument; the
+	// new design reads Repository from the manifest.
+	m := &Manifest{
+		Version:       3,
+		App:           "agentctl",
+		Repository:    "agentctl",
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
 	}
-	if err := Validate(m, "1-agentctl"); err == nil {
-		t.Errorf("expected error for digit-prefixed expectedRepo")
+	if err := Validate(m); err != nil {
+		t.Errorf("v3 with valid app+repository should validate: %v", err)
 	}
-	if err := Validate(m, "agentctl"); err != nil {
-		t.Errorf("agentctl should validate: %v", err)
+	bad := *m
+	bad.Repository = "Agentctl"
+	if err := Validate(&bad); err == nil {
+		t.Errorf("uppercase Repository should be rejected")
+	}
+	bad = *m
+	bad.Repository = "1-agentctl"
+	if err := Validate(&bad); err == nil {
+		t.Errorf("digit-prefixed Repository should be rejected")
 	}
 }
 
@@ -210,7 +284,7 @@ func TestValidate_AcceptsVersion2WithoutData(t *testing.T) {
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 	}
-	if err := Validate(m, "agentctl"); err != nil {
+	if err := Validate(m); err != nil {
 		t.Errorf("version 2 without data should validate: %v", err)
 	}
 }
@@ -234,7 +308,7 @@ func TestValidate_AcceptsVersion2WithDataMount(t *testing.T) {
 				HealthPath:    "/healthz",
 				Data:          &ManifestData{Mount: tc.mount, ReadOnly: tc.readOnly},
 			}
-			if err := Validate(m, "agentctl"); err != nil {
+			if err := Validate(m); err != nil {
 				t.Errorf("version 2 with data %+v should validate: %v", tc, err)
 			}
 		})
@@ -249,7 +323,7 @@ func TestValidate_RejectsVersion1WithDataField(t *testing.T) {
 		HealthPath:    "/healthz",
 		Data:          &ManifestData{Mount: true},
 	}
-	err := Validate(m, "agentctl")
+	err := Validate(m)
 	if err == nil {
 		t.Fatalf("expected error for version 1 with data field")
 	}
@@ -305,7 +379,7 @@ func TestLoad_RejectsUnknownFieldInData(t *testing.T) {
 // ---------- v3 / env / host_source ----------
 
 func TestLoad_Version3WithoutDataOrEnv(t *testing.T) {
-	path := writeDeploy(t, `{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz"}`)
+	path := writeDeploy(t, `{"version":3,"app":"agentctl","repository":"agentctl","container_port":8080,"health_path":"/healthz"}`)
 	got, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -322,7 +396,7 @@ func TestLoad_Version3WithoutDataOrEnv(t *testing.T) {
 }
 
 func TestLoad_Version3WithEnv(t *testing.T) {
-	path := writeDeploy(t, `{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"}]}`)
+	path := writeDeploy(t, `{"version":3,"app":"agentctl","repository":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"}]}`)
 	got, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -337,7 +411,7 @@ func TestLoad_Version3WithEnv(t *testing.T) {
 }
 
 func TestLoad_Version3WithDataAndEnv(t *testing.T) {
-	path := writeDeploy(t, `{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz","data":{"mount":true,"host_source":"/srv/data","container_path":"/srv"},"env":[{"name":"FOO","secret_ref":"foo.key","required":true}]}`)
+	path := writeDeploy(t, `{"version":3,"app":"agentctl","repository":"agentctl","container_port":8080,"health_path":"/healthz","data":{"mount":true,"host_source":"/srv/data","container_path":"/srv"},"env":[{"name":"FOO","secret_ref":"foo.key","required":true}]}`)
 	got, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -368,7 +442,7 @@ func TestLoad_RejectsVersion2WithEnv(t *testing.T) {
 }
 
 func TestLoad_EnvEntryRejectsEmptyName(t *testing.T) {
-	path := writeDeploy(t, `{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"","secret_ref":"foo.key"}]}`)
+	path := writeDeploy(t, `{"version":3,"app":"agentctl","repository":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"","secret_ref":"foo.key"}]}`)
 	if _, err := Load(path); err == nil {
 		t.Errorf("expected error for empty env name")
 	}
@@ -390,7 +464,7 @@ func TestLoad_EnvEntryRejectsBadSecretRef(t *testing.T) {
 	}
 	for _, ref := range cases {
 		t.Run(ref, func(t *testing.T) {
-			body := fmt.Sprintf(`{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"X","secret_ref":%q}]}`, ref)
+			body := fmt.Sprintf(`{"version":3,"app":"agentctl","repository":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"X","secret_ref":%q}]}`, ref)
 			path := writeDeploy(t, body)
 			if _, err := Load(path); err == nil {
 				t.Errorf("expected error for secret_ref %q", ref)
@@ -413,7 +487,7 @@ func TestLoad_EnvEntryAcceptsValidSecretRefs(t *testing.T) {
 	}
 	for _, ref := range cases {
 		t.Run(ref, func(t *testing.T) {
-			body := fmt.Sprintf(`{"version":3,"app":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"X","secret_ref":%q}]}`, ref)
+			body := fmt.Sprintf(`{"version":3,"app":"agentctl","repository":"agentctl","container_port":8080,"health_path":"/healthz","env":[{"name":"X","secret_ref":%q}]}`, ref)
 			path := writeDeploy(t, body)
 			if _, err := Load(path); err != nil {
 				t.Errorf("expected accept %q, got %v", ref, err)
@@ -426,10 +500,11 @@ func TestValidate_AcceptsVersion3WithoutEnv(t *testing.T) {
 	m := &Manifest{
 		Version:       3,
 		App:           "agentctl",
+		Repository:    "agentctl",
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 	}
-	if err := Validate(m, "agentctl"); err != nil {
+	if err := Validate(m); err != nil {
 		t.Errorf("version 3 without env should validate: %v", err)
 	}
 }
@@ -438,11 +513,12 @@ func TestValidate_AcceptsVersion3WithEnv(t *testing.T) {
 	m := &Manifest{
 		Version:       3,
 		App:           "agentctl",
+		Repository:    "agentctl",
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 		Env:           []EnvEntry{{Name: "FOO", SecretRef: "foo.key"}},
 	}
-	if err := Validate(m, "agentctl"); err != nil {
+	if err := Validate(m); err != nil {
 		t.Errorf("version 3 with env should validate: %v", err)
 	}
 }
@@ -451,6 +527,7 @@ func TestValidate_RejectsDuplicateEnvNames(t *testing.T) {
 	m := &Manifest{
 		Version:       3,
 		App:           "agentctl",
+		Repository:    "agentctl",
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 		Env: []EnvEntry{
@@ -458,7 +535,7 @@ func TestValidate_RejectsDuplicateEnvNames(t *testing.T) {
 			{Name: "FOO", SecretRef: "foo2.key"},
 		},
 	}
-	err := Validate(m, "agentctl")
+	err := Validate(m)
 	if err == nil {
 		t.Fatalf("expected error for duplicate env name")
 	}
@@ -474,11 +551,12 @@ func TestValidate_RejectsV3WithDangerousContainerPath(t *testing.T) {
 			m := &Manifest{
 				Version:       3,
 				App:           "agentctl",
+				Repository:    "agentctl",
 				ContainerPort: 8080,
 				HealthPath:    "/healthz",
 				Data:          &ManifestData{Mount: true, HostSource: "/srv/data", ContainerPath: p},
 			}
-			err := Validate(m, "agentctl")
+			err := Validate(m)
 			if err == nil {
 				t.Errorf("expected error for container_path %q", p)
 			}
@@ -493,11 +571,76 @@ func TestValidate_AcceptsV3WithSafeContainerPath(t *testing.T) {
 	m := &Manifest{
 		Version:       3,
 		App:           "agentctl",
+		Repository:    "agentctl",
 		ContainerPort: 8080,
 		HealthPath:    "/healthz",
 		Data:          &ManifestData{Mount: true, HostSource: "/srv/data", ContainerPath: "/srv/app"},
 	}
-	if err := Validate(m, "agentctl"); err != nil {
+	if err := Validate(m); err != nil {
 		t.Errorf("expected accept /srv/app, got %v", err)
+	}
+}
+
+// ---------- v3 / repository ----------
+
+// TestLoad_Version3WithRepository is the canonical v3 happy path:
+// app + repository both set. Repository mirrors the app-name
+// regex and is used by the daemon to derive the trusted origin
+// URL.
+func TestLoad_Version3WithRepository(t *testing.T) {
+	path := writeDeploy(t, `{"version":3,"app":"myapp","repository":"myapp-backend","container_port":8080,"health_path":"/healthz"}`)
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Repository != "myapp-backend" {
+		t.Errorf("Repository = %q, want myapp-backend", got.Repository)
+	}
+	if got.App != "myapp" {
+		t.Errorf("App = %q, want myapp", got.App)
+	}
+	if got.App == got.Repository {
+		t.Errorf("test expected different app and repository; got both = %q", got.App)
+	}
+}
+
+// TestLoad_Version3WithoutRepositoryRejected is the spec-mandated
+// rejection: a v3 manifest without a repository field is invalid
+// and must be refused at Load time so the source layer never sees
+// it.
+func TestLoad_Version3WithoutRepositoryRejected(t *testing.T) {
+	path := writeDeploy(t, `{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz"}`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatalf("expected error for v3 manifest without repository")
+	}
+	if !strings.Contains(err.Error(), "repository") {
+		t.Errorf("expected error mentioning repository, got %q", err.Error())
+	}
+}
+
+// TestLoad_Version1WithRepositoryRejected ensures v1 manifests
+// never accept the new field (it is a v3 feature).
+func TestLoad_Version1WithRepositoryRejected(t *testing.T) {
+	path := writeDeploy(t, `{"version":1,"app":"myapp","repository":"myapp-backend","container_port":8080,"health_path":"/healthz"}`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatalf("expected error for v1 manifest with repository")
+	}
+	if !strings.Contains(err.Error(), "version 1") || !strings.Contains(err.Error(), "repository") {
+		t.Errorf("expected error mentioning version 1 and repository, got %q", err.Error())
+	}
+}
+
+// TestLoad_Version2WithRepositoryRejected ensures v2 manifests
+// never accept the new field (it is a v3 feature).
+func TestLoad_Version2WithRepositoryRejected(t *testing.T) {
+	path := writeDeploy(t, `{"version":2,"app":"myapp","repository":"myapp-backend","container_port":8080,"health_path":"/healthz"}`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatalf("expected error for v2 manifest with repository")
+	}
+	if !strings.Contains(err.Error(), "version 3") || !strings.Contains(err.Error(), "repository") {
+		t.Errorf("expected error mentioning version 3 and repository, got %q", err.Error())
 	}
 }

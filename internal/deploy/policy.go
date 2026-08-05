@@ -6,26 +6,34 @@ import (
 	"strings"
 )
 
-// Validate enforces project policy on a parsed manifest. expectedRepo
-// is the repository short name the manifest is being deployed for
-// (e.g. "agentctl"); it must match the app-name regex and must equal
-// m.App. Returns nil when all checks pass, otherwise a descriptive
-// error.
+// Validate enforces project policy on a parsed manifest. The
+// manifest is the single source of truth for both the deployment
+// identity (App) and the source-resolution repository (Repository);
+// Validate never takes a separate "expected repo" argument and
+// never derives the repository from the app name.
 //
 // Versions accepted:
 //
-//	1 — single HTTP container, no data mount, no env (legacy contract).
+//	1 — single HTTP container, no data mount, no env, no repository
+//	    (legacy contract). The repository field is rejected at
+//	    parse time by Load, so a v1 manifest that reaches Validate
+//	    has Repository == "".
 //	2 — single HTTP container; optional data mount declared by the
 //	    "data" field. When the "data" field is absent the deployment
 //	    is identical to version 1 in behaviour. When it is present,
 //	    the deployment opts into the per-app persistent data
 //	    directory; see docs/DEPLOYMENT.md for the host-side layout.
-//	3 — adds an optional "env" array for per-app secret injection.
+//	3 — adds a REQUIRED "repository" field (GitHub repo short name;
+//	    the daemon derives the trusted origin URL internally from
+//	    the configured org + repository) and an optional "env" array
+//	    for per-app secret injection.
 //
-// A version-1 manifest that contains a "data" or "env" field is
-// rejected: both features explicitly postdate v1, and silently
-// accepting either on v1 would be a contract change.
-func Validate(m *Manifest, expectedRepo string) error {
+// A version-1 manifest that contains a "data", "env", or
+// "repository" field is rejected by Load before Validate sees it.
+// Similarly, a version-2 manifest with an "env" or "repository"
+// field is rejected by Load. Validate therefore only checks the
+// shape of fields that are valid for the declared version.
+func Validate(m *Manifest) error {
 	if m == nil {
 		return fmt.Errorf("nil manifest")
 	}
@@ -43,14 +51,22 @@ func Validate(m *Manifest, expectedRepo string) error {
 			return fmt.Errorf("env field requires manifest version 3 (current version is 2)")
 		}
 	}
-	if !appNameRe.MatchString(expectedRepo) {
-		return fmt.Errorf("expected repo %q does not match app-name format", expectedRepo)
+	if m.Version == 3 && m.Repository == "" {
+		// Defensive: Load already rejects this. Kept here so a
+		// manifest constructed in-memory (tests, future code
+		// paths) cannot bypass the requirement.
+		return fmt.Errorf("repository field is required for version 3 manifests")
 	}
 	if !appNameRe.MatchString(m.App) {
 		return fmt.Errorf("manifest app %q does not match app-name format", m.App)
 	}
-	if m.App != expectedRepo {
-		return fmt.Errorf("manifest app %q does not match expected repo %q", m.App, expectedRepo)
+	// Repository is required for v3; for v1/v2 it is empty and
+	// the regex check is skipped. App and Repository are allowed
+	// to differ; both names must individually match the safe
+	// short-name regex so they can be embedded in URLs, hostnames,
+	// and filesystem paths.
+	if m.Repository != "" && !appNameRe.MatchString(m.Repository) {
+		return fmt.Errorf("manifest repository %q does not match app-name format", m.Repository)
 	}
 	if m.ContainerPort < 1024 || m.ContainerPort > 65535 {
 		return fmt.Errorf("container_port %d out of range [1024, 65535]", m.ContainerPort)

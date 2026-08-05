@@ -183,13 +183,6 @@ func validateDeployConfig(cfg DeployConfig, manifest Manifest) error {
 			message:     "Source.RepositoryRoot is required",
 		}
 	}
-	if cfg.Source.OriginURL == "" {
-		return &deployError{
-			primary:     ErrDeploymentFailed,
-			secondaries: []error{ErrInvalidDeployInput},
-			message:     "Source.OriginURL is required",
-		}
-	}
 	if cfg.Source.AllowedOrg == "" {
 		return &deployError{
 			primary:     ErrDeploymentFailed,
@@ -267,6 +260,22 @@ func validateDeployConfig(cfg DeployConfig, manifest Manifest) error {
 			message:     fmt.Sprintf("manifest app %q does not match app-name format", manifest.App),
 		}
 	}
+	if manifest.Version == 3 {
+		if manifest.Repository == "" {
+			return &deployError{
+				primary:     ErrDeploymentFailed,
+				secondaries: []error{ErrInvalidDeployInput},
+				message:     "manifest repository is required for version 3 manifests",
+			}
+		}
+		if !appNameRe.MatchString(manifest.Repository) {
+			return &deployError{
+				primary:     ErrDeploymentFailed,
+				secondaries: []error{ErrInvalidDeployInput},
+				message:     fmt.Sprintf("manifest repository %q does not match app-name format", manifest.Repository),
+			}
+		}
+	}
 	if manifest.Version != 1 && manifest.Version != 2 && manifest.Version != 3 {
 		return &deployError{
 			primary:     ErrDeploymentFailed,
@@ -337,7 +346,19 @@ func deploy(ctx context.Context, cfg DeployConfig, manifest Manifest, commit str
 	// 3. Prepare trusted source checkout. The source layer
 	//    validates the commit (40 hex chars, reachable from
 	//    origin/main) and produces a detached checkout directory.
-	source, err := CheckoutSource(ctx, cfg.Source, cfg.Source.AllowedOrg, manifest.App, commit)
+	//    The repository short name is taken verbatim from
+	//    manifest.Repository; the daemon derives the trusted
+	//    origin URL internally from cfg.Source.AllowedOrg +
+	//    repository. validateDeployConfig has already enforced
+	//    that a v3 manifest declares a non-empty Repository
+	//    that matches appNameRe, so by this point sourceRepo is
+	//    always set on the supported path. A v1/v2 manifest
+	//    (no Repository field) would reach CheckoutSource with
+	//    an empty repository and be rejected by the source
+	//    layer's regex check; there is no app-equals-repo
+	//    compatibility bridge.
+	sourceRepo := manifest.Repository
+	source, err := CheckoutSource(ctx, cfg.Source, sourceRepo, commit)
 	if err != nil {
 		return nil, &deployError{
 			primary:     ErrDeploymentFailed,

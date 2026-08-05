@@ -129,7 +129,6 @@ func setupValidCheckout(t *testing.T) (string, RuntimeConfig) {
 // runtimeSource returns a SourceResult matching the given checkout path.
 func runtimeSource(checkout string) SourceResult {
 	return SourceResult{
-		Organisation: "myorg",
 		Repository:   "myapp",
 		Commit:       strings.Repeat("a", 40),
 		CheckoutPath: checkout,
@@ -770,5 +769,85 @@ func TestStartCandidate_HealthCancellationStillCleansUp(t *testing.T) {
 	}
 	if runner.ContextCancelledAt(logsIndex) {
 		t.Errorf("docker logs received an already-cancelled context (call index %d)", logsIndex)
+	}
+}
+
+// setupV3ManifestMatchingSource builds a minimal valid v3 environment
+// for testing the runtime's repository-invariant check: a temp
+// RepositoryRoot containing the expected derived checkout directory
+// at <root>/<repository>-checkouts/<commit> with a regular Dockerfile,
+// plus a v3 manifest and a SourceResult that share the same
+// <repository> short name. App and Repository are passed in
+// independently so tests can express the "app != repository" case
+// explicitly. The returned (cfg, manifest, source) tuple is ready
+// to feed validateRuntimeInputs.
+func setupV3ManifestMatchingSource(t *testing.T, app, repository string) (RuntimeConfig, Manifest, SourceResult) {
+	t.Helper()
+	root := t.TempDir()
+	commit := strings.Repeat("a", 40)
+	checkout := filepath.Join(root, repository+"-checkouts", commit)
+	if err := os.MkdirAll(checkout, 0o755); err != nil {
+		t.Fatalf("mkdir checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatalf("write Dockerfile: %v", err)
+	}
+	cfg := RuntimeConfig{
+		PortRangeStart: 49152,
+		PortRangeEnd:   49200,
+		HealthTimeout:  3 * time.Second,
+		RepositoryRoot: root,
+	}
+	manifest := Manifest{
+		Version:       3,
+		App:           app,
+		Repository:    repository,
+		ContainerPort: 8080,
+		HealthPath:    "/healthz",
+	}
+	source := SourceResult{
+		Repository:   repository,
+		Commit:       commit,
+		CheckoutPath: checkout,
+		MirrorPath:   "/some/mirror",
+	}
+	return cfg, manifest, source
+}
+
+// TestValidateRuntimeInputs_V3RepositoryMatches is the positive case
+// for the v3 repository invariant: a v3 manifest whose Repository
+// field equals source.Repository passes the runtime check, even
+// when App and Repository are deliberately independent fields.
+func TestValidateRuntimeInputs_V3RepositoryMatches(t *testing.T) {
+	cfg, manifest, source := setupV3ManifestMatchingSource(t, "alpha", "beta")
+	if err := validateRuntimeInputs(cfg, manifest, source); err != nil {
+		t.Errorf("validateRuntimeInputs returned error with matching Repository: %v", err)
+	}
+}
+
+// TestValidateRuntimeInputs_V3RepositoryMismatchRejected is the
+// negative case: a v3 manifest whose Repository field disagrees
+// with source.Repository must be rejected before any image is
+// built or any container is started.
+func TestValidateRuntimeInputs_V3RepositoryMismatchRejected(t *testing.T) {
+	cfg, manifest, source := setupV3ManifestMatchingSource(t, "alpha", "beta")
+	manifest.Repository = "beta"
+	source.Repository = "gamma"
+	if err := validateRuntimeInputs(cfg, manifest, source); err == nil {
+		t.Fatal("expected error from Repository mismatch, got nil")
+	}
+}
+
+// TestValidateRuntimeInputs_V3RepositoryMismatchWrapsErrInvalidInputs
+// proves the rejection in the mismatch case wraps the
+// ErrInvalidInputs sentinel so callers can branch on it via
+// errors.Is.
+func TestValidateRuntimeInputs_V3RepositoryMismatchWrapsErrInvalidInputs(t *testing.T) {
+	cfg, manifest, source := setupV3ManifestMatchingSource(t, "alpha", "beta")
+	manifest.Repository = "beta"
+	source.Repository = "gamma"
+	err := validateRuntimeInputs(cfg, manifest, source)
+	if !errors.Is(err, ErrInvalidInputs) {
+		t.Errorf("expected error to wrap ErrInvalidInputs, got %v", err)
 	}
 }

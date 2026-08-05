@@ -32,7 +32,6 @@ func minimalConfig(socketPath string) *Config {
 		Source: deploy.SourceConfig{
 			AllowedOrg:     "acme",
 			RepositoryRoot: "/srv/agentctl/repos",
-			OriginURL:      "https://github.com/acme/example.git",
 		},
 		Runtime: deploy.RuntimeConfig{
 			PortRangeStart: 40000,
@@ -688,30 +687,11 @@ func TestListenAndServe_BindsWithConfiguredWriteTimeout(t *testing.T) {
 // uses its real source-verification path against an actual local
 // git remote so VerifyCommit's behaviour is covered end-to-end.
 func TestInspectHandler_DoesNotCreateCheckout(t *testing.T) {
-	remoteDir := t.TempDir()
-	runGit := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = remoteDir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	runGit("init", "-q", "-b", "main", remoteDir)
-	runGit("config", "user.email", "test@example.com")
-	runGit("config", "user.name", "Test")
-	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
-	mainSHA := runGit("rev-parse", "HEAD")
-	if len(mainSHA) != 40 {
-		t.Fatalf("setupRemote mainSHA = %q (len %d, want 40)", mainSHA, len(mainSHA))
-	}
+	mainSHA := seedInspectRemote(t, "acme", "myapp")
 
 	repoRoot := t.TempDir()
 	cfg := minimalConfig(filepath.Join(t.TempDir(), "agentctl.sock"))
 	cfg.Source.RepositoryRoot = repoRoot
-	cfg.Source.OriginURL = remoteDir
 	cfg.Source.AllowedOrg = "acme"
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
@@ -719,7 +699,7 @@ func TestInspectHandler_DoesNotCreateCheckout(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":1,"app":"myapp","container_port":8080,"health_path":"/healthz"}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz"}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
@@ -798,7 +778,7 @@ func TestSlowDeployer_ResponseDelivered(t *testing.T) {
 		t.Fatalf("socket did not appear: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":1,"app":"example","container_port":8080,"health_path":"/healthz"}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"example","repository":"example","container_port":8080,"health_path":"/healthz"}`)
 	body, err := json.Marshal(map[string]any{
 		"commit":   strings.Repeat("a", 40),
 		"manifest": manifestJSON,
@@ -1081,7 +1061,7 @@ func TestListenAndServe_ShutdownWaitsForActiveDeploy(t *testing.T) {
 		t.Fatalf("socket did not appear: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":1,"app":"example","container_port":8080,"health_path":"/healthz"}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"example","repository":"example","container_port":8080,"health_path":"/healthz"}`)
 	body, err := json.Marshal(map[string]any{
 		"commit":   strings.Repeat("a", 40),
 		"manifest": manifestJSON,
@@ -1363,57 +1343,6 @@ func minimalConfigWithSecrets(socketPath, secretDir string) *Config {
 	return cfg
 }
 
-// inspectHandlerEnv builds a server + inspect handler invocation
-// that uses a local git remote and a v3 manifest with the supplied
-// env entries. Returns the response and recorder so tests can
-// inspect body, status, and decoded response.
-func inspectHandlerEnv(t *testing.T, manifestJSON string, env []deploy.EnvEntry) (*httptest.ResponseRecorder, *InspectResponse) {
-	t.Helper()
-
-	remoteDir := t.TempDir()
-	runGit := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = remoteDir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	runGit("init", "-q", "-b", "main", remoteDir)
-	runGit("config", "user.email", "test@example.com")
-	runGit("config", "user.name", "Test")
-	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
-	mainSHA := runGit("rev-parse", "HEAD")
-
-	cfg := minimalConfig(filepath.Join(t.TempDir(), "agentctl.sock"))
-	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
-
-	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
-	body, err := json.Marshal(map[string]any{
-		"app":      "myapp",
-		"commit":   mainSHA,
-		"manifest": json.RawMessage(manifestJSON),
-	})
-	if err != nil {
-		t.Fatalf("marshal request body: %v", err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/inspect", bytes.NewReader(body))
-	w := httptest.NewRecorder()
-	srv.handleInspect(w, req)
-	var resp InspectResponse
-	if err := json.NewDecoder(bytes.NewReader(w.Body.Bytes())).Decode(&resp); err != nil {
-		t.Fatalf("decode inspect response: %v", err)
-	}
-	return w, &resp
-}
-
 func TestInspectHandler_EnvStatusesConfigured(t *testing.T) {
 	secretDir := t.TempDir()
 	// foo.key configured; bar.key (optional) missing.
@@ -1425,32 +1354,16 @@ func TestInspectHandler_EnvStatusesConfigured(t *testing.T) {
 	}
 
 	cfg := minimalConfigWithSecrets(filepath.Join(t.TempDir(), "agentctl.sock"), secretDir)
-	remoteDir := t.TempDir()
-	runGit := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = remoteDir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	runGit("init", "-q", "-b", "main", remoteDir)
-	runGit("config", "user.email", "test@example.com")
-	runGit("config", "user.name", "Test")
-	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
-	mainSHA := runGit("rev-parse", "HEAD")
+	mainSHA := seedInspectRemote(t, "acme", "myapp")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key","required":true},{"name":"BAR","secret_ref":"bar.key"}]}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key","required":true},{"name":"BAR","secret_ref":"bar.key"}]}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
@@ -1525,32 +1438,16 @@ func TestInspectHandler_EnvStatusesAllConfigured(t *testing.T) {
 	}
 
 	cfg := minimalConfigWithSecrets(filepath.Join(t.TempDir(), "agentctl.sock"), secretDir)
-	remoteDir := t.TempDir()
-	runGit := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = remoteDir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	runGit("init", "-q", "-b", "main", remoteDir)
-	runGit("config", "user.email", "test@example.com")
-	runGit("config", "user.name", "Test")
-	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
-	mainSHA := runGit("rev-parse", "HEAD")
+	mainSHA := seedInspectRemote(t, "acme", "myapp")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"},{"name":"BAR","secret_ref":"bar.key"}]}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"},{"name":"BAR","secret_ref":"bar.key"}]}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
@@ -1593,32 +1490,16 @@ func TestInspectHandler_NoEnvNoEnvStatuses(t *testing.T) {
 	// V3 manifest without env entries: env_statuses must be empty.
 	secretDir := t.TempDir()
 	cfg := minimalConfigWithSecrets(filepath.Join(t.TempDir(), "agentctl.sock"), secretDir)
-	remoteDir := t.TempDir()
-	runGit := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = remoteDir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	runGit("init", "-q", "-b", "main", remoteDir)
-	runGit("config", "user.email", "test@example.com")
-	runGit("config", "user.name", "Test")
-	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
-	mainSHA := runGit("rev-parse", "HEAD")
+	mainSHA := seedInspectRemote(t, "acme", "myapp")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz"}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz"}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
@@ -1653,32 +1534,16 @@ func TestInspectHandler_EnvStatusesRequiredMissingFails(t *testing.T) {
 	secretDir := t.TempDir()
 	// No secrets at all: every required env entry will be missing.
 	cfg := minimalConfigWithSecrets(filepath.Join(t.TempDir(), "agentctl.sock"), secretDir)
-	remoteDir := t.TempDir()
-	runGit := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = remoteDir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	runGit("init", "-q", "-b", "main", remoteDir)
-	runGit("config", "user.email", "test@example.com")
-	runGit("config", "user.name", "Test")
-	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
-	mainSHA := runGit("rev-parse", "HEAD")
+	mainSHA := seedInspectRemote(t, "acme", "myapp")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key","required":true}]}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key","required":true}]}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
@@ -1728,32 +1593,16 @@ func TestInspectHandler_EnvStatusesRequiredMissingFails(t *testing.T) {
 func TestInspectHandler_EnvStatusesOptionalMissingPasses(t *testing.T) {
 	secretDir := t.TempDir()
 	cfg := minimalConfigWithSecrets(filepath.Join(t.TempDir(), "agentctl.sock"), secretDir)
-	remoteDir := t.TempDir()
-	runGit := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = remoteDir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	runGit("init", "-q", "-b", "main", remoteDir)
-	runGit("config", "user.email", "test@example.com")
-	runGit("config", "user.name", "Test")
-	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
-	mainSHA := runGit("rev-parse", "HEAD")
+	mainSHA := seedInspectRemote(t, "acme", "myapp")
 
 	cfg.Source.RepositoryRoot = t.TempDir()
-	cfg.Source.OriginURL = remoteDir
 
 	srv, err := NewServerWithDeployer(cfg, audit.New(io.Discard), realDeployer{}, execDockerRunner{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"}]}`)
+	manifestJSON := json.RawMessage(`{"version":3,"app":"myapp","repository":"myapp","container_port":8080,"health_path":"/healthz","env":[{"name":"FOO","secret_ref":"foo.key"}]}`)
 	body, err := json.Marshal(map[string]any{
 		"app":      "myapp",
 		"commit":   mainSHA,
@@ -1783,4 +1632,63 @@ func TestInspectHandler_EnvStatusesOptionalMissingPasses(t *testing.T) {
 	if resp.EnvStatuses[0].Required {
 		t.Errorf("FOO required=true, want false")
 	}
+}
+
+// seedInspectRemote creates a local non-bare git repository
+// at <tmp>/remote and configures git's URL rewrite so the
+// production-derived https://github.com/<org>/<repo>.git URL
+// fetches from the local remote. This is the test-only channel
+// for pointing the source layer at a local file remote: the
+// production SourceConfig derives the URL from
+// cfg.Source.AllowedOrg + the validated repository, but the
+// test process rewrites that exact URL via GIT_CONFIG_GLOBAL.
+// The mirror's remote.origin.url is set to the URL passed to
+// clone (the production-derived URL, not the rewritten one),
+// so ensureMirror's URL verification still matches. Subsequent
+// fetches use the rewrite to keep fetching from the local
+// remote.
+//
+// Production callers cannot reach this helper: there is no
+// exported way to inject a local remote into SourceConfig.
+// The reflection test in source_test.go enforces that the
+// SourceConfig type exposes no exported field or method
+// capable of overriding the origin URL, base URL, or
+// organisation.
+//
+// Returns the main branch SHA.
+func seedInspectRemote(t *testing.T, org, repo string) string {
+	t.Helper()
+	root := t.TempDir()
+	remoteDir := filepath.Join(root, "remote")
+	if err := os.MkdirAll(remoteDir, 0o755); err != nil {
+		t.Fatalf("mkdir remote: %v", err)
+	}
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = remoteDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init", "-q", "-b", "main", remoteDir)
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	runGit("commit", "--allow-empty", "-q", "-m", "first commit on main")
+	mainSHA := runGit("rev-parse", "HEAD")
+	if len(mainSHA) != 40 {
+		t.Fatalf("seedInspectRemote mainSHA = %q (len %d, want 40)", mainSHA, len(mainSHA))
+	}
+	configPath := filepath.Join(root, "gitconfig")
+	expectedURL := fmt.Sprintf("https://github.com/%s/%s.git", org, repo)
+	localURL := "file://" + remoteDir
+	content := fmt.Sprintf("[url %q]\n\tinsteadOf = %s\n", localURL, expectedURL)
+	if err := os.WriteFile(configPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write gitconfig: %v", err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", configPath)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	return mainSHA
 }

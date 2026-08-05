@@ -371,14 +371,12 @@ AGENTCTLD_MAX_REQUEST_BYTES=65536
 # other content under this path.
 AGENTCTLD_SOURCE_REPOSITORY_ROOT=/var/lib/agentctld/sources
 
-# Trusted remote URL. The daemon validates that the bare mirror's
-# `remote.origin.url` matches this on every deploy; a mismatch is
-# fatal. Use the form `https://github.com/<org>/<repo>.git`.
-AGENTCTLD_SOURCE_ORIGIN_URL=https://github.com/<your-org>/<your-repo>.git
-
-# Expected GitHub organisation. Every deploy's `app` value is
-# matched against this in addition to the app-name regex. The
-# bare mirror's origin URL must belong to this organisation.
+# Expected GitHub organisation. The per-app origin URL is derived
+# internally as `https://github.com/<org>/<repository>.git` where
+# `<repository>` comes from the manifest's `repository` field.
+# The caller never supplies a URL, a base URL, or an org. The
+# daemon validates that the bare mirror's `remote.origin.url`
+# matches the derived URL on every deploy; a mismatch is fatal.
 AGENTCTLD_SOURCE_ALLOWED_ORG=<your-org>
 
 # ─── Runtime layer ────────────────────────────────────────────────
@@ -461,7 +459,6 @@ AGENTCTLD_DATA_ROOT=/var/lib/agentctld/data
 | `AGENTCTLD_MAX_REQUEST_BYTES` | no | `65536` | Max request body bytes |
 | `AGENTCTLD_AUDIT_LOG` | no | stderr | Path for structured audit log |
 | `AGENTCTLD_SOURCE_REPOSITORY_ROOT` | yes | — | Source mirror + checkouts |
-| `AGENTCTLD_SOURCE_ORIGIN_URL` | yes | — | Trusted origin URL |
 | `AGENTCTLD_SOURCE_ALLOWED_ORG` | yes | — | Expected GitHub org |
 | `AGENTCTLD_RUNTIME_PORT_RANGE_START` | yes | — | Inclusive port range start |
 | `AGENTCTLD_RUNTIME_PORT_RANGE_END` | yes | — | Inclusive port range end |
@@ -1015,7 +1012,7 @@ untrusted workloads.
 
 - **The daemon's own network access is unrestricted beyond
   address-family restrictions.** It will talk to any
-  `github.com` host (or whatever `AGENTCTLD_SOURCE_ORIGIN_URL`
+  `github.com` host (or whatever `AGENTCTLD_SOURCE_ALLOWED_ORG` + `manifest.repository` (derived per-app))
   points to), any loopback address, and any reachable host on
   the configured DNS resolvers. Operators behind a proxy must
   configure Git's proxy settings at the system level.
