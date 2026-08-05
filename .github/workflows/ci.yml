@@ -29,6 +29,14 @@ jobs:
         run: go vet ./...
 
       - name: Test
+        env:
+          # GitHub Actions ubuntu-latest runners mount /tmp as a
+          # noexec tmpfs, so `go test` cannot fork/exec the test
+          # binary it builds under $TMPDIR/go-build*/b*/*test by
+          # default. Redirect Go's temp/build dir to a writable,
+          # exec-capable path. Matches the local validation
+          # command in the PR description.
+          GOTMPDIR: /tmp/agentctl-test
         run: go test -race ./...
 
       - name: Install Gitleaks
