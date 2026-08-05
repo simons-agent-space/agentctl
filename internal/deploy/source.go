@@ -49,9 +49,17 @@ type SourceConfig struct {
 	// replaces the derived origin URL. The field is unexported so
 	// production code (the daemon, the CLI, every external entry
 	// point) cannot set it; only tests in this package can read
-	// or write the field directly. External tests (e.g. daemon
-	// HTTP integration tests in another package) must use the
-	// exported WithTestOriginURL helper below to set it.
+	// or write the field directly. The daemon HTTP integration
+	// tests also live in this package for exactly this reason,
+	// so they can drive the seam without exposing it.
+	// Note: as of the v3 manifest migration, the daemon HTTP
+	// integration tests live in package "daemon", not here. They
+	// drive the local-remote case without touching this field
+	// at all: they let production code derive the trusted URL
+	// (https://github.com/<AllowedOrg>/<repository>.git) and
+	// then redirect git's HTTPS fetch to a local file remote
+	// via GIT_CONFIG_GLOBAL (url.<local>.insteadOf = <trusted>),
+	// which is process-scoped test setup, not an API surface.
 	originURLOverride string
 }
 
@@ -372,24 +380,4 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 
 func normalizeGitURL(u string) string {
 	return strings.TrimSuffix(strings.TrimSpace(u), ".git")
-}
-
-// WithTestOriginURL returns a copy of c with the test-only origin
-// URL override set. It exists so external test packages (the
-// daemon HTTP integration tests, in particular) can point source
-// resolution at a local file remote without poking the unexported
-// originURLOverride field directly. Production callers MUST NOT
-// call this function; the contract is that the origin URL is
-// derived from the trusted SourceConfig, never supplied by the
-// caller. The "Test" suffix in the name is the only signal a
-// reader gets that this is not a production API.
-//
-// A reflection-based test in source_test.go asserts that the
-// SourceConfig type exposes no exported origin-URL or base-URL
-// field; that test fails the build if a future refactor
-// accidentally re-exports originURLOverride (or any other field
-// that would let a production caller pick the origin URL).
-func (c SourceConfig) WithTestOriginURL(url string) SourceConfig {
-	c.originURLOverride = url
-	return c
 }

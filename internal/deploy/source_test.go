@@ -799,32 +799,45 @@ func TestVerifyCommit_DoesNotCreateCheckout(t *testing.T) {
 	}
 }
 
-func TestSourceConfig_NoExportedOriginOrBaseURLField(t *testing.T) {
+func TestSourceConfig_NoExportedOriginOrBaseURLAPI(t *testing.T) {
 	t.Helper()
 	typ := reflect.TypeOf(SourceConfig{})
+
+	// Exported fields.
 	for i := 0; i < typ.NumField(); i++ {
 		f := typ.Field(i)
 		if !f.IsExported() {
 			continue
 		}
 		lname := strings.ToLower(f.Name)
-		if strings.Contains(lname, "origin") || strings.Contains(lname, "url") || strings.Contains(lname, "base") {
-			t.Errorf("SourceConfig exposes exported field %q (production must not pick the origin URL); rename or unexport it", f.Name)
+		for _, bad := range []string{"origin", "url", "base", "remote"} {
+			if strings.Contains(lname, bad) {
+				t.Errorf("SourceConfig exposes exported field %q (matches %q in name); rename or unexport it (production must not let a caller pick the origin URL, base URL, or alternate remote)", f.Name, bad)
+				break
+			}
 		}
 	}
-}
 
-func TestSourceConfig_WithTestOriginURL(t *testing.T) {
-	t.Helper()
-	cfg := SourceConfig{AllowedOrg: "myorg"}
-	got := cfg.WithTestOriginURL("file:///tmp/fake.git")
-	if got.originURLOverride != "file:///tmp/fake.git" {
-		t.Errorf("WithTestOriginURL did not set the override: %q", got.originURLOverride)
-	}
-	if cfg.originURLOverride != "" {
-		t.Errorf("WithTestOriginURL mutated the receiver; expected a copy: %q", cfg.originURLOverride)
-	}
-	if url := got.originURL("cron-dashboard"); url != "file:///tmp/fake.git" {
-		t.Errorf("WithTestOriginURL result originURL = %q, want %q", url, "file:///tmp/fake.git")
+	// Exported methods.
+	ptr := reflect.PtrTo(typ)
+	seen := map[string]bool{}
+	for _, mt := range []reflect.Type{typ, ptr} {
+		for i := 0; i < mt.NumMethod(); i++ {
+			m := mt.Method(i)
+			if !m.IsExported() {
+				continue
+			}
+			if seen[m.Name] {
+				continue
+			}
+			seen[m.Name] = true
+			lname := strings.ToLower(m.Name)
+			for _, bad := range []string{"origin", "url", "base", "remote", "withtest", "testorigin", "testurl"} {
+				if strings.Contains(lname, bad) {
+					t.Errorf("SourceConfig exposes exported method %q (matches %q in name); the production API must not let a caller pick the origin URL, base URL, or alternate remote (rename, unexport, or remove)", m.Name, bad)
+					break
+				}
+			}
+		}
 	}
 }
